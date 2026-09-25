@@ -530,6 +530,77 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 	}
 }
 
+// Tail follows a stream without any durable state (an ordered, ephemeral consumer): it calls fn
+// for every message matching filter stored at or after start (zero = the whole stream), in
+// stream order, then keeps following new messages until ctx ends. caughtUp (may be nil) is
+// called once, when every message stored at the time Tail started has been passed to fn. Nothing
+// is acked. A fn error stops Tail and is returned; otherwise it returns ctx.Err().
+func (j *JetStream) Tail(ctx context.Context, stream, filter string, start time.Time, fn func(Msg) error, caughtUp func()) error {
+	cfg := jetstream.OrderedConsumerConfig{FilterSubjects: []string{filter}, DeliverPolicy: jetstream.DeliverAllPolicy}
+	if !start.IsZero() {
+		cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
+		cfg.OptStartTime = &start
+	}
+	c, err := j.js.OrderedConsumer(ctx, stream, cfg)
+	if err != nil {
+		return fmt.Errorf("jetstream: tail %s: %w", stream, err)
+	}
+	var once sync.Once
+	signal := func() {
+		if caughtUp != nil {
+			once.Do(caughtUp)
+		}
+	}
+	info, err := c.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("jetstream: tail %s: info: %w", stream, err)
+	}
+	if info.NumPending == 0 {
+		signal()
+	}
+	it, err := c.Messages()
+	if err != nil {
+		return fmt.Errorf("jetstream: tail %s: %w", stream, err)
+	}
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(it.Stop) }
+	defer stop()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			stop()
+		case <-done:
+		}
+	}()
+	for {
+		m, err := it.Next()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, jetstream.ErrMsgIteratorClosed) {
+				return fmt.Errorf("jetstream: tail %s: %w", stream, err)
+			}
+			log.Printf("jetstream: tail %s: %v", stream, err)
+			continue
+		}
+		meta, err := m.Metadata()
+		if err != nil {
+			log.Printf("jetstream: tail %s: %s: no metadata (%v); skipped", stream, m.Subject(), err)
+			continue
+		}
+		if err := fn(Msg{Subject: m.Subject(), Data: m.Data(), StreamSeq: meta.Sequence.Stream,
+			NumDelivered: meta.NumDelivered, Stored: meta.Timestamp}); err != nil {
+			return err
+		}
+		if meta.NumPending == 0 {
+			signal()
+		}
+	}
+}
+
 func (j *JetStream) filterIsWholeStream(stream, filter string) bool {
 	for _, s := range j.streams {
 		if s.Name == stream {

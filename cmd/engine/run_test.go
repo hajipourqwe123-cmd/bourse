@@ -260,7 +260,7 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 			}
 		})
 		for ins, g := range wantGame {
-			if gotGame[ins] != g {
+			if !sameGame(gotGame[ins], g) {
 				t.Errorf("cut %d: %s game totals\n got %+v\nwant %+v", cut, ins, gotGame[ins], g)
 			}
 		}
@@ -315,7 +315,7 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 		}
 	})
 	for ins, g := range wantGame {
-		if gotGame[ins] != g {
+		if !sameGame(gotGame[ins], g) {
 			t.Errorf("%s game totals\n got %+v\nwant %+v", ins, gotGame[ins], g)
 		}
 	}
@@ -626,4 +626,13 @@ func TestLostLeaseBlocksAck(t *testing.T) {
 	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 0 {
 		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
 	}
+}
+
+// sameGame compares totals; AsOf by instant (decoded times carry distinct *Location values).
+func sameGame(a, b model.GameTotals) bool {
+	if !a.AsOf.Equal(b.AsOf) {
+		return false
+	}
+	a.AsOf, b.AsOf = time.Time{}, time.Time{}
+	return a == b
 }

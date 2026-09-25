@@ -5,6 +5,9 @@
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
 //	                                         # (SYN* refused unless ALLOW_SYNTHETIC_ON_BUS=1)
 //	SESSIONS_FILE=path.json                  # session calendar; live sources poll only while a class is in session
+//	REPLAY_REBASE=today|now                  # DEV ONLY: re-time a recording to the present, paced in real time
+//	                                         #   today: onto today's date (REPLAY_DATE=YYYY-MM-DD for another day)
+//	                                         #   now: recording time REPLAY_AT (default 10:00) = the current instant
 package main
 
 import (
@@ -96,6 +99,19 @@ func run() int {
 		log.Printf("collector: WARNING: calendar sessions span up to %s a day, more than the %s the bus streams are sized for (contracts/subjects.md)",
 			span, bus.SizedSessionSpan)
 	}
+	if mode := config.Str("REPLAY_REBASE", ""); mode != "" {
+		if !isReplay {
+			log.Printf("collector: REPLAY_REBASE needs SOURCE=replay")
+			return 1
+		}
+		rb, err := rebase(src, source.RebaseMode(mode), cal, time.Now())
+		if err != nil {
+			log.Printf("collector: %v", err)
+			return 1
+		}
+		log.Printf("collector: WARNING: REPLAY_REBASE=%s: recording re-timed to the present and paced in real time (local development only)", mode)
+		src, replayDelay = rb, 0
+	}
 	var filter *publishFilter
 	if !isReplay { // a recording is replayed as recorded, whatever the wall clock says
 		filter = newPublishFilter(cal)
@@ -163,7 +179,7 @@ func run() int {
 			}
 		}
 		wait := interval
-		if _, ok := src.(*source.Replay); ok {
+		if isReplay {
 			wait = replayDelay
 		}
 		if wait > 0 {
@@ -269,4 +285,26 @@ func (f *publishFilter) warnUnmapped(batch []model.Snapshot) {
 	if n > 0 {
 		log.Printf("collector: WARNING: %d of %d instruments have no class in the session calendar (class %q; see docs/sessions.md)", n, len(batch), calendar.Unknown)
 	}
+}
+
+// rebase wraps a replay for REPLAY_REBASE. "today" is refused on a day no class trades (the
+// dashboard would show closed sessions) unless REPLAY_DATE names the target day.
+func rebase(src source.Source, mode source.RebaseMode, cal *calendar.Calendar, now time.Time) (source.Source, error) {
+	target := now
+	if d := config.Str("REPLAY_DATE", ""); d != "" {
+		t, err := time.ParseInLocation("2006-01-02", d, tehran.Loc)
+		if err != nil {
+			return nil, fmt.Errorf("REPLAY_DATE %q: want YYYY-MM-DD", d)
+		}
+		target = t
+	} else if mode == source.RebaseToday {
+		if _, open := cal.Union(now); !open {
+			return nil, fmt.Errorf("REPLAY_REBASE=today: no class trades today (%s); set REPLAY_DATE=YYYY-MM-DD or use REPLAY_REBASE=now", tehran.TradingDay(now))
+		}
+	}
+	at, err := time.Parse("15:04", config.Str("REPLAY_AT", "10:00"))
+	if err != nil {
+		return nil, fmt.Errorf("REPLAY_AT: want HH:MM")
+	}
+	return source.NewRebase(src, mode, target, time.Duration(at.Hour())*time.Hour+time.Duration(at.Minute())*time.Minute)
 }

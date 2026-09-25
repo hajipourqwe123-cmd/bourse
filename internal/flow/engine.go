@@ -160,8 +160,14 @@ func (e *Engine) Process(s model.Snapshot) Result {
 			cp := s // re-baseline on inconsistent totals; the bad interval is dropped
 			st.prev = &cp
 			// The dropped interval's trades are missing from the day totals and from the window
-			// the re-baseline falls in: both are partial from now on (rule 1).
-			st.game.Partial = true
+			// the re-baseline falls in: both are partial from now on (rule 1). Consumers learn it
+			// now, not only with the next trade (there may be none).
+			if !st.game.Partial {
+				st.game.Partial = true
+				st.game.AsOf, st.game.Volume = s.SourceTime, s.Volume
+				g := st.game
+				r.Game = &g
+			}
 			if w := windowStart(sess, open, s.SourceTime); st.partialWin.Before(w) {
 				st.partialWin = w
 			}
@@ -216,6 +222,7 @@ func (e *Engine) Process(s model.Snapshot) Result {
 				}
 			}
 		}
+		st.game.AsOf, st.game.Volume = s.SourceTime, s.Volume
 		g := st.game
 		r.Game = &g
 		buyV := int64(float64(d.Value) * float64(d.IndBuyVol) / float64(d.Volume))

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"bourse/internal/flow"
 	"bourse/internal/model"
 	"bourse/internal/quality"
+	"bourse/internal/source"
 	"bourse/internal/tehran"
 )
 
@@ -142,5 +144,28 @@ func TestPublishFilterSourceDayChange(t *testing.T) {
 	}
 	if !step(at("2026-09-27", "08:40:00"), at("2026-09-27", "08:40:01")) {
 		t.Fatal("source moved to today (the day baseline) but was not published")
+	}
+}
+
+func TestRebaseRefusesClosedTodayUnlessDateGiven(t *testing.T) {
+	cal := calendar.Default()
+	fri, _ := time.ParseInLocation("2006-01-02 15:04", "2026-09-25 10:00", tehran.Loc)
+	src, err := source.NewReplay("/dev/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rebase(src, source.RebaseToday, cal, fri); err == nil || !strings.Contains(err.Error(), "REPLAY_DATE") {
+		t.Errorf("today on a Friday = %v, want refusal naming REPLAY_DATE", err)
+	}
+	if _, err := rebase(src, source.RebaseNow, cal, fri); err != nil {
+		t.Errorf("now on a Friday: %v", err)
+	}
+	t.Setenv("REPLAY_DATE", "2026-09-23")
+	if _, err := rebase(src, source.RebaseToday, cal, fri); err != nil {
+		t.Errorf("today with REPLAY_DATE: %v", err)
+	}
+	t.Setenv("REPLAY_DATE", "23/09/2026")
+	if _, err := rebase(src, source.RebaseToday, cal, fri); err == nil {
+		t.Error("bad REPLAY_DATE accepted")
 	}
 }

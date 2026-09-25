@@ -195,6 +195,10 @@ func TestRebaselineMarksPartial(t *testing.T) {
 	if r = e.Process(glitch); !codes(r)[quality.SideMismatch] {
 		t.Fatalf("(b) setup: %+v", r.Issues)
 	}
+	// The flip to partial is published at once (there may be no later trade), as of the glitch.
+	if r.Game == nil || !r.Game.Partial || !r.Game.AsOf.Equal(glitch.SourceTime) || r.Game.Volume != 400_000 {
+		t.Errorf("(b) re-baseline must publish partial totals as of the glitch: %+v", r.Game)
+	}
 	next := sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 500_000, 350_000, 360_000, 7, 5)
 	next.InstBuyVol, next.IndBuyVol = 200_000, 350_000 // Δbuy 50,000 + 50,000 = Δvolume 100,000
 	r = e.Process(next)

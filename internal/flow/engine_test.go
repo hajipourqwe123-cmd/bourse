@@ -79,6 +79,10 @@ func TestHotPlusBand(t *testing.T) {
 	if r.Game.NetHotPlus != -1_500_000_000 {
 		t.Fatalf("game hot_plus wrong: %+v", *r.Game)
 	}
+	// Totals carry the source time and cumulative volume of the snapshot they include.
+	if !r.Game.AsOf.Equal(t0.Add(5*time.Second)) || r.Game.Volume != 1_150_000 {
+		t.Fatalf("game as_of/volume = %s/%d", r.Game.AsOf, r.Game.Volume)
+	}
 }
 
 func TestUnattributedNeverBanded(t *testing.T) {
