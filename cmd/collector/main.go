@@ -2,6 +2,8 @@
 //
 //	SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson collector > snaps.ndjson
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
+//	SOURCE=brsapi BRSAPI_KEY=… POLL_INTERVAL=…  # BRSAPI_TYPES=1[,4], BRSAPI_DAILY_LIMIT=100, BRSAPI_5MIN_LIMIT=300:
+//	                                         # refuses to start if the interval exceeds the plan's quota
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
 //	                                         # (SYN* refused unless ALLOW_SYNTHETIC_ON_BUS=1)
 //	SESSIONS_FILE=path.json                  # session calendar; live sources poll only while a class is in session
@@ -38,6 +40,7 @@ func run() int {
 	defer stop()
 
 	var src source.Source
+	var brsPer5 int64 // SOURCE=brsapi: the plan's 5-minute quota (budget check below)
 	switch kind := config.Str("SOURCE", "replay"); kind {
 	case "replay":
 		r, err := source.NewReplay(config.Str("REPLAY_FILE", "testdata/synthetic_day.ndjson"))
@@ -50,6 +53,12 @@ func run() int {
 			config.Str("SOURCEARENA_URL", "https://apis.sourcearena.ir/api/"),
 			os.Getenv("SOURCEARENA_TOKEN"),
 			config.Dur("HTTP_TIMEOUT", 10*time.Second))
+	case "brsapi":
+		cfg, per5, err := brsapiConfig()
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		src, brsPer5 = source.NewBrsApi(cfg), per5
 	default:
 		log.Fatalf("unknown SOURCE %q", kind)
 	}
@@ -94,6 +103,13 @@ func run() int {
 	if now := time.Now(); cal.HolidaysBetween(now, now.AddDate(1, 0, 0)) == 0 {
 		log.Printf("collector: WARNING: no official holiday listed in the session calendar for the next 12 months; " +
 			"on an unlisted holiday the vendor's previous-day data would be collected as today's (docs/sessions.md)")
+	}
+	if b, ok := src.(*source.BrsApi); ok {
+		cfg := b.Config()
+		if err := brsapiBudget(len(cfg.Types), interval, cal.MaxDailySpan(), int64(cfg.DailyLimit), brsPer5); err != nil {
+			log.Printf("collector: %v", err)
+			return 1
+		}
 	}
 	if span := cal.MaxDailySpan(); span > bus.SizedSessionSpan {
 		log.Printf("collector: WARNING: calendar sessions span up to %s a day, more than the %s the bus streams are sized for (contracts/subjects.md)",

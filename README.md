@@ -62,6 +62,8 @@ make gate2                                                             # Gate 2:
 
 اگر dockerd سقف فایل باز کمتر از 262144 دارد (خطای `error setting rlimit type 7`)، در `.env` مقدار `CLICKHOUSE_NOFILE` را برابر `ulimit -Hn` بگذارید.
 
+BrsApi (`SOURCE=brsapi`، کلید در `.env` به نام `BRSAPI_KEY`): collector اگر `POLL_INTERVAL` از سقف پلن (`BRSAPI_DAILY_LIMIT`/`BRSAPI_5MIN_LIMIT`) بیشتر باشد شروع نمی‌شود. ضبط پیش‌گشایش شنبه برای بررسی صفرشدن جمع‌های روز: `infra/brsapi-preopen.sh`. نگاشت فیلدها و نتایج کاوش در `docs/source-mapping.md`.
+
 اتصال به منبع زنده (پس از دریافت توکن):
 
 ```bash

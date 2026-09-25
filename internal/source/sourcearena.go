@@ -87,11 +87,16 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	return Parse(body, s.now())
 }
 
+// redact removes secret from msg, also in its URL-encoded forms (a key in a query string shows
+// up escaped in *url.Error messages).
 func redact(msg, secret string) string {
 	if secret == "" {
 		return msg
 	}
-	return strings.ReplaceAll(msg, secret, "***")
+	for _, s := range []string{secret, url.QueryEscape(secret), url.PathEscape(secret)} {
+		msg = strings.ReplaceAll(msg, s, "***")
+	}
+	return msg
 }
 
 // Parse converts one vendor payload into snapshots. Exported for contract tests.
@@ -138,7 +143,7 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		set(model.FIndSellCount, &sn.IndSellCount)
 		set(model.FInstBuyCount, &sn.InstBuyCount)
 		set(model.FInstSellCount, &sn.InstSellCount)
-		sn.Missing = append(sn.Missing, model.FBook) // order book not in the documented "all" payload
+		sn.Missing = append(sn.Missing, model.FBook, model.FPriceLimits) // not in the documented "all" payload
 		out = append(out, sn)
 	}
 	return out, nil
