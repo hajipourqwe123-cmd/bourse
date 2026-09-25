@@ -1,0 +1,84 @@
+package model
+
+import "time"
+
+// Side of a flow event.
+type Side string
+
+const (
+	Buy  Side = "buy"
+	Sell Side = "sell"
+)
+
+// Band classifies an interval's average ticket per participant.
+type Band string
+
+const (
+	BandHot     Band = "hot"      // >= HotThreshold  (default 200M toman)
+	BandHotPlus Band = "hot_plus" // [PlusThreshold, HotThreshold) (default 100–200M toman)
+	BandRetail  Band = "retail"   // below PlusThreshold
+)
+
+// Attribution tells how reliable the per-participant average is.
+type Attribution string
+
+const (
+	// Attributed: the interval added new participants, so value/count is a real average.
+	Attributed Attribution = "attributed"
+	// Unattributed: volume grew but the (distinct) participant count did not, i.e. participants
+	// already counted earlier in the day traded again. No per-participant average exists.
+	Unattributed Attribution = "unattributed"
+)
+
+// FlowEvent is one detected hot-money (or hot-plus) interval for one side.
+type FlowEvent struct {
+	InsCode      string      `json:"ins_code"`
+	Symbol       string      `json:"symbol"`
+	Side         Side        `json:"side"`
+	Band         Band        `json:"band"`
+	Attribution  Attribution `json:"attribution"`
+	IntervalFrom time.Time   `json:"interval_from"`
+	IntervalTo   time.Time   `json:"interval_to"`
+	Volume       int64       `json:"volume"`       // shares in the interval (real persons, this side)
+	Value        int64       `json:"value"`        // rial, Volume × interval VWAP
+	Participants int64       `json:"participants"` // new distinct participants in the interval (0 when unattributed)
+	AvgTicket    int64       `json:"avg_ticket"`   // rial per participant (0 when unattributed)
+	VWAP         int64       `json:"vwap"`         // interval VWAP in rial
+	PriceLast    int64       `json:"price_last"`
+}
+
+// QualityIssue is emitted whenever a snapshot fails a data-quality rule.
+type QualityIssue struct {
+	InsCode string    `json:"ins_code"`
+	Code    string    `json:"code"`
+	Detail  string    `json:"detail"`
+	At      time.Time `json:"at"`
+}
+
+// TenMinute aggregates one instrument's flow in one 10-minute window (the "big moves" matrix).
+type TenMinute struct {
+	InsCode     string    `json:"ins_code"`
+	WindowStart time.Time `json:"window_start"`
+	NetHot      int64     `json:"net_hot"`    // rial, attributed hot buy − attributed hot sell
+	PriceOpen   int64     `json:"price_open"` // first last-price seen in window
+	PriceLastV  int64     `json:"price_last"` // latest last-price seen in window
+}
+
+// ChangePct returns the price change in percent over the window (0 when undefined).
+func (t TenMinute) ChangePct() float64 {
+	if t.PriceOpen <= 0 {
+		return 0
+	}
+	return float64(t.PriceLastV-t.PriceOpen) / float64(t.PriceOpen) * 100
+}
+
+// GameTotals accumulates the "market game" split for one instrument for the day (rial, net = buy − sell).
+type GameTotals struct {
+	InsCode    string `json:"ins_code"`
+	Day        string `json:"day"`
+	NetHot     int64  `json:"net_hot"`
+	NetHotPlus int64  `json:"net_hot_plus"`
+	NetRetail  int64  `json:"net_retail"`
+	// NetUnattributed holds flow that cannot be banded (existing participants trading again).
+	NetUnattributed int64 `json:"net_unattributed"`
+}

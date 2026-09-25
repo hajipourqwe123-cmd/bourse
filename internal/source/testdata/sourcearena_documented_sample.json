@@ -1,0 +1,29 @@
+[
+  {
+    "name": "شصدف",
+    "instance_code": "204092872752957",
+    "full_name": "صنعتي دوده فام",
+    "first_price": "33493",
+    "close_price": "33493",
+    "close_price_change": 1594,
+    "close_price_change_percent": "5%",
+    "final_price": "32023",
+    "final_price_change": 124,
+    "final_price_change_percent": "0.39%",
+    "eps": "2862",
+    "highest_price": "33493",
+    "lowest_price": "33493",
+    "P:E": 11.19,
+    "trade_number": "4726",
+    "trade_volume": "123747",
+    "trade_value": "4144658271",
+    "all_stocks": "200000000",
+    "basis_volume": "1561378",
+    "avg_month": 12369082,
+    "real_buy_volume": "123747",
+    "co_buy_volume": "0",
+    "real_sell_volume": "107663",
+    "co_sell_volume": "16084",
+    "real_buy_count": "5"
+  }
+]

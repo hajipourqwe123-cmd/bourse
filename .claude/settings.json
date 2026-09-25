@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make test)",
+      "Bash(make vet)",
+      "Bash(make build)",
+      "Bash(make demo)",
+      "Bash(go test ./...)",
+      "Bash(go test -race ./...)",
+      "Bash(go vet ./...)",
+      "Bash(gofmt -l .)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./testdata/*.ndjson)",
+      "Read(./recordings/**)"
+    ]
+  }
+}

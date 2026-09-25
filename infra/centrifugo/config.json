@@ -1,0 +1,8 @@
+{
+  "allowed_origins": ["http://localhost:3000"],
+  "namespaces": [
+    { "name": "sym",  "history_size": 50,  "history_ttl": "300s", "force_recovery": true },
+    { "name": "flow", "history_size": 200, "history_ttl": "600s", "force_recovery": true },
+    { "name": "mkt",  "history_size": 20,  "history_ttl": "300s", "force_recovery": true }
+  ]
+}
