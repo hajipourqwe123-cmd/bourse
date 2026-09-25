@@ -220,26 +220,45 @@ func TestFailedPublishRequeuesRadarAndHot(t *testing.T) {
 	}
 }
 
-type memStore struct{ m map[string][]byte }
+type memStore struct {
+	m       map[string][]byte
+	failGet bool
+	puts    int
+}
 
 func (s *memStore) StateGet(_ context.Context, k string) ([]byte, bool, error) {
+	if s.failGet {
+		return nil, false, errors.New("kv down")
+	}
 	b, ok := s.m[k]
 	return b, ok, nil
 }
-func (s *memStore) StatePut(_ context.Context, k string, v []byte) error { s.m[k] = v; return nil }
+func (s *memStore) StatePut(_ context.Context, k string, v []byte) error {
+	s.m[k] = v
+	s.puts++
+	return nil
+}
+
+func storedDay(t *testing.T, s *memStore, key string) string {
+	t.Helper()
+	var dt market.DayTotals
+	_ = json.Unmarshal(s.m[key], &dt)
+	return dt.Day
+}
 
 // The previous day's last totals survive restarts (MD keeps only 48 h: a Saturday needs
 // Wednesday's): saved every minute, rotated when the day changes, loaded at start.
 func TestPrevTotalsPersistAcrossRestarts(t *testing.T) {
 	store := &memStore{m: map[string][]byte{}}
-	day1 := tehranAt("12:29")
+	day1 := tehranAt("12:29") // Wednesday
 	h, _, _ := hubAt(t, day1, false)
 	h.store = store
+	h.loadPrevTotals(context.Background())
 	ready(h)
 	h.onSnapshot(msg("md.snap.S1", snapAt("S1", day1, 1010, 5000)))
 	h.saveTotals(context.Background())
 
-	day2 := day1.Add(21 * time.Hour) // 09:29 next day
+	day2 := day1.Add(69 * time.Hour) // Saturday 09:29 (the next trading day)
 	start := func() *hub {
 		h2, _, _ := hubAt(t, day2, false)
 		h2.store = store
@@ -248,21 +267,65 @@ func TestPrevTotalsPersistAcrossRestarts(t *testing.T) {
 		return h2
 	}
 	h2 := start()
-	carried := snapAt("S1", day2, 1010, 5000) // same totals as yesterday's last, after the open
+	carried := snapAt("S1", day2, 1010, 5000) // same totals as Wednesday's last, after the open
 	h2.onSnapshot(msg("md.snap.S1", carried))
-	if st, _ := h2.state(day2); len(st.Rows) != 1 || !st.Rows[0].AwaitingReset {
-		t.Fatalf("rows = %+v, want S1 awaiting a reset", st.Rows)
+	st, _ := h2.state(day2)
+	if len(st.Rows) != 1 || !st.Rows[0].AwaitingReset || !st.Summary.CarryoverCheck.OK {
+		t.Fatalf("rows = %+v check %+v, want S1 awaiting a reset against Wednesday", st.Rows, st.Summary.CarryoverCheck)
 	}
-	h2.saveTotals(context.Background()) // rotates yesterday's record to the previous-day key
-	var prev market.DayTotals
-	_ = json.Unmarshal(store.m[keyPrevTotals], &prev)
-	if prev.Day != "2026-09-23" {
-		t.Fatalf("previous-day record = %q, want 2026-09-23", prev.Day)
+	h2.saveTotals(context.Background()) // rotates Wednesday's record to the previous-day key
+	h2.saveTotals(context.Background()) // a second save the same day must not rotate again
+	if storedDay(t, store, keyPrevTotals) != "2026-09-23" || storedDay(t, store, keyTotals) != "2026-09-26" {
+		t.Fatalf("stored: prev %q cur %q", storedDay(t, store, keyPrevTotals), storedDay(t, store, keyTotals))
 	}
 	// Restart on the same day: today's record is today's, so the rotated one is used.
 	h3 := start()
 	h3.onSnapshot(msg("md.snap.S1", carried))
 	if st, _ := h3.state(day2); !st.Rows[0].AwaitingReset {
 		t.Error("after a same-day restart the previous-day totals must still apply")
+	}
+}
+
+// A failed read at start must not let a save overwrite the stored record.
+func TestNoSaveBeforeSuccessfulLoad(t *testing.T) {
+	store := &memStore{m: map[string][]byte{keyTotals: []byte(`{"day":"2026-09-22","totals":{"S9":{"v":1,"val":1}}}`)}, failGet: true}
+	now := tehranAt("10:00")
+	h, _, _ := hubAt(t, now, false)
+	h.store = store
+	if h.loadPrevTotals(context.Background()) {
+		t.Fatal("load must fail")
+	}
+	ready(h)
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", now, 1010, 5000)))
+	h.saveTotals(context.Background())
+	if store.puts != 0 {
+		t.Fatalf("%d writes after a failed load", store.puts)
+	}
+	store.failGet = false
+	h.saveTotals(context.Background()) // loads first, then saves (rotating Tuesday's record)
+	if storedDay(t, store, keyPrevTotals) != "2026-09-22" || storedDay(t, store, keyTotals) != "2026-09-23" {
+		t.Errorf("stored: prev %q cur %q", storedDay(t, store, keyPrevTotals), storedDay(t, store, keyTotals))
+	}
+}
+
+// Midnight in a running gateway: the state rolls in flush and the next save rotates.
+func TestInProcessDayRollover(t *testing.T) {
+	store := &memStore{m: map[string][]byte{}}
+	day1 := tehranAt("12:29")
+	h, _, clock := hubAt(t, day1, false)
+	h.store = store
+	h.loadPrevTotals(context.Background())
+	ready(h)
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", day1, 1010, 5000)))
+	h.saveTotals(context.Background())
+	*clock = day1.Add(69 * time.Hour)
+	_ = h.flush(context.Background()) // advances to Saturday
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", *clock, 1010, 5000)))
+	if st, _ := h.state(*clock); !st.Rows[0].AwaitingReset {
+		t.Fatal("in-process rollover must keep Wednesday's totals as the reference")
+	}
+	h.saveTotals(context.Background())
+	if storedDay(t, store, keyPrevTotals) != "2026-09-23" || storedDay(t, store, keyTotals) != "2026-09-26" {
+		t.Errorf("stored: prev %q cur %q", storedDay(t, store, keyPrevTotals), storedDay(t, store, keyTotals))
 	}
 }

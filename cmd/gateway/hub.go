@@ -85,8 +85,7 @@ type hub struct {
 	undecodable int
 	synSkipped  bool
 	synIns      map[string]bool // instruments seen with synthetic snapshots
-	saved       []byte          // last record written to (or read from) keyTotals
-	savedDay    string
+	loaded      bool            // the stored day totals were read (saving is allowed)
 }
 
 func newHub(cfg Config, pub publisher, valid func() error, now func() time.Time) *hub {
@@ -245,72 +244,90 @@ func (h *hub) loop(ctx context.Context) error {
 	}
 }
 
-// loadPrevTotals gives the state the previous trading day's last totals from storage: the saved
-// record if it is of an earlier day, else the rotated previous one.
-func (h *hub) loadPrevTotals(ctx context.Context) {
+// loadPrevTotals gives the state the previous day's last totals from storage: the saved record
+// if it is of an earlier day, else the rotated previous one. It reports success; until it
+// succeeds nothing is saved (a failed read must not let a save overwrite the stored record).
+func (h *hub) loadPrevTotals(ctx context.Context) bool {
 	if h.store == nil {
-		return
+		return false
 	}
-	read := func(key string) (market.DayTotals, []byte) {
+	read := func(key string) (market.DayTotals, error) {
 		var dt market.DayTotals
 		b, ok, err := h.store.StateGet(ctx, key)
 		if err != nil {
-			log.Printf("gateway: load %s: %v", key, err)
-			return dt, nil
+			return dt, err
 		}
 		if ok && json.Unmarshal(b, &dt) != nil {
 			log.Printf("gateway: %s undecodable; ignored", key)
 			return market.DayTotals{}, nil
 		}
-		return dt, b
+		return dt, nil
 	}
-	cur, curB := read(keyTotals)
+	cur, err := read(keyTotals)
+	if err != nil {
+		log.Printf("gateway: load %s: %v (retried before the next save)", keyTotals, err)
+		return false
+	}
+	prev, err := read(keyPrevTotals)
+	if err != nil {
+		log.Printf("gateway: load %s: %v (retried before the next save)", keyPrevTotals, err)
+		return false
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.saved, h.savedDay = curB, cur.Day
+	h.loaded = true
 	today := h.st.Day()
-	switch prev, _ := read(keyPrevTotals); {
+	switch {
 	case cur.Day != "" && cur.Day < today:
 		h.st.SetPrevTotals(cur)
 	case prev.Day != "" && prev.Day < today:
 		h.st.SetPrevTotals(prev)
 	default:
-		return
+		return true
 	}
 	log.Printf("gateway: previous-day totals loaded for the post-open carryover rule")
+	return true
 }
 
-// saveTotals stores today's last totals; a stored record of an earlier day is first rotated to
-// the previous-day key. Only the lease holder writes; failures are logged (retried next time).
+// saveTotals stores today's last totals; the stored record, if of an earlier day, is first
+// rotated to the previous-day key (decided from storage, so a second save the same day never
+// overwrites it). Only the lease holder writes, and only after a successful load; failures are
+// logged and retried next time.
 func (h *hub) saveTotals(ctx context.Context) {
 	if h.store == nil || h.valid() != nil {
 		return
 	}
 	h.mu.Lock()
-	if !h.ready {
-		h.mu.Unlock()
+	ready, loaded := h.ready, h.loaded
+	h.mu.Unlock()
+	if !ready || (!loaded && !h.loadPrevTotals(ctx)) {
 		return
 	}
+	h.mu.Lock()
 	lt := h.st.LastTotals()
-	oldB, oldDay := h.saved, h.savedDay
 	h.mu.Unlock()
+	if lt.Day == "" {
+		return
+	}
 	b, err := json.Marshal(lt)
 	if err != nil {
 		return
 	}
-	if oldDay != "" && oldDay < lt.Day && oldB != nil {
-		if err := h.store.StatePut(ctx, keyPrevTotals, oldB); err != nil {
+	old, ok, err := h.store.StateGet(ctx, keyTotals)
+	if err != nil {
+		log.Printf("gateway: save %s: %v", keyTotals, err)
+		return
+	}
+	var stored market.DayTotals
+	if ok && json.Unmarshal(old, &stored) == nil && stored.Day != "" && stored.Day < lt.Day {
+		if err := h.store.StatePut(ctx, keyPrevTotals, old); err != nil {
 			log.Printf("gateway: save %s: %v", keyPrevTotals, err)
 			return
 		}
 	}
 	if err := h.store.StatePut(ctx, keyTotals, b); err != nil {
 		log.Printf("gateway: save %s: %v", keyTotals, err)
-		return
 	}
-	h.mu.Lock()
-	h.saved, h.savedDay = b, lt.Day
-	h.mu.Unlock()
 }
 
 // flush publishes what changed since the last tick in one batch. A failed publish is logged and

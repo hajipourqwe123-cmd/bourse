@@ -83,6 +83,7 @@ const (
 	FInstBuyCount  = "inst_buy_count"
 	FInstSellCount = "inst_sell_count"
 	FBook          = "book"
+	FTradeCount    = "trade_count"
 )
 
 // FlowFields are required for any real-person money-flow metric.

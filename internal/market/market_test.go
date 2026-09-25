@@ -674,9 +674,10 @@ func TestPreOpenCarryoverTradeCountOnly(t *testing.T) {
 	}
 }
 
-const day2 = "2026-09-24"
+// day2 is the next trading day after day (Wednesday → Saturday; Thursday and Friday are closed).
+const day2 = "2026-09-26"
 
-func at2(hm string) time.Time { return at(hm).AddDate(0, 0, 1) }
+func at2(hm string) time.Time { return at(hm).AddDate(0, 0, 3) }
 
 func snap2(ins, hm string, last, yesterday, volume, value, trades int64) model.Snapshot {
 	s := snap(ins, hm, last, yesterday, volume, value)
@@ -685,10 +686,10 @@ func snap2(ins, hm string, last, yesterday, volume, value, trades int64) model.S
 	return s
 }
 
-// Owner decision on PR #3 (rule 1): after the open, totals equal to the instrument's last totals
-// of the previous trading day are carryover: excluded from today's aggregates, the row marked
-// «در انتظار بازنشانی منبع», until a reset or a change is observed.
-func TestPostOpenCarryoverAwaitingReset(t *testing.T) {
+// dayOneThenTwo: S1 ends Wednesday at 5,000,000 shares / 50e9 rial / 900 trades, S2 and E1 also
+// trade; the state then advances to Saturday.
+func dayOneThenTwo(t *testing.T) *State {
+	t.Helper()
 	st := testState()
 	y := snap("S1", "12:29:55", 1010, 1000, 5_000_000, 50_000_000_000)
 	y.TradeCount = 900
@@ -697,11 +698,21 @@ func TestPostOpenCarryoverAwaitingReset(t *testing.T) {
 	e1 := snap("E1", "12:29:55", 1, 1, 7, 7)
 	e1.TradeCount = 5
 	st.ApplySnapshot(e1)
-	st.Advance(day2) // S1's and S2's last totals of 09-23 become the reference
+	st.Advance(day2)
+	return st
+}
 
+// Owner decision on PR #3 (rule 1): after the open, totals equal to the instrument's last totals
+// of the previous trading day are carryover: excluded from today's aggregates, the row marked
+// «در انتظار بازنشانی منبع», until a reset or a change is observed.
+func TestPostOpenCarryoverAwaitingReset(t *testing.T) {
+	st := dayOneThenTwo(t)
+	if c := st.Summary().CarryoverCheck; !c.OK || c.Day != day || c.Expected != day {
+		t.Fatalf("carryover check = %+v, want Wednesday as the previous trading day", c)
+	}
 	st.ApplySnapshot(snap2("S1", "09:00:05", 1010, 1000, 5_000_000, 50_000_000_000, 900)) // yesterday's, after the open
 	st.ApplySnapshot(snap2("S2", "09:00:05", 2000, 2000, 12, 24_000, 3))                  // changed: today's
-	st.ApplySnapshot(snap2("E1", "09:00:05", 1, 1, 7, 7, 0))                              // same volume/value, trades differ: changed
+	st.ApplySnapshot(snap2("E1", "09:00:05", 1, 1, 7, 7, 0))                              // trades differ: changed
 	st.ApplyGame(model.GameTotals{InsCode: "S1", Class: Stock, Day: day2, AsOf: at2("09:00:05"), Volume: 5_000_000, NetHot: 99})
 	r := st.Rows()
 	if !r[1].AwaitingReset || r[1].Last != nil || r[1].Value != nil || r[1].Chg != nil || r[1].NetHot != nil {
@@ -712,50 +723,88 @@ func TestPostOpenCarryoverAwaitingReset(t *testing.T) {
 	}
 	sum := st.Summary()
 	stock, flow, br := sum.KPIs[1], sum.Flows[0], sum.Breadth
-	if sum.AwaitingReset != 1 || stock.Awaiting != 1 || flow.Awaiting != 1 || br.Awaiting != 1 {
+	if sum.AwaitingReset != 1 || stock.Awaiting != 1 || flow.Awaiting != 1 || br.Awaiting != 1 || stock.Secondary.Awaiting != 0 {
 		t.Fatalf("awaiting counts: summary %d kpi %d flow %d breadth %d", sum.AwaitingReset, stock.Awaiting, flow.Awaiting, br.Awaiting)
 	}
 	eq(t, "stock value (S1 excluded)", stock.Value, 24_000)
-	if flow.Pattern != nil || flow.Instruments != 2 {
-		t.Errorf("flow %+v: pattern must wait for the reset", flow)
+	st.ApplyGame(model.GameTotals{InsCode: "S2", Class: Stock, Day: day2, AsOf: at2("09:00:05"), Volume: 12})
+	if st.Summary().Flows[0].Pattern != nil {
+		t.Error("the class pattern must wait for the reset")
 	}
-	if len(st.Summary().KPIs[1].Series) != 1 { // only S2's baseline window
+	if len(st.Summary().KPIs[1].Series) != 1 { // only S2's window
 		t.Errorf("series = %+v: the carryover must not be a series baseline", st.Summary().KPIs[1].Series)
 	}
-
-	// The source resets: resolved for the day; the reset is the series baseline.
+	// An incomplete snapshot cannot end the wait.
+	inc := snap2("S1", "09:00:07", 1010, 1000, 0, 0, 0)
+	inc.Missing = []string{model.FVolume}
+	st.ApplySnapshot(inc)
+	if !st.Rows()[1].AwaitingReset {
+		t.Error("incomplete snapshot ended the wait")
+	}
+	// The source resets: today's figures; the reset is the series baseline.
 	st.ApplySnapshot(snap2("S1", "09:00:10", 1000, 1000, 0, 0, 0))
 	st.ApplySnapshot(snap2("S1", "09:00:30", 1012, 1000, 100, 101_200, 2))
-	st.ApplySnapshot(snap2("S1", "09:00:40", 1010, 1000, 5_000_000, 50_000_000_000, 900)) // coincidence later: no re-check
-	if r := st.Rows()[1]; r.AwaitingReset || r.Value == nil || *r.Value != 50_000_000_000 {
+	if r := st.Rows()[1]; r.AwaitingReset || r.Value == nil || *r.Value != 101_200 || st.Summary().AwaitingReset != 0 {
 		t.Errorf("after the reset: %+v", r)
 	}
-	if st.Summary().AwaitingReset != 0 {
-		t.Error("awaiting count after the reset")
+	// Flipping back to yesterday's totals later: awaiting again, not booked.
+	st.ApplySnapshot(snap2("S1", "09:00:40", 1010, 1000, 5_000_000, 50_000_000_000, 900))
+	if r := st.Rows()[1]; !r.AwaitingReset || r.Value != nil {
+		t.Errorf("flip-back: %+v", r)
+	}
+	if b := bars(st)["09:00"]; b.Value == nil || *b.Value != 101_200 {
+		t.Errorf("09:00 bar = %v: yesterday's value must never be booked", deref(b.Value))
 	}
 }
 
-func TestPrevTotalsStorage(t *testing.T) {
+// A missing trade count is compared only when both sides have one (review R2).
+func TestAwaitingWithMissingTradeCount(t *testing.T) {
+	st := dayOneThenTwo(t)
+	sn := snap2("S1", "09:00:05", 1010, 1000, 5_000_000, 50_000_000_000, 0)
+	sn.Missing = []string{model.FTradeCount}
+	st.ApplySnapshot(sn)
+	if !st.Rows()[0].AwaitingReset {
+		t.Error("same volume and value, trade count missing today: still carryover")
+	}
+}
+
+// Before the open the pre-open rule applies (never "awaiting"): explicit session check.
+func TestAwaitingOnlyAfterOpen(t *testing.T) {
+	st := dayOneThenTwo(t)
+	st.ApplySnapshot(snap2("S1", "08:50:00", 1010, 1000, 5_000_000, 50_000_000_000, 900))
+	if s := st.Summary(); s.Carryover != 1 || s.AwaitingReset != 0 || len(st.Rows()) != 0 {
+		t.Errorf("pre-open: carryover %d awaiting %d rows %d", s.Carryover, s.AwaitingReset, len(st.Rows()))
+	}
+}
+
+func TestPrevTotalsStorageAndCheck(t *testing.T) {
 	st := testState()
 	st.ApplySnapshot(snap("S1", "10:00:00", 1, 1, 10, 100))
-	st.SetPrevTotals(DayTotals{Day: day, Totals: map[string]Totals{"S2": {1, 2, 3}}}) // same day: ignored
-	st.SetPrevTotals(DayTotals{Day: "2026-09-22", Totals: map[string]Totals{"S2": {1, 2, 3}, "S1": {9, 9, 9}}})
+	st.SetPrevTotals(DayTotals{Day: day, Totals: map[string]model.Totals{"S2": {Volume: 1}}}) // same day: ignored
+	st.SetPrevTotals(DayTotals{Day: "2026-09-22", Totals: map[string]model.Totals{
+		"S2": {Volume: 1, Value: 2, Seen: "2026-09-22"}, "S1": {Volume: 9, Seen: "2026-09-22"}, "OLD": {Volume: 1, Seen: "2026-08-01"}}})
 	lt := st.LastTotals()
-	if lt.Day != day || lt.Totals["S1"] != (Totals{10, 100, 0}) || lt.Totals["S2"] != (Totals{1, 2, 3}) {
-		t.Errorf("last totals = %+v, want today's S1 and S2 carried from the previous day", lt)
+	if lt.Day != day || lt.Totals["S1"].Volume != 10 || lt.Totals["S1"].Seen != day || lt.Totals["S2"].Value != 2 {
+		t.Errorf("last totals = %+v, want today's S1 and S2 carried", lt)
 	}
-	// Loaded after a restart: S2 still showing 09-22's totals today is awaiting.
-	st.ApplySnapshot(snap("S2", "10:00:00", 1, 1, 1, 2))
-	sn := snap("S2", "10:00:05", 1, 1, 1, 2)
-	sn.TradeCount = 3
-	st.ApplySnapshot(sn) // S2 was already resolved by the first (different trade count)
-	if st.Rows()[1].AwaitingReset {
-		t.Error("resolved instruments are not re-checked")
+	if _, ok := lt.Totals["OLD"]; ok {
+		t.Error("an instrument not seen for 30 days must be dropped")
 	}
-	st2 := testState()
-	st2.SetPrevTotals(DayTotals{Day: "2026-09-22", Totals: map[string]Totals{"S2": {1, 2, 3}}})
-	st2.ApplySnapshot(sn)
-	if !st2.Rows()[0].AwaitingReset {
-		t.Error("prev totals loaded from storage not applied")
+	if c := st.Summary().CarryoverCheck; !c.OK || c.Expected != "2026-09-22" {
+		t.Errorf("check = %+v: Tuesday is the previous trading day of Wednesday", c)
+	}
+	gap := testState() // the reference is Monday's: Tuesday had no data here
+	gap.SetPrevTotals(DayTotals{Day: "2026-09-21", Totals: map[string]model.Totals{"S1": {Volume: 1}}})
+	if c := gap.Summary().CarryoverCheck; c.OK {
+		t.Errorf("check = %+v: a reference older than the previous trading day is not OK", c)
+	}
+	// No data today: the reference is kept as the last day with data.
+	empty := testState()
+	empty.SetPrevTotals(DayTotals{Day: "2026-09-22", Totals: map[string]model.Totals{"S1": {Volume: 1}}})
+	if lt := empty.LastTotals(); lt.Day != "2026-09-22" {
+		t.Errorf("no data today: last totals day %q, want the reference's", lt.Day)
+	}
+	if c := testState().Summary().CarryoverCheck; c.OK {
+		t.Error("no reference: the check is not OK")
 	}
 }

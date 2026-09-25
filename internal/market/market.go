@@ -191,12 +191,23 @@ type Summary struct {
 	Carryover int `json:"carryover"`
 	// AwaitingReset counts instruments whose totals after the open still equal their last totals
 	// of the previous trading day (left out of every aggregate until a reset or a change).
-	AwaitingReset int         `json:"awaiting_reset"`
-	Issues        int         `json:"issues"`
-	Flows         []ClassFlow `json:"flows"`
-	KPIs          []KPI       `json:"kpis"`
-	Breadth       Breadth     `json:"breadth"`
-	Queues        Unavailable `json:"queues"`
+	AwaitingReset int `json:"awaiting_reset"`
+	// CarryoverCheck: the reference of that rule. OK only when it is the calendar's previous
+	// trading day; otherwise (no stored totals, or a day without data in between) the check
+	// may miss a carryover and the dashboard says so.
+	CarryoverCheck CarryoverCheck `json:"carryover_check"`
+	Issues         int            `json:"issues"`
+	Flows          []ClassFlow    `json:"flows"`
+	KPIs           []KPI          `json:"kpis"`
+	Breadth        Breadth        `json:"breadth"`
+	Queues         Unavailable    `json:"queues"`
+}
+
+// CarryoverCheck describes the post-open carryover reference.
+type CarryoverCheck struct {
+	Day      string `json:"day"`      // day of the reference totals ("" = none)
+	Expected string `json:"expected"` // the calendar's previous trading day
+	OK       bool   `json:"ok"`
 }
 
 // Signal is one radar item (AI-01 anomaly or AI-02 divergence).
@@ -228,7 +239,6 @@ type inst struct {
 	dirty      bool
 	everTraded bool // a snapshot of today showed trading (or unknown volume)
 	awaiting   bool // latest snapshot repeats the previous day's last totals (awaiting a reset)
-	resolved   bool // a snapshot after the open differed from the previous day's totals: no more checks today
 	// Series: the value baseline (the highest value booked so far), when it was seen, and when
 	// the value first fell below it (a dip: zero when none).
 	base   int64
@@ -254,7 +264,7 @@ type State struct {
 	issues  int // issues without an instrument
 	// prev holds each instrument's last totals of the previous trading day (prevDay), for the
 	// post-open carryover rule.
-	prev    map[string]Totals
+	prev    map[string]model.Totals
 	prevDay string
 	// synthetic reports an instrument whose data is not real (rule 5); showSyn keeps it
 	// (labelled) instead of hiding it. Set by the owner (SetSynthetic).
@@ -326,18 +336,15 @@ func (s *State) Advance(day string) bool {
 	return true
 }
 
-// Totals are an instrument's cumulative day totals as the source shows them.
-type Totals struct {
-	Volume     int64 `json:"v"`
-	Value      int64 `json:"val"`
-	TradeCount int64 `json:"n"`
+// DayTotals are the last totals of every instrument seen on (or carried into) Day, the last day
+// with data.
+type DayTotals struct {
+	Day    string                  `json:"day"`
+	Totals map[string]model.Totals `json:"totals"`
 }
 
-// DayTotals are the last totals of every instrument seen on (or carried into) Day.
-type DayTotals struct {
-	Day    string            `json:"day"`
-	Totals map[string]Totals `json:"totals"`
-}
+// PrevKeepDays bounds the carried totals: an instrument not seen for this many days is dropped.
+const PrevKeepDays = 30
 
 // SetPrevTotals sets the previous trading day's last totals (e.g. loaded from storage after a
 // restart); ignored unless dt is of an earlier day than the state's.
@@ -347,30 +354,64 @@ func (s *State) SetPrevTotals(dt DayTotals) {
 	}
 }
 
-// LastTotals returns the latest totals of today per instrument, carrying over the previous
-// day's for instruments not seen today (a halted instrument keeps showing them).
+// LastTotals returns the latest totals of today per instrument (the last snapshot with volume and
+// value), carrying the reference's for instruments not seen today (a halted instrument keeps
+// showing them) and dropping those not seen for PrevKeepDays. With no data today it is the
+// reference itself (its day is the last day with data).
 func (s *State) LastTotals() DayTotals {
-	out := DayTotals{Day: s.day, Totals: map[string]Totals{}}
-	for k, v := range s.prev {
-		out.Totals[k] = v
-	}
+	today := map[string]model.Totals{}
 	for k, in := range s.ins {
-		if sn := &in.snap; sn.InsCode != "" && sn.Has(model.FVolume) && sn.Has(model.FValue) {
-			out.Totals[k] = Totals{Volume: sn.Volume, Value: sn.Value, TradeCount: sn.TradeCount}
+		if t, ok := model.TotalsOf(&in.snap); ok && in.snap.InsCode != "" {
+			t.Seen = s.day
+			today[k] = t
+		}
+	}
+	if len(today) == 0 {
+		return DayTotals{Day: s.prevDay, Totals: s.prev}
+	}
+	out := DayTotals{Day: s.day, Totals: today}
+	cut := ""
+	if d, err := time.ParseInLocation("2006-01-02", s.day, tehran.Loc); err == nil {
+		cut = d.AddDate(0, 0, -PrevKeepDays).Format("2006-01-02")
+	}
+	for k, v := range s.prev {
+		if _, seen := today[k]; !seen && (v.Seen == "" || v.Seen >= cut) {
+			out.Totals[k] = v
 		}
 	}
 	return out
 }
 
-// repeatsPrev reports a snapshot taken at or after the instrument's own open whose totals equal
-// its last totals of the previous trading day, with some activity: the source has not reset
-// its day totals yet (owner decision on PR #3; rule 1).
+// prevTradingDay is the calendar's trading day before day (any class trading), "" if none in
+// the last 3 weeks.
+func (s *State) prevTradingDay(day string) string {
+	d, err := time.ParseInLocation("2006-01-02", day, tehran.Loc)
+	if err != nil {
+		return ""
+	}
+	for i := 1; i <= 21; i++ {
+		c := d.AddDate(0, 0, -i).Add(12 * time.Hour)
+		if _, open := s.cfg.Sessions.Union(c); open {
+			return tehran.TradingDay(c)
+		}
+	}
+	return ""
+}
+
+// repeatsPrev reports a snapshot taken at or after the instrument's own open (or on a day its
+// market is closed) whose totals equal its last totals of the previous day with data, with
+// activity: the source has not reset its day totals (owner decision on PR #3; rule 1). The
+// same model.Totals comparison as the engine's.
 func (s *State) repeatsPrev(sn *model.Snapshot) bool {
+	if sess, ok := s.cfg.Sessions.Session(sn.InsCode, sn.SourceTime); ok && sn.SourceTime.Before(sess.Open) {
+		return false // before the open: the pre-open carryover rule (carryover) applies
+	}
 	p, ok := s.prev[sn.InsCode]
-	if !ok || !sn.Has(model.FVolume) || !sn.Has(model.FValue) || (p.Volume == 0 && p.Value == 0 && p.TradeCount == 0) {
+	if !ok || s.prevDay == "" || s.prevDay >= s.day || !p.Active() {
 		return false
 	}
-	return sn.Volume == p.Volume && sn.Value == p.Value && sn.TradeCount == p.TradeCount
+	t, ok := model.TotalsOf(sn)
+	return ok && t.Same(p)
 }
 
 func (s *State) today(t time.Time) bool { return s.day != "" && tehran.TradingDay(t) == s.day }
@@ -418,15 +459,17 @@ func (s *State) ApplySnapshot(sn model.Snapshot) {
 	prev := in.snap
 	in.snap = sn
 	in.dirty = true
-	// Post-open carryover: until a reset or a change is observed, the snapshot is shown as
-	// awaiting and feeds nothing (not even the series baseline).
-	if !in.resolved {
-		if s.repeatsPrev(&sn) {
-			in.awaiting = true
-			return
-		}
-		in.awaiting, in.resolved = false, true
+	// Post-open carryover: a snapshot repeating the previous day's totals is shown as awaiting
+	// and feeds nothing (not even the series baseline); checked on every snapshot, so a source
+	// flipping back after a reset is caught too. An incomplete snapshot cannot end the wait.
+	if s.repeatsPrev(&sn) {
+		in.awaiting = true
+		return
 	}
+	if _, complete := model.TotalsOf(&sn); in.awaiting && !complete {
+		return
+	}
+	in.awaiting = false
 	in.everTraded = in.everTraded || showsTrading(&sn)
 	if id := seriesKPI(in.class); id != "" && sn.Has(model.FValue) {
 		s.book(id, in, &prev, &sn)
@@ -724,6 +767,8 @@ func (b *Breadth) bucket(last, y int64) {
 // Summary computes every aggregate above the symbols table.
 func (s *State) Summary() Summary {
 	sum := Summary{Day: s.day, Issues: s.issueCount(), Queues: QueuesUnavailable, Carryover: len(s.carried)}
+	exp := s.prevTradingDay(s.day)
+	sum.CarryoverCheck = CarryoverCheck{Day: s.prevDay, Expected: exp, OK: s.prevDay != "" && s.prevDay == exp}
 	flows := map[string]*ClassFlow{}
 	type acc struct {
 		value, n, missing, withV, awaiting int64

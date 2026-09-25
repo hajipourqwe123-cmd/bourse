@@ -378,3 +378,97 @@ func TestPreOpenCarryover(t *testing.T) {
 		t.Error("carryover of the next day not reported")
 	}
 }
+
+// dayEnd feeds IRSTOCK a complete 2026-09-26 (Saturday): zero pre-open baseline, one trade
+// bringing it to 5,000,000 shares. Returns the engine.
+func dayEnd(t *testing.T) *Engine {
+	t.Helper()
+	e := sessEngine()
+	e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	last := sn("IRSTOCK", tt("2026-09-26", "12:29:55"), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900)
+	last.TradeCount = 900
+	if r := e.Process(last); r.Game == nil {
+		t.Fatalf("setup: %+v", r)
+	}
+	return e
+}
+
+// yesterday's last totals shown again on 2026-09-27 (Sunday) at hms.
+func repeat(hms string) model.Snapshot {
+	s := sn("IRSTOCK", tt("2026-09-27", hms), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900)
+	s.TradeCount = 900
+	return s
+}
+
+// Owner decision on PR #3 (rule 1), engine side: after the open, totals equal to the last
+// totals of the previous day are carryover, never a baseline or an interval (review E1: a late
+// reset above yesterday's totals must not book today − yesterday as one hot interval).
+func TestPostOpenCarryoverEngine(t *testing.T) {
+	e := dayEnd(t)
+	rs := []Result{e.Process(repeat("09:00:05")), e.Process(repeat("09:30:00"))}
+	if !hasIssue(rs[0], quality.PrevDayCarryover) || hasIssue(rs[1], quality.PrevDayCarryover) || rs[0].Game != nil || rs[1].Game != nil {
+		t.Fatalf("carryover after the open: %+v", rs)
+	}
+	late := sn("IRSTOCK", tt("2026-09-27", "10:30:00"), 10_000, 6_000_000, 3_600_000, 3_000_000, 950, 900) // reset "above" yesterday
+	late.TradeCount = 1000
+	r := e.Process(late)
+	if !hasIssue(r, quality.DayStartMissed) || r.Game != nil || len(r.Events) != 0 {
+		t.Fatalf("the first changed snapshot is a late baseline, no interval from yesterday: %+v", r)
+	}
+	next := sn("IRSTOCK", tt("2026-09-27", "10:30:05"), 10_000, 6_100_000, 3_700_000, 3_000_000, 951, 900)
+	next.TradeCount = 1001
+	if r = e.Process(next); r.Game == nil || !r.Game.Partial || r.Game.NetHotPlus+r.Game.NetHot+r.Game.NetRetail+r.Game.NetUnattributed != 1_000_000_000 {
+		t.Errorf("today's flow only (+100,000 shares × 10,000): %+v", r.Game)
+	}
+}
+
+// Review E2: a zero pre-open baseline, then the source flips back to yesterday's totals after
+// the open: never booked as today's.
+func TestFlipBackAfterZeroBaseline(t *testing.T) {
+	e := dayEnd(t)
+	e.Process(sn("IRSTOCK", tt("2026-09-27", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	if r := e.Process(repeat("09:00:05")); !hasIssue(r, quality.PrevDayCarryover) || r.Game != nil {
+		t.Fatalf("flip-back: %+v", r)
+	}
+	today := sn("IRSTOCK", tt("2026-09-27", "09:00:10"), 10_000, 300_000, 300_000, 200_000, 1, 0)
+	if r := e.Process(today); r.Game == nil || r.Game.Partial || r.Game.NetHot != 3_000_000_000 {
+		t.Errorf("today's interval from the zero baseline: %+v", r.Game)
+	}
+}
+
+// Review E3: a missing trade count cannot contradict zero volume and value (documented).
+func TestZeroBaselineWithMissingTradeCount(t *testing.T) {
+	e := sessEngine()
+	z := sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0)
+	z.Missing = []string{model.FTradeCount}
+	if r := e.Process(z); hasIssue(r, quality.PrevDayCarryover) || hasIssue(r, quality.DayStartMissed) {
+		t.Errorf("zero volume and value, trade count missing: %+v", r.Issues)
+	}
+}
+
+// The reference survives a restart (recovery replays only the current day) and is pruned.
+func TestPrevTotalsPersistence(t *testing.T) {
+	e := dayEnd(t)
+	e.TakeRolled()
+	e.Process(repeat("08:30:00")) // first snapshot of 09-27: rolls (pre-open carryover)
+	if !e.TakeRolled() || e.TakeRolled() {
+		t.Fatal("the roll must be reported exactly once")
+	}
+	day, m := e.PrevTotals()
+	if day != "2026-09-26" || m["IRSTOCK"].Volume != 5_000_000 || m["IRSTOCK"].Seen != "2026-09-26" {
+		t.Fatalf("reference = %s %+v", day, m)
+	}
+	fresh := sessEngine() // a restarted engine, reference loaded from storage
+	fresh.SetPrevTotals(day, m)
+	if r := fresh.Process(repeat("09:00:05")); !hasIssue(r, quality.PrevDayCarryover) {
+		t.Errorf("restarted engine must apply the loaded reference: %+v", r.Issues)
+	}
+	// An instrument not seen for more than PrevKeepDays is dropped at the next roll.
+	old := sessEngine()
+	old.SetPrevTotals("2026-08-01", map[string]model.Totals{"GONE": {Volume: 1, Seen: "2026-08-01"}, "IRSTOCK": {Volume: 1, Seen: "2026-09-20"}})
+	old.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	old.Process(sn("IRSTOCK", tt("2026-09-27", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	if _, m := old.PrevTotals(); m["GONE"] != (model.Totals{}) || m["IRSTOCK"].Seen != "2026-09-26" {
+		t.Errorf("pruning: %+v", m)
+	}
+}

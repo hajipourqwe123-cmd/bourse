@@ -177,7 +177,7 @@ func TestRecoveryStart(t *testing.T) {
 // the margin are included, and nothing after the ack floor is touched.
 func TestRecoverStateReplaysTradingDayUpToFloor(t *testing.T) {
 	d := day("2026-09-23", 1, 3, 5)
-	prev := day("2026-09-22", 1, 2, 5)
+	prev := day("2026-09-22", 1, 2, 6) // own seed: identical totals would be (correctly) carryover
 	f := &fakeBus{floor: 4}
 	f.add(1, tehranTime("2026-09-22", "12:00"), prev[0]) // outside the window
 	f.add(2, tehranTime("2026-09-22", "23:30"), prev[1]) // inside the 1h margin
@@ -724,5 +724,33 @@ func TestReplayIssuesOnlyAfterLossAndPublishedAtRecovery(t *testing.T) {
 	}
 	if fmt.Sprint(pub.ids) != "[eng:1:dsm:SYNTEST0000:2026-09-23]" || pub.subj[0] != "quality.SYNTEST0000" {
 		t.Fatalf("published %v on %v", pub.ids, pub.subj)
+	}
+}
+
+// The previous-day reference is saved at a day change (rotating the older record) and loaded at
+// recovery as the newest record older than the replayed day.
+func TestPrevTotalsSaveRotateLoad(t *testing.T) {
+	f := &fakeBus{}
+	p := newTestProcessor(f, &recPub{})
+	p.eng.SetPrevTotals("2026-09-22", map[string]model.Totals{"A": {Volume: 1}})
+	if err := p.savePrev(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.eng.SetPrevTotals("2026-09-23", map[string]model.Totals{"A": {Volume: 2}})
+	_ = p.savePrev(context.Background())
+	_ = p.savePrev(context.Background()) // same day again: must not rotate over the older record
+	for day, want := range map[string]int64{"2026-09-24": 2, "2026-09-23": 1, "": 2} {
+		q := newTestProcessor(f, &recPub{})
+		if err := q.loadPrev(context.Background(), day); err != nil {
+			t.Fatal(err)
+		}
+		if _, m := q.eng.PrevTotals(); m["A"].Volume != want {
+			t.Errorf("replaying %q: loaded volume %d, want %d", day, m["A"].Volume, want)
+		}
+	}
+	q := newTestProcessor(f, &recPub{})
+	_ = q.loadPrev(context.Background(), "2026-09-22") // nothing older: no reference
+	if d, _ := q.eng.PrevTotals(); d != "" {
+		t.Errorf("reference %q loaded for a day it is not older than", d)
 	}
 }

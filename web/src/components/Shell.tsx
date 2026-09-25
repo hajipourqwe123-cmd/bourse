@@ -114,6 +114,15 @@ export function DataHealth() {
         </span>
       )}
       {s.state?.calendar_unverified && <span className="chip chip-warn" style={{ alignSelf: "flex-start" }}>تقویم جلسات تأییدنشده</span>}
+      {s.summary && !s.summary.carryover_check.ok && (
+        <span
+          className="chip chip-warn"
+          style={{ alignSelf: "flex-start" }}
+          title={`مرجع مقایسه: ${s.summary.carryover_check.day || "ندارد"}؛ روز معاملاتی قبل: ${s.summary.carryover_check.expected || "نامعلوم"}`}
+        >
+          بررسی مانده روز قبل ناقص است
+        </span>
+      )}
     </section>
   );
 }

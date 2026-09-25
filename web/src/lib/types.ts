@@ -99,6 +99,7 @@ export interface Summary {
   unknown_notice: boolean;
   carryover: number;
   awaiting_reset: number;
+  carryover_check: { day: string; expected: string; ok: boolean };
   issues: number;
   flows: ClassFlow[];
   kpis: KPI[];

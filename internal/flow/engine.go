@@ -71,6 +71,86 @@ type Engine struct {
 	state    map[string]*symState
 	estDay   map[string]string // trading day SOURCE_TIME_ESTIMATED was last reported, per instrument
 	carryDay map[string]string // trading day PREV_DAY_CARRYOVER was last reported, per instrument
+
+	// Previous-day carryover after the open (owner decision on PR #3): each instrument's last
+	// accepted totals of the previous day(s) with data (prevDay), rolled when the first snapshot
+	// of a new day arrives (rolled tells the runner to persist them: a restart replays only the
+	// current day).
+	curDay  string
+	prev    map[string]model.Totals
+	prevDay string
+	rolled  bool
+}
+
+// PrevKeepDays bounds the carried totals: an instrument not seen for this many days is dropped.
+const PrevKeepDays = 30
+
+// PrevTotals returns the previous-day reference (for persistence).
+func (e *Engine) PrevTotals() (day string, totals map[string]model.Totals) { return e.prevDay, e.prev }
+
+// SetPrevTotals installs a persisted previous-day reference (at recovery, before the replay).
+func (e *Engine) SetPrevTotals(day string, totals map[string]model.Totals) {
+	e.prevDay, e.prev = day, totals
+	if e.prev == nil {
+		e.prev = map[string]model.Totals{}
+	}
+}
+
+// TakeRolled reports (once) that the previous-day reference changed since the last call.
+func (e *Engine) TakeRolled() bool {
+	r := e.rolled
+	e.rolled = false
+	return r
+}
+
+// roll moves to trading day day: every instrument's last accepted totals of an earlier day
+// become the reference, merged over the older reference (instruments not seen since keep
+// theirs, dropped after PrevKeepDays).
+func (e *Engine) roll(day string) {
+	if day <= e.curDay {
+		return
+	}
+	if e.curDay == "" { // fresh process: the reference is what SetPrevTotals installed
+		e.curDay = day
+		return
+	}
+	next := make(map[string]model.Totals, len(e.prev)+len(e.state))
+	for k, v := range e.prev {
+		next[k] = v
+	}
+	newest := e.prevDay
+	for ins, st := range e.state {
+		if st.day >= day || st.prev == nil {
+			continue
+		}
+		if t, ok := model.TotalsOf(st.prev); ok {
+			t.Seen = st.day
+			next[ins] = t
+			if st.day > newest {
+				newest = st.day
+			}
+		}
+	}
+	if d, err := time.ParseInLocation("2006-01-02", day, tehran.Loc); err == nil {
+		cut := d.AddDate(0, 0, -PrevKeepDays).Format("2006-01-02")
+		for k, v := range next {
+			if v.Seen != "" && v.Seen < cut {
+				delete(next, k)
+			}
+		}
+	}
+	e.prev, e.prevDay, e.curDay, e.rolled = next, newest, day, true
+}
+
+// repeatsPrev: s shows exactly the instrument's last totals of the previous day with data, with
+// activity: the source has not reset its day totals.
+func (e *Engine) repeatsPrev(s *model.Snapshot, day string) (model.Totals, bool) {
+	p, ok := e.prev[s.InsCode]
+	if !ok || e.prevDay == "" || e.prevDay >= day || !p.Active() {
+		return p, false
+	}
+	t, ok := model.TotalsOf(s)
+	return p, ok && t.Same(p)
 }
 
 // New returns an engine with cfg (a nil calendar means the embedded one).
@@ -81,7 +161,8 @@ func New(cfg Config) *Engine {
 	if cfg.GapAfter <= 0 {
 		cfg.GapAfter = 30 * time.Second
 	}
-	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}, carryDay: map[string]string{}}
+	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}, carryDay: map[string]string{},
+		prev: map[string]model.Totals{}}
 }
 
 func (e *Engine) band(avg int64) model.Band {
@@ -98,6 +179,7 @@ func (e *Engine) band(avg int64) model.Band {
 // Process consumes one snapshot.
 func (e *Engine) Process(s model.Snapshot) Result {
 	var r Result
+	e.roll(tehran.TradingDay(s.SourceTime))
 	class := e.cfg.Sessions.Class(s.InsCode)
 	sess, open := e.cfg.Sessions.Session(s.InsCode, s.SourceTime)
 	inSession := false
@@ -127,18 +209,31 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		r.Issues = append(r.Issues, quality.EarlierDay(&s, st.prev))
 		return r
 	}
-	// Before the instrument's own open nothing trades: a snapshot showing day activity (volume,
-	// value or trade count ≠ 0) is the source's previous-day carryover, never a baseline nor an
-	// interval, reported once per instrument and day (owner decision on DL-01, PR #3). A zero one
-	// is a valid day baseline even after carryover polls.
-	zero := s.Volume == 0 && s.Value == 0 && s.TradeCount == 0
-	if open && s.SourceTime.Before(sess.Open) && !zero {
+	// Previous-day carryover (owner decisions on PR #3), never a baseline nor an interval,
+	// reported once per instrument and day as PREV_DAY_CARRYOVER:
+	//   - before the instrument's own open nothing trades: a snapshot showing day activity
+	//     (volume, value or a present trade count ≠ 0) is carryover; a zero one is a valid day
+	//     baseline even after carryover polls (a missing trade count cannot contradict zero
+	//     volume and value);
+	//   - at or after the open (or on a day its market is closed), a snapshot whose totals equal
+	//     the instrument's last totals of the previous day with data is carryover too, whenever
+	//     it comes (also after a zero baseline: a source flipping back must not book yesterday).
+	tot, _ := model.TotalsOf(&s)
+	zero := !tot.Active()
+	carry := ""
+	if open && s.SourceTime.Before(sess.Open) {
+		if !zero {
+			carry = fmt.Sprintf("pre-open snapshot at %s shows day volume %d, value %d, trades %d before the %s open (%s): previous-day totals, not a baseline",
+				s.SourceTime.In(tehran.Loc).Format("15:04:05"), s.Volume, s.Value, s.TradeCount, class, sess.Open.In(tehran.Loc).Format("15:04"))
+		}
+	} else if _, same := e.repeatsPrev(&s, day); same {
+		carry = fmt.Sprintf("snapshot at %s repeats the last totals of %s (volume %d, value %d): the source has not reset its day totals; not a baseline",
+			s.SourceTime.In(tehran.Loc).Format("15:04:05"), e.prevDay, s.Volume, s.Value)
+	}
+	if carry != "" {
 		if e.carryDay[s.InsCode] != day {
 			e.carryDay[s.InsCode] = day
-			r.Issues = append(r.Issues, quality.Carryover(&s, fmt.Sprintf(
-				"pre-open snapshot at %s shows day volume %d, value %d, trades %d before the %s open (%s): previous-day totals, not a baseline",
-				s.SourceTime.In(tehran.Loc).Format("15:04:05"), s.Volume, s.Value, s.TradeCount, class,
-				sess.Open.In(tehran.Loc).Format("15:04"))))
+			r.Issues = append(r.Issues, quality.Carryover(&s, carry))
 		}
 		return r
 	}

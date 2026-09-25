@@ -353,6 +353,9 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: snapshots were lost; affected days are marked partial by the late-start rule (DAY_START_MISSED)",
 			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339), floor, floorDay)
 	}
+	if err := p.loadPrev(ctx, floorDay); err != nil {
+		return 0, err
+	}
 	replayIssues := map[string]output{}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
 		s, err := decode(m.Subject, m.Data)
@@ -399,6 +402,7 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		}
 		log.Printf("engine: recovery: published %d DAY_START_MISSED issue(s) from the replay", len(outs))
 	}
+	p.eng.TakeRolled() // the reference rebuilt by the replay is the stored one
 	p.lastSeq = floor
 	return replayed, nil
 }
@@ -501,6 +505,13 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
+	if p.eng.TakeRolled() {
+		// A new trading day: persist the previous-day reference BEFORE anything of this day is
+		// published or acked (a restart replays only the current day and needs it).
+		if err := bus.Retry(ctx, p.retry, keepAlive, func() error { return p.savePrev(ctx) }); err != nil {
+			return bus.Abort(fmt.Errorf("save previous-day totals: %w", err))
+		}
+	}
 	for i := range outs {
 		if iss, ok := outs[i].v.(model.QualityIssue); ok && iss.Code == quality.DayStartMissed {
 			outs[i].id = p.dsmID(s.InsCode, tehran.TradingDay(s.SourceTime))
@@ -511,6 +522,62 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	p.lastSeq = m.StreamSeq
 	p.checkpoint(ctx, s, m.StreamSeq)
+	return nil
+}
+
+// KV keys (service_state) of the engine's previous-day reference: the latest record and the
+// one before it, so a restart can pick the record older than the day it replays.
+const (
+	keyPrev       = "engine_prev_totals"
+	keyPrevBefore = "engine_prev_totals_before"
+)
+
+type prevRecord struct {
+	Day    string                  `json:"day"`
+	Totals map[string]model.Totals `json:"totals"`
+}
+
+// savePrev stores the engine's previous-day reference, rotating an older stored record.
+func (p *processor) savePrev(ctx context.Context) error {
+	if p.guard != nil {
+		if err := p.guard(); err != nil {
+			return bus.Permanent(err)
+		}
+	}
+	day, totals := p.eng.PrevTotals()
+	b, err := json.Marshal(prevRecord{Day: day, Totals: totals})
+	if err != nil {
+		return bus.Permanent(err)
+	}
+	old, ok, err := p.js.StateGet(ctx, keyPrev)
+	if err != nil {
+		return err
+	}
+	var rec prevRecord
+	if ok && json.Unmarshal(old, &rec) == nil && rec.Day != "" && rec.Day < day {
+		if err := p.js.StatePut(ctx, keyPrevBefore, old); err != nil {
+			return err
+		}
+	}
+	return p.js.StatePut(ctx, keyPrev, b)
+}
+
+// loadPrev installs the stored previous-day reference older than day (the day being replayed).
+func (p *processor) loadPrev(ctx context.Context, day string) error {
+	for _, key := range []string{keyPrev, keyPrevBefore} {
+		b, ok, err := p.js.StateGet(ctx, key)
+		if err != nil {
+			return fmt.Errorf("recovery: load %s: %w", key, err)
+		}
+		var rec prevRecord
+		if !ok || json.Unmarshal(b, &rec) != nil || rec.Day == "" || (day != "" && rec.Day >= day) {
+			continue
+		}
+		p.eng.SetPrevTotals(rec.Day, rec.Totals)
+		log.Printf("engine: recovery: previous-day totals of %s loaded (%d instruments)", rec.Day, len(rec.Totals))
+		return nil
+	}
+	log.Printf("engine: recovery: no stored previous-day totals before %q; post-open carryover is not detected until the next day", day)
 	return nil
 }
 
