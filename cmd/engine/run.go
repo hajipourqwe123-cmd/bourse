@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"bourse/internal/anomaly"
 	"bourse/internal/bus"
+	"bourse/internal/calendar"
 	"bourse/internal/flow"
 	"bourse/internal/model"
 	"bourse/internal/quality"
@@ -26,6 +28,7 @@ import (
 type output struct {
 	subject string
 	v       any
+	id      string // explicit message ID (re-emitted outputs keep their original one); "" = prefix:index
 }
 
 // processor owns the engine state. Not safe for concurrent use (see flow.Engine).
@@ -42,11 +45,12 @@ type processor struct {
 	cpDay   string // trading day recorded in the checkpoint (for this MD epoch)
 
 	// loss is set by recovery when snapshots were discarded from MD before this engine applied
-	// them (or before it could replay them). Each instrument's first complete snapshot after
-	// recovery is its new baseline; first records whether data of that day before it was lost.
-	loss    *lossInfo
-	first   map[string]firstSeen // by instrument and trading day (dayKey)
-	flagged map[string]bool      // (instrument, day) already given a RECOVERY_TRUNCATED issue
+	// them (or before it could replay them); logged only: the affected days are marked partial by
+	// the flow engine's late-start rule (their first retained snapshot is a late baseline).
+	loss        *lossInfo
+	cal         *calendar.Calendar
+	unmapped    map[string]bool // unmapped instruments seen on unmappedDay
+	unmappedDay string
 
 	guard          func() error // e.g. lease validity; checked before every publish (nil = none)
 	allowSynthetic bool         // accept SYN* snapshots (ALLOW_SYNTHETIC_ON_BUS=1, local demos only)
@@ -54,10 +58,40 @@ type processor struct {
 }
 
 func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
-	return &processor{eng: flow.New(cfg), radar: anomaly.New(anomaly.DefaultConfig()), pub: pub,
-		retry:   []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second},
-		first:   map[string]firstSeen{},
-		flagged: map[string]bool{}}
+	rc := anomaly.DefaultConfig()
+	rc.Sessions = cfg.Sessions // one calendar for every time rule
+	if cfg.Sessions == nil {
+		cfg.Sessions = calendar.Default()
+	}
+	return &processor{eng: flow.New(cfg), radar: anomaly.New(rc), pub: pub, cal: cfg.Sessions,
+		retry:    []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second},
+		unmapped: map[string]bool{}}
+}
+
+// dsmID is the message ID of an instrument's DAY_START_MISSED for one day: stable across
+// restarts and the same whether it was published live or re-emitted after a recovery replay.
+func (p *processor) dsmID(ins, day string) string {
+	return fmt.Sprintf("eng:%d:dsm:%s:%s", p.epoch, ins, day)
+}
+
+// noteUnmapped logs, per trading day, when the 1st, 10th, 100th, 1000th instrument without a
+// class in the session calendar is seen (class "unknown": union session, no per-class aggregates).
+func (p *processor) noteUnmapped(s *model.Snapshot) {
+	if p.cal.Mapped(s.InsCode) {
+		return
+	}
+	if day := tehran.TradingDay(s.SourceTime); day != p.unmappedDay {
+		p.unmappedDay, p.unmapped = day, map[string]bool{}
+	}
+	if p.unmapped[s.InsCode] {
+		return
+	}
+	p.unmapped[s.InsCode] = true
+	switch n := len(p.unmapped); n {
+	case 1, 10, 100, 1000:
+		log.Printf("engine: WARNING: %d instrument(s) without a class in the session calendar on %s (latest %s; class %q, see docs/sessions.md)",
+			n, p.unmappedDay, s.InsCode, calendar.Unknown)
+	}
 }
 
 // lossInfo describes snapshots discarded from MD that the current state never saw.
@@ -67,87 +101,31 @@ type lossInfo struct {
 	replayBefore      time.Time // as replayDay when the day is unknown: those stored before this
 }
 
-func dayKey(ins, day string) string { return ins + "|" + day }
-
-// firstSeen is an instrument's first complete snapshot of a trading day after recovery (its
-// baseline for that day).
-type firstSeen struct {
-	day     string    // its trading day
-	window  time.Time // its 10-minute window
-	partial bool      // trades of that day before it were lost: day totals and that window are partial
-}
-
-func (l *lossInfo) decide(s model.Snapshot) firstSeen {
-	day, ds := tehran.TradingDay(s.SourceTime), tehran.DayStart(s.SourceTime)
-	lost := (!l.unprocessedBefore.IsZero() && ds.Before(l.unprocessedBefore)) ||
-		(l.replayDay != "" && day == l.replayDay) ||
-		(!l.replayBefore.IsZero() && ds.Before(l.replayBefore))
-	// Volume is day-to-date: zero means nothing traded that day before this baseline.
-	return firstSeen{day: day, window: tehran.Floor10m(s.SourceTime), partial: lost && s.Volume > 0}
-}
-
-func hasFlowFields(s *model.Snapshot) bool {
-	for _, f := range model.FlowFields {
-		if !s.Has(f) {
-			return false
-		}
-	}
-	return true
-}
-
-// markPartial flags the day totals and the 10-minute window that contain an instrument's lost
-// data. The flow engine re-baselines each instrument on its first complete snapshot after
-// recovery, so what is missing is that day's activity up to that snapshot: the day totals of
-// that day and the window containing the snapshot (later windows are complete).
-func (p *processor) markPartial(s *model.Snapshot, r *flow.Result) {
-	if p.loss == nil {
-		return
-	}
-	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
-	fs, ok := p.first[key]
-	if !ok {
-		if !hasFlowFields(s) {
-			return // incomplete snapshots never become baselines
-		}
-		fs = p.loss.decide(*s)
-		p.first[key] = fs
-	}
-	if !fs.partial {
-		return
-	}
-	if r.Game != nil && r.Game.Day == fs.day {
-		r.Game.Partial = true
-	}
-	if r.Window != nil && !r.Window.WindowStart.After(fs.window) {
-		r.Window.Partial = true
-	}
-}
-
 // compute runs one snapshot through the engine and radar. It mutates state exactly once per
 // snapshot, whether or not the outputs are published afterwards (recovery discards them).
 func (p *processor) compute(s model.Snapshot) []output {
 	var outs []output
+	p.noteUnmapped(&s)
 	r := p.eng.Process(s)
-	p.markPartial(&s, &r) // before the radar: AI-02 must not run on a partial window
 	for _, i := range r.Issues {
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), i})
+		outs = append(outs, output{subject: bus.SubjQuality(s.InsCode), v: i})
 	}
 	for _, e := range r.Events {
-		outs = append(outs, output{bus.SubjFlow(s.InsCode), e})
+		outs = append(outs, output{subject: bus.SubjFlow(s.InsCode), v: e})
 	}
 	if r.Game != nil {
-		outs = append(outs, output{bus.SubjGame(s.InsCode), r.Game})
+		outs = append(outs, output{subject: bus.SubjGame(s.InsCode), v: r.Game})
 	}
 	if r.Window != nil {
-		outs = append(outs, output{bus.SubjWindow(s.InsCode), r.Window})
-		if !r.Window.Partial {
+		outs = append(outs, output{subject: bus.SubjWindow(s.InsCode), v: r.Window})
+		if !r.Window.Partial { // AI-02 must not run on a partial window
 			if ev := p.radar.Divergence(r.Window); ev != nil {
-				outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+				outs = append(outs, output{subject: bus.SubjAI(s.InsCode), v: ev})
 			}
 		}
 	}
 	for _, ev := range p.radar.Observe(r.Interval) {
-		outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+		outs = append(outs, output{subject: bus.SubjAI(s.InsCode), v: ev})
 	}
 	return outs
 }
@@ -163,7 +141,6 @@ type idPublisher interface {
 // progressing publish never outlives the consumer's AckWait.
 func (p *processor) publish(ctx context.Context, outs []output, idPrefix string, keepAlive func()) error {
 	idp, useID := p.pub.(idPublisher)
-	useID = useID && idPrefix != ""
 	last := time.Now()
 	alive := func() {
 		if keepAlive != nil && time.Since(last) >= time.Second {
@@ -174,14 +151,18 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 	var guardErr error
 	for i, o := range outs {
 		alive()
+		id := o.id
+		if id == "" && idPrefix != "" {
+			id = fmt.Sprintf("%s:%d", idPrefix, i)
+		}
 		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if p.guard != nil { // before EVERY attempt, retries included
 				if guardErr = p.guard(); guardErr != nil {
 					return bus.Permanent(guardErr) // no point retrying without the lease
 				}
 			}
-			if useID {
-				return idp.PublishID(o.subject, fmt.Sprintf("%s:%d", idPrefix, i), o.v)
+			if useID && id != "" {
+				return idp.PublishID(o.subject, id, o.v)
 			}
 			return p.pub.Publish(o.subject, o.v)
 		})
@@ -340,15 +321,26 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	}
 	if loss != (lossInfo{}) {
 		p.loss = &loss
-		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: affected day totals and windows will be published partial=true with RECOVERY_TRUNCATED",
+		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: snapshots were lost; affected days are marked partial by the late-start rule (DAY_START_MISSED)",
 			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339), floor, floorDay)
 	}
+	replayIssues := map[string]output{}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
 		s, err := decode(m.Subject, m.Data)
 		if err != nil || (model.IsSynthetic(&s) && !p.allowSynthetic) {
 			return nil // was terminated (and reported) when first consumed
 		}
-		p.compute(s)
+		for _, o := range p.compute(s) {
+			if iss, ok := o.v.(model.QualityIssue); ok && iss.Code == quality.DayStartMissed {
+				// Keyed by instrument and day: a later replayed baseline of the same day (after a
+				// re-baseline) keeps the first issue; its stable ID de-duplicates across processes.
+				key := s.InsCode + "|" + tehran.TradingDay(s.SourceTime)
+				if _, seen := replayIssues[key]; !seen {
+					replayIssues[key] = output{subject: bus.SubjQuality(s.InsCode), v: iss,
+						id: p.dsmID(s.InsCode, tehran.TradingDay(s.SourceTime))}
+				}
+			}
+		}
 		replayed++
 		return nil
 	})
@@ -357,6 +349,26 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	}
 	if gerr == nil && last != floor {
 		return replayed, fmt.Errorf("recovery replay stopped at seq %d before the ack floor %d", last, floor)
+	}
+	// Replay outputs are discarded. When the replay was complete the previous process already
+	// published every DAY_START_MISSED it contains; when snapshots were lost, a replayed baseline
+	// may be new (the lost ones were the real baseline), so its issue is published now, before
+	// consuming, under the stable per-(instrument, day) ID (a duplicate of an earlier publish is
+	// de-duplicated within the window). Never dropped if the instrument does not trade again.
+	if p.loss != nil && len(replayIssues) > 0 {
+		keys := make([]string, 0, len(replayIssues))
+		for k := range replayIssues {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		outs := make([]output, 0, len(keys))
+		for _, k := range keys {
+			outs = append(outs, replayIssues[k])
+		}
+		if err := p.publish(ctx, outs, "", nil); err != nil {
+			return replayed, fmt.Errorf("recovery: publish DAY_START_MISSED: %w", err)
+		}
+		log.Printf("engine: recovery: published %d DAY_START_MISSED issue(s) from the replay", len(outs))
 	}
 	p.lastSeq = floor
 	return replayed, nil
@@ -410,7 +422,7 @@ func (p *processor) poison(ctx context.Context, m bus.Msg) error {
 	err := fmt.Errorf("POISON_SUSPECT: MD %s (%s) delivered %d times without success; not processing it. "+
 		"Inspect it (stream MD), fix the cause, then restart with ENGINE_RETRY_POISON_SEQ=%d to process it once more; "+
 		"the engine never skips it on its own", seqs, m.Subject, m.NumDelivered, m.StreamSeq)
-	if perr := p.publish(ctx, []output{{bus.SubjQuality(ins), iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
+	if perr := p.publish(ctx, []output{{subject: bus.SubjQuality(ins), v: iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
 		err = fmt.Errorf("%w (reporting it also failed: %v)", err, perr)
 	}
 	return bus.Abort(err)
@@ -446,7 +458,7 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	if derr != nil {
 		iss := model.QualityIssue{InsCode: strings.TrimPrefix(m.Subject, "md.snap."), Code: quality.Undecodable,
 			Detail: fmt.Sprintf("stream seq %d: payload is not a valid snapshot: %v", m.StreamSeq, derr), At: m.Stored}
-		if err := p.publish(ctx, []output{{bus.SubjQuality(iss.InsCode), iss}}, id, keepAlive); err != nil {
+		if err := p.publish(ctx, []output{{subject: bus.SubjQuality(iss.InsCode), v: iss}}, id, keepAlive); err != nil {
 			return bus.Abort(err)
 		}
 		p.lastSeq = m.StreamSeq
@@ -460,12 +472,10 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
-	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
-	if fs, ok := p.first[key]; ok && fs.partial && !p.flagged[key] {
-		p.flagged[key] = true
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
-			Detail: fmt.Sprintf("engine restarted after snapshots of %s before %s were discarded from the bus; day totals and that 10-minute window are partial",
-				fs.day, fs.window.In(tehran.Loc).Format("15:04")), At: s.IngestTime}})
+	for i := range outs {
+		if iss, ok := outs[i].v.(model.QualityIssue); ok && iss.Code == quality.DayStartMissed {
+			outs[i].id = p.dsmID(s.InsCode, tehran.TradingDay(s.SourceTime))
+		}
 	}
 	if err := p.publish(ctx, outs, id, keepAlive); err != nil {
 		return bus.Abort(err)

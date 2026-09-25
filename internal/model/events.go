@@ -34,6 +34,7 @@ const (
 type FlowEvent struct {
 	InsCode      string      `json:"ins_code"`
 	Symbol       string      `json:"symbol"`
+	Class        string      `json:"class"` // instrument class from the session calendar ("unknown" if unmapped)
 	Side         Side        `json:"side"`
 	Band         Band        `json:"band"`
 	Attribution  Attribution `json:"attribution"`
@@ -58,13 +59,13 @@ type QualityIssue struct {
 // TenMinute aggregates one instrument's flow in one 10-minute window (the "big moves" matrix).
 type TenMinute struct {
 	InsCode     string    `json:"ins_code"`
+	Class       string    `json:"class"` // instrument class ("unknown" if unmapped)
 	WindowStart time.Time `json:"window_start"`
 	NetHot      int64     `json:"net_hot"`    // rial, attributed hot buy − attributed hot sell
 	PriceOpen   int64     `json:"price_open"` // first last-price seen in window
 	PriceLastV  int64     `json:"price_last"` // latest last-price seen in window
-	// Partial is true when snapshots of this window were lost before the engine applied them
-	// (engine restart after the bus discarded them): NetHot then covers only part of the window.
-	// The flow engine never sets it; see RECOVERY_TRUNCATED in docs/data-quality.md.
+	// Partial is true for the window holding a late day baseline (see GameTotals.Partial): the
+	// activity before that baseline is missing from NetHot. DAY_START_MISSED in docs/data-quality.md.
 	Partial bool `json:"partial"`
 }
 
@@ -79,14 +80,16 @@ func (t TenMinute) ChangePct() float64 {
 // GameTotals accumulates the "market game" split for one instrument for the day (rial, net = buy − sell).
 type GameTotals struct {
 	InsCode    string `json:"ins_code"`
+	Class      string `json:"class"` // instrument class ("unknown" if unmapped); per-class aggregates exclude unknown
 	Day        string `json:"day"`
 	NetHot     int64  `json:"net_hot"`
 	NetHotPlus int64  `json:"net_hot_plus"`
 	NetRetail  int64  `json:"net_retail"`
 	// NetUnattributed holds flow that cannot be banded (existing participants trading again).
 	NetUnattributed int64 `json:"net_unattributed"`
-	// Partial is true when snapshots of this day were lost before the engine applied them
-	// (engine restart after the bus discarded them): the totals cover only part of the day.
-	// The flow engine never sets it; see RECOVERY_TRUNCATED in docs/data-quality.md.
+	// Partial is true unless the day's first accepted baseline was taken before the instrument's
+	// own session open with zero volume: otherwise trades before it are not counted (late start,
+	// data lost upstream, engine restart after the bus discarded the start of the day).
+	// DAY_START_MISSED in docs/data-quality.md.
 	Partial bool `json:"partial"`
 }

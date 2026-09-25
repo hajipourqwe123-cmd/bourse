@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"bourse/internal/calendar"
 	"bourse/internal/flow"
 	"bourse/internal/model"
 	"bourse/internal/tehran"
@@ -57,12 +58,28 @@ func TestSpikeDetectedAfterWarmUp(t *testing.T) {
 	}
 }
 
+// The opening skip is relative to the instrument's OWN open: a stock (09:00) is not scored at
+// 09:05; a gold fund (12:00) is not scored at 12:10 but is at 12:20.
 func TestOpeningWindowNotScored(t *testing.T) {
-	r := New(DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"X": "stock"})
+	r := New(cfg)
 	feed(r, 200)
 	open := day.Add(9*time.Hour + 5*time.Minute)
 	if evs := r.Observe(iv(open, 5_000_000_000, 4_000_000_000)); len(evs) != 0 {
 		t.Fatalf("opening window must not be scored: %+v", evs)
+	}
+	cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"X": "gold"})
+	for _, c := range []struct {
+		hm     time.Duration
+		scored bool
+	}{{12*time.Hour + 10*time.Minute, false}, {12*time.Hour + 20*time.Minute, true}} {
+		r := New(cfg)
+		feed(r, 200)
+		evs := r.Observe(iv(day.Add(c.hm), 5_000_000_000, 4_000_000_000))
+		if (len(evs) != 0) != c.scored {
+			t.Errorf("gold fund at %s: %d events, scored want %v", c.hm, len(evs), c.scored)
+		}
 	}
 }
 
@@ -92,5 +109,35 @@ func TestDivergenceOncePerWindow(t *testing.T) {
 	w3 := &model.TenMinute{InsCode: "X", WindowStart: ws.Add(20 * time.Minute), NetHot: 6_000_000_000, PriceOpen: 10_000, PriceLastV: 10_200}
 	if ev := r.Divergence(w3); ev != nil {
 		t.Fatalf("price rose 2%%: no divergence, got %+v", ev)
+	}
+}
+
+// Unmapped instruments (class unknown) are not scored within the skip after ANY class's open
+// (08:30, 09:00, 12:00 on a normal day); closed days neither score nor train the baseline.
+func TestUnknownClassAndClosedDay(t *testing.T) {
+	cfg := DefaultConfig()
+	for _, c := range []struct {
+		at     time.Duration
+		scored bool
+	}{{9*time.Hour + 5*time.Minute, false}, {9*time.Hour + 20*time.Minute, true}, {12*time.Hour + 5*time.Minute, false}, {12*time.Hour + 20*time.Minute, true}} {
+		r := New(cfg)
+		feed(r, 200)
+		evs := r.Observe(iv(day.Add(c.at), 5_000_000_000, 4_000_000_000)) // "X" is unmapped
+		if (len(evs) != 0) != c.scored {
+			t.Errorf("unknown class at %s: %d events, scored want %v", c.at, len(evs), c.scored)
+		}
+	}
+	r := New(cfg)
+	feed(r, 200)
+	thursday := time.Date(2026, 10, 1, 10, 0, 0, 0, tehran.Loc)
+	before := r.state["X"].feats[FeatValueRate].n
+	if evs := r.Observe(iv(thursday, 5_000_000_000, 4_000_000_000)); len(evs) != 0 {
+		t.Errorf("scored on a Thursday: %+v", evs)
+	}
+	if r.state["X"].feats[FeatValueRate].n != before {
+		t.Error("closed-day interval trained the baseline")
+	}
+	if New(Config{OpeningSkip: time.Minute, ZThreshold: 4, WarmUp: 1}).cfg.Sessions == nil {
+		t.Error("nil calendar not defaulted")
 	}
 }

@@ -3,3 +3,6 @@
 *.log
 /out/
 out.ndjson
+/collector
+/engine
+/syngen

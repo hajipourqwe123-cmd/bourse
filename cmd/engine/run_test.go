@@ -30,7 +30,7 @@ import (
 func startServer(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	// max_file_store is an accounting limit (the default streams reserve 26 GiB of MaxBytes);
+	// max_file_store is an accounting limit (the default streams reserve 37 GiB of MaxBytes);
 	// it is only honoured from a config file, like infra/nats/nats.conf.
 	conf := filepath.Join(dir, "nats.conf")
 	if err := os.WriteFile(conf, []byte(fmt.Sprintf("listen: \"127.0.0.1:-1\"\njetstream { store_dir: %q, max_file_store: 64G }\n", dir)), 0o600); err != nil {
@@ -361,7 +361,7 @@ func TestMalformedSnapshotsReportedAndSkipped(t *testing.T) {
 				t.Errorf("bad issue on %s: %+v", m.Subject, iss)
 			}
 			undecodable = append(undecodable, iss.Detail)
-		} else if iss.Code != quality.Stale {
+		} else if iss.Code != quality.Stale && iss.Code != quality.DayStartMissed {
 			t.Errorf("unexpected issue (zero-filled snapshot reached the engine?): %+v", iss)
 		}
 	}
@@ -394,7 +394,7 @@ func (downPub) PublishID(string, string, any) error { return errors.New("nats do
 func TestPoisonSuspectAcrossRestarts(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)
-	snaps := day("2026-09-23", 1, 2, 4)
+	snaps := withPreOpen(day("2026-09-23", 1, 1, 4)) // seq 1 pre-open baseline (no outputs), seq 2 has outputs
 	feed(t, url, js, []any{snaps[0], snaps[1]})
 	for run := 1; run <= 4; run++ {
 		if err := runUntil(t, js, downPub{}, 2); err == nil || !strings.Contains(err.Error(), "nats down") {
@@ -561,7 +561,7 @@ func (b *blockingPub) PublishID(subject, id string, v any) error {
 func TestLostLeaseStopsPublishAndAck(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)
-	snaps := day("2026-09-23", 1, 2, 11) // seq 1 is a baseline (no outputs), seq 2 has several
+	snaps := withPreOpen(day("2026-09-23", 1, 1, 11)) // seq 1 pre-open baseline (no outputs), seq 2 has several
 	feed(t, url, js, []any{snaps[0], snaps[1]})
 	bp := &blockingPub{JetStream: js, entered: make(chan struct{}), release: make(chan struct{})}
 	stop := startLeasedWith(t, js, bp, "engine-a")

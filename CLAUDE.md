@@ -15,6 +15,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - internal/anomaly   AI tier 1: per-symbol EWMA anomaly radar (AI-01), flow–price divergence (AI-02)
 - internal/source    adapters: replay (done), sourcearena (PROVISIONAL, docs/source-mapping.md)
 - internal/bus       Publisher: NDJSON | JetStream (BUS=ndjson|nats); streams+ack rules in contracts/subjects.md
+- internal/calendar  per-instrument trading sessions (data: sessions.json, dated, UNVERIFIED); ALL time logic uses it
 - cmd/{collector,engine,syngen}; infra/ (compose, ClickHouse DDL, Centrifugo)
 
 ## Non-negotiable rules
@@ -33,6 +34,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - Do not Read testdata/*.ndjson or recordings/ (large); use `head -c` or jq summaries instead.
 
 ## Current state
-Sprint 0 done. Sprint 1: I-01 (compose + DDL), P-01 (JetStream bus), P-02 (single-engine KV lease) done.
+Sprint 0 done. Sprint 1: I-01 (compose + DDL), P-01 (JetStream bus), P-02 (single-engine KV lease),
+DL-01 (session calendar; late-start partial rule) done.
 Next, in order: W-01 ClickHouse writer (idempotent: dedup key / ReplacingMergeTree for flow_events;
 store `partial`), R-01 daily recording, Q-01 Grafana. D-03 waits for the live token.

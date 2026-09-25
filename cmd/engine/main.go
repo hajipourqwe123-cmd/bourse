@@ -6,6 +6,7 @@
 //	ENGINE_LEASE_TTL=15s                    # (nats) single-engine lease (>= 3s); a second engine refuses to start
 //	ENGINE_RETRY_POISON_SEQ=<seq>           # (nats) operator release of one POISON_SUSPECT message
 //	ALLOW_SYNTHETIC_ON_BUS=1                # (nats) accept SYN* snapshots; disposable local stacks only
+//	SESSIONS_FILE=path.json                 # trading-session calendar (default: embedded internal/calendar/sessions.json)
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"bourse/internal/bus"
+	"bourse/internal/calendar"
 	"bourse/internal/config"
 	"bourse/internal/flow"
 )
@@ -31,6 +33,14 @@ func main() {
 	cfg.HotThreshold = config.Int("HOT_THRESHOLD_RIAL", cfg.HotThreshold)
 	cfg.PlusThreshold = config.Int("PLUS_THRESHOLD_RIAL", cfg.PlusThreshold)
 	cfg.StaleAfter = config.Dur("STALE_AFTER", cfg.StaleAfter)
+	cal, err := calendar.Load(config.Str("SESSIONS_FILE", ""))
+	if err != nil {
+		log.Fatalf("engine: %v", err)
+	}
+	if n := cal.Unverified(); n > 0 {
+		log.Printf("engine: WARNING: session calendar has %d rules/holidays not verified against an official source (docs/sessions.md)", n)
+	}
+	cfg.Sessions = cal
 
 	switch kind := config.Str("BUS", "ndjson"); kind {
 	case "ndjson":

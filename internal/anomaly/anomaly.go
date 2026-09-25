@@ -10,33 +10,35 @@
 // ("support": hidden demand) are flagged once per window.
 //
 // Known limitation (Phase 2 fix): the baseline has no time-of-day profile, so the opening window
-// (before OpeningSkipUntil) is not scored at all.
+// (the first OpeningSkip after the instrument's OWN session open, from the session calendar) is
+// not scored at all; nor is anything on a day its market is closed.
 package anomaly
 
 import (
 	"math"
 	"time"
 
+	"bourse/internal/calendar"
 	"bourse/internal/flow"
 	"bourse/internal/model"
-	"bourse/internal/tehran"
 )
 
 // Config holds the radar's parameters.
 type Config struct {
-	Alpha            float64       // EWMA weight of the newest observation (default 0.02)
-	WarmUp           int           // observations required before scoring (default 60)
-	ZThreshold       float64       // |z| at or above which an anomaly is emitted (default 4)
-	MinValueRate     float64       // rial/second floor below which intervals are ignored (default 1e6)
-	OpeningSkipUntil time.Duration // offset from 00:00 Tehran; default 9h15m
-	DivergenceHot    int64         // |net hot| in a window that qualifies for AI-02 (default 5e9 rial)
-	DivergenceFlat   float64       // price change %, at or below/above which price is "flat" (default 0.2)
+	Alpha          float64            // EWMA weight of the newest observation (default 0.02)
+	WarmUp         int                // observations required before scoring (default 60)
+	ZThreshold     float64            // |z| at or above which an anomaly is emitted (default 4)
+	MinValueRate   float64            // rial/second floor below which intervals are ignored (default 1e6)
+	OpeningSkip    time.Duration      // after the instrument's own session open; default 15m
+	Sessions       *calendar.Calendar // trading sessions per instrument (default: the embedded calendar)
+	DivergenceHot  int64              // |net hot| in a window that qualifies for AI-02 (default 5e9 rial)
+	DivergenceFlat float64            // price change %, at or below/above which price is "flat" (default 0.2)
 }
 
 // DefaultConfig returns conservative defaults; all are design assumptions to be tuned on real data.
 func DefaultConfig() Config {
 	return Config{Alpha: 0.02, WarmUp: 60, ZThreshold: 4, MinValueRate: 1e6,
-		OpeningSkipUntil: 9*time.Hour + 15*time.Minute, DivergenceHot: 5_000_000_000, DivergenceFlat: 0.2}
+		OpeningSkip: 15 * time.Minute, Sessions: calendar.Default(), DivergenceHot: 5_000_000_000, DivergenceFlat: 0.2}
 }
 
 // Feature names.
@@ -92,7 +94,32 @@ type Radar struct {
 }
 
 // New returns a radar.
-func New(cfg Config) *Radar { return &Radar{cfg: cfg, state: map[string]*symState{}} }
+func New(cfg Config) *Radar {
+	if cfg.Sessions == nil {
+		cfg.Sessions = calendar.Default()
+	}
+	return &Radar{cfg: cfg, state: map[string]*symState{}}
+}
+
+// scoring reports whether an interval ending at t is scored: the market is open that day and t
+// is past the opening skip. An unmapped (unknown-class) instrument could be in any class, so it
+// is skipped after EVERY class's open that day.
+func (r *Radar) scoring(ins string, t time.Time) (scored, open bool) {
+	sess, open := r.cfg.Sessions.Session(ins, t)
+	if !open {
+		return false, false
+	}
+	opens := []time.Time{sess.Open}
+	if sess.Class == calendar.Unknown {
+		opens = r.cfg.Sessions.Opens(t)
+	}
+	for _, o := range opens {
+		if !t.Before(o) && t.Before(o.Add(r.cfg.OpeningSkip)) {
+			return false, true
+		}
+	}
+	return !t.Before(sess.Open.Add(r.cfg.OpeningSkip)), true
+}
 
 func (r *Radar) sym(ins string) *symState {
 	st := r.state[ins]
@@ -117,9 +144,10 @@ func (r *Radar) Observe(iv *flow.Interval) []Event {
 	if rate < r.cfg.MinValueRate {
 		return nil
 	}
-	lt := iv.To.In(tehran.Loc)
-	sinceMidnight := time.Duration(lt.Hour())*time.Hour + time.Duration(lt.Minute())*time.Minute
-	scoring := sinceMidnight >= r.cfg.OpeningSkipUntil
+	scoring, open := r.scoring(iv.InsCode, iv.To)
+	if !open {
+		return nil // a closed day (e.g. an unlisted holiday) must not train the baseline either
+	}
 
 	st := r.sym(iv.InsCode)
 	var out []Event

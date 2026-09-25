@@ -34,19 +34,27 @@ type StreamSpec struct {
 
 const gib = int64(1) << 30
 
+// SizedSessionSpan is the longest daily collection span (union of all session classes) the
+// stream sizing assumes; services warn at startup when the loaded calendar exceeds it.
+const SizedSessionSpan = 9*time.Hour + 35*time.Minute // 08:25–18:00
+
 // DefaultStreams is the single source of truth for stream layout.
 //
 // Sizing (contracts/subjects.md, TestStreamSizingAssumption): full market ~1500 instruments every
-// 5s = 300 snapshots/s over the collector's 4.5h COLLECT_WINDOW (08:30–13:00) = 4.86M
-// snapshots/day. A worst-case stored snapshot (5-level book, message-ID header) measures 1270 B
-// (assumed <= 1400 B) → ~6.2 GB/day, so MD holds >= 1.2 full days (the engine replays the
-// current day on restart). FLOW: measured ~2 outputs of 261 B per snapshot → ~2.5 GB/day.
+// 5s = 300 snapshots/s. Worst case: every instrument published across the whole union of the
+// session calendar (08:25–18:00 = 34,500 s) = 10.35M snapshots/day; a worst-case stored snapshot
+// (5-level book, message-ID header) measures 1270 B (assumed <= 1400 B) → <= 14.5 GB/day, so MD
+// (20 GiB) holds >= 1.2 full days (the engine replays the current day on restart). Realistic
+// (each class only in its own session; unchanged snapshots outside it skipped): <= 9 GB/day.
+// FLOW: <= 2 outputs per snapshot (measured ≈ 2.0), <= 400 B stored each (measured 317) → <= 8.3
+// GB/day; QUALITY: <= 1 issue per snapshot, <= 450 B (measured 383) → <= 4.7 GB/day
+// (TestFlowAndQualitySizing). Sum of MaxBytes: 37 GiB (reserved against max_file_store).
 func DefaultStreams() []StreamSpec {
 	return []StreamSpec{
-		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 16 * gib},
-		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 8 * gib},
+		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 20 * gib},
+		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 10 * gib},
 		{Name: StreamAI, Subjects: []string{"ai.signal.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
-		{Name: StreamQuality, Subjects: []string{"quality.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
+		{Name: StreamQuality, Subjects: []string{"quality.>"}, MaxAge: 48 * time.Hour, MaxBytes: 6 * gib},
 	}
 }
 

@@ -11,13 +11,16 @@ import (
 	"os"
 	"time"
 
+	"bourse/internal/calendar"
 	"bourse/internal/model"
 	"bourse/internal/tehran"
 )
 
 type inst struct {
 	s            model.Snapshot
-	bigBuyEvery  int // inject one large new buyer every N steps (0 = never)
+	sess         calendar.Session // from the session calendar (class of its ins_code)
+	step         int              // trading steps emitted so far
+	bigBuyEvery  int              // inject one large new buyer every N steps (0 = never)
 	bigSellEvery int
 	price        float64
 	drift        float64
@@ -27,15 +30,17 @@ func main() {
 	day := flag.String("day", "2026-09-23", "Tehran trading day (YYYY-MM-DD)")
 	step := flag.Duration("step", 5*time.Second, "snapshot interval")
 	seed := flag.Int64("seed", 1405, "random seed (deterministic output)")
-	n := flag.Int("n", 4, "number of instruments (>= 4; the first 4 are the fixed scenarios, more are load)")
+	n := flag.Int("n", 5, "number of instruments (>= 5; the first 5 are the fixed scenarios, more are load)")
 	flag.Parse()
 	d, err := time.ParseInLocation("2006-01-02", *day, tehran.Loc)
 	if err != nil {
 		panic(err)
 	}
+	cal, err := calendar.Load(os.Getenv("SESSIONS_FILE"))
+	if err != nil {
+		panic(err)
+	}
 	rng := rand.New(rand.NewSource(*seed))
-	start := d.Add(9 * time.Hour)
-	end := d.Add(12*time.Hour + 30*time.Minute)
 
 	mk := func(code, sym string, price float64, drift float64, bb, bs int) *inst {
 		return &inst{s: model.Snapshot{InsCode: code, Symbol: sym, Source: "synthetic",
@@ -46,18 +51,46 @@ func main() {
 		mk("SYNTHETIC0002", "SYN-RETAIL", 5_000, 0.0, 0, 0),       // retail noise only
 		mk("SYNTHETIC0003", "SYN-DISTRIB", 30_000, -0.00003, 0, 150),
 		mk("SYNTHETIC0004", "SYN-MIXED", 8_000, 0.00001, 300, 300),
+		mk("SYNTHETICG001", "SYN-GOLDFUND", 45_000, 0.00002, 240, 360), // afternoon session (gold class)
 	}
-	for k := len(insts); k < *n; k++ { // load instruments: vary the four scenarios
+	for k := 4; len(insts) < *n; k++ { // load instruments (unmapped: class unknown, union session), varying the four stock scenarios
 		base := insts[k%4]
 		in := mk(fmt.Sprintf("SYNTHETIC%04d", k+1), fmt.Sprintf("%s-%d", base.s.Symbol, k+1),
 			base.price*(0.5+float64(k%7)/4), base.drift, base.bigBuyEvery, base.bigSellEvery)
 		insts = append(insts, in)
 	}
+	// Each instrument trades in its own session from the calendar; one zero-volume snapshot one
+	// step before its open is its pre-open day baseline, so the demo day is complete.
+	var start, end time.Time
+	for _, in := range insts {
+		sess, ok := cal.Session(in.s.InsCode, d.Add(12*time.Hour))
+		if !ok {
+			panic("syngen: " + *day + " is not a trading day for " + in.s.InsCode)
+		}
+		in.sess = sess
+		if pre := sess.Open.Add(-*step); start.IsZero() || pre.Before(start) {
+			start = pre
+		}
+		if sess.Close.After(end) {
+			end = sess.Close
+		}
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
-	i := 0
 	for t := start; !t.After(end); t = t.Add(*step) {
 		for _, in := range insts {
+			if t.Equal(in.sess.Open.Add(-*step)) {
+				pre := in.s
+				pre.PriceLast, pre.PriceClose = pre.PriceYesterday, pre.PriceYesterday
+				pre.SourceTime, pre.IngestTime = t, t.Add(500*time.Millisecond)
+				enc.Encode(map[string]any{"subject": "md.snap." + pre.InsCode, "data": pre})
+				continue
+			}
+			if t.Before(in.sess.Open) || !t.Before(in.sess.Close) { // trading is [open, close)
+				continue
+			}
+			i := in.step
+			in.step++
 			in.price *= 1 + in.drift + rng.NormFloat64()*0.0006
 			p := int64(in.price)
 			// retail flow: a few small trades
@@ -104,6 +137,5 @@ func main() {
 			s.IngestTime = t.Add(time.Duration(300+rng.Intn(900)) * time.Millisecond)
 			enc.Encode(map[string]any{"subject": "md.snap." + s.InsCode, "data": s})
 		}
-		i++
 	}
 }
