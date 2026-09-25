@@ -18,6 +18,7 @@ const (
 	TimeEstimated      = "SOURCE_TIME_ESTIMATED"
 	Undecodable        = "UNDECODABLE"        // a bus message is not a valid snapshot; dropped, never retried
 	RecoveryTruncated  = "RECOVERY_TRUNCATED" // engine restart could not replay the whole trading day
+	PoisonSuspect      = "POISON_SUSPECT"     // an MD message was delivered 5 times unprocessed; engine stopped
 )
 
 func issue(s *model.Snapshot, code, detail string) model.QualityIssue {

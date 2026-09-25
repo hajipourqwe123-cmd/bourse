@@ -35,11 +35,14 @@ type processor struct {
 	retry []time.Duration // publish backoff; len+1 attempts per output
 
 	// NATS path only.
-	js        jsBus
-	epoch     int64           // MD stream creation time: makes output IDs unique per stream lifetime
-	lastSeq   uint64          // highest MD sequence applied to state AND fully published (or reported undecodable)
-	truncated bool            // recovery found part of the day already discarded from MD
-	flagged   map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
+	js      jsBus
+	epoch   int64  // MD stream creation time: makes output IDs unique per stream lifetime
+	lastSeq uint64 // highest MD sequence applied to state AND fully published (or reported undecodable)
+	// partialBefore is set when recovery found part of its replay window already discarded from
+	// MD: snapshots stored before it are lost, so days and 10-minute windows starting before it
+	// are published with Partial=true, and each instrument gets one RECOVERY_TRUNCATED issue.
+	partialBefore time.Time
+	flagged       map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
 }
 
 func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
@@ -149,12 +152,14 @@ func (p *processor) runNDJSON(r io.Reader) (n, bad int, err error) {
 const (
 	engineDurable = "engine"
 	snapFilter    = "md.snap.>"
+	poisonAfter   = 5 // deliveries of one MD message before the engine stops with POISON_SUSPECT
 )
 
 // engineConsumer is the durable consumer spec. MaxDeliver is unlimited on purpose: every
 // engine handler error is either Permanent (terminated at once) or Abort (process exits), so
 // the only redeliveries are after crashes/aborts, and counting those would silently drop a
-// snapshot whose outputs were never published. A crash loop is visible; a drop is not.
+// snapshot whose outputs were never published. Instead the engine itself stops on a message
+// delivered poisonAfter times (POISON_SUSPECT) and keeps it for investigation. Never drop.
 func engineConsumer() bus.ConsumerSpec {
 	return bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter, MaxDeliver: -1}
 }
@@ -163,7 +168,7 @@ func engineConsumer() bus.ConsumerSpec {
 type jsBus interface {
 	AckFloor(ctx context.Context, stream, durable string) (uint64, error)
 	GetMsg(ctx context.Context, stream string, seq uint64) (string, []byte, time.Time, error)
-	StreamState(ctx context.Context, stream string) (uint64, time.Time, error)
+	StreamState(ctx context.Context, stream string) (bus.StreamInfo, error)
 	Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(bus.Msg) error) (uint64, error)
 	StreamCreated(ctx context.Context, stream string) (time.Time, error)
 	Consume(ctx context.Context, spec bus.ConsumerSpec, fn func(bus.Msg) error) error
@@ -192,7 +197,7 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	if err != nil || floor == 0 {
 		return 0, err
 	}
-	firstSeq, firstStored, err := p.js.StreamState(ctx, bus.StreamMD)
+	st, err := p.js.StreamState(ctx, bus.StreamMD)
 	if err != nil {
 		return 0, err
 	}
@@ -209,10 +214,10 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		}
 	}
 	// Part of the window already gone (limits/age): state for today would be understated.
-	p.truncated = firstSeq > 1 && (start.IsZero() || firstStored.After(start))
-	if p.truncated {
-		log.Printf("engine: recovery: MD starts at seq %d stored %s, after the replay start; today's totals are incomplete and will be flagged RECOVERY_TRUNCATED",
-			firstSeq, firstStored.UTC().Format(time.RFC3339))
+	if st.FirstSeq > 1 && (start.IsZero() || st.FirstStored.After(start)) {
+		p.partialBefore = st.FirstStored
+		log.Printf("engine: recovery: MD starts at seq %d stored %s, after the replay start; totals from before then are incomplete (partial=true, RECOVERY_TRUNCATED)",
+			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339))
 	}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
 		s, err := decode(m.Subject, m.Data)
@@ -246,14 +251,32 @@ func (p *processor) handle(ctx context.Context, m bus.Msg) error {
 			return err
 		}
 	}
+	if m.NumDelivered >= poisonAfter {
+		return p.poison(ctx, m)
+	}
 	return p.apply(ctx, m, m.InProgress)
+}
+
+// poison reports a message that was delivered poisonAfter times without being acknowledged
+// (every previous attempt crashed or aborted the engine) and stops the engine WITHOUT
+// processing, acking or terminating it: it stays first in line until someone investigates.
+func (p *processor) poison(ctx context.Context, m bus.Msg) error {
+	ins := strings.TrimPrefix(m.Subject, "md.snap.")
+	iss := model.QualityIssue{InsCode: ins, Code: quality.PoisonSuspect, At: m.Stored,
+		Detail: fmt.Sprintf("stream seq %d delivered %d times without being processed; engine stopped, message kept for investigation", m.StreamSeq, m.NumDelivered)}
+	err := fmt.Errorf("POISON_SUSPECT: MD seq %d (%s) delivered %d times without success; not processing it. "+
+		"Inspect it (stream MD, that sequence), fix the cause, then restart; the engine will not skip it on its own", m.StreamSeq, m.Subject, m.NumDelivered)
+	if perr := p.publish(ctx, []output{{bus.SubjQuality(ins), iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
+		err = fmt.Errorf("%w (reporting it also failed: %v)", err, perr)
+	}
+	return bus.Abort(err)
 }
 
 func (p *processor) fillGap(ctx context.Context, upTo uint64) error {
 	from := p.lastSeq + 1
-	if first, _, err := p.js.StreamState(ctx, bus.StreamMD); err == nil && first > from {
-		log.Printf("engine: MD sequences %d..%d were discarded before this engine applied them", from, first-1)
-		from = first
+	if st, err := p.js.StreamState(ctx, bus.StreamMD); err == nil && st.FirstSeq > from {
+		log.Printf("engine: MD sequences %d..%d were discarded before this engine applied them", from, st.FirstSeq-1)
+		from = st.FirstSeq
 	}
 	for seq := from; seq < upTo; seq++ {
 		subj, data, stored, err := p.js.GetMsg(ctx, bus.StreamMD, seq)
@@ -287,10 +310,8 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
-	if p.truncated && !p.flagged[s.InsCode] {
-		p.flagged[s.InsCode] = true
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
-			Detail: "engine restarted after part of this trading day was discarded from the bus; day totals are incomplete", At: s.IngestTime}})
+	if !p.partialBefore.IsZero() {
+		outs = p.markPartial(s, outs)
 	}
 	if err := p.publish(ctx, outs, id, keepAlive); err != nil {
 		return bus.Abort(err)
@@ -299,9 +320,33 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	return nil
 }
 
+// markPartial flags outputs whose day or window started before partialBefore (their earlier
+// snapshots were lost) and adds one RECOVERY_TRUNCATED issue per instrument for such a day.
+func (p *processor) markPartial(s model.Snapshot, outs []output) []output {
+	for _, o := range outs {
+		switch v := o.v.(type) {
+		case *model.GameTotals:
+			if d, err := time.ParseInLocation("2006-01-02", v.Day, tehran.Loc); err == nil && d.Before(p.partialBefore) {
+				v.Partial = true
+			}
+		case *model.TenMinute:
+			v.Partial = v.WindowStart.Before(p.partialBefore)
+		}
+	}
+	if !p.flagged[s.InsCode] && tehran.DayStart(s.SourceTime).Before(p.partialBefore) {
+		p.flagged[s.InsCode] = true
+		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
+			Detail: fmt.Sprintf("engine restarted after snapshots stored before %s were discarded from the bus; day totals and windows before then are partial",
+				p.partialBefore.UTC().Format(time.RFC3339)), At: s.IngestTime}})
+	}
+	return outs
+}
+
 // runNATS consumes md.snap.> through the durable "engine" consumer (BUS=nats). It returns nil
 // on ctx cancellation, or an error (exit non-zero) when outputs cannot be published.
-func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec) error {
+// With exitWhenIdle it also returns nil once every message currently in MD is acknowledged
+// (make demo-nats, batch backfills).
+func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec, exitWhenIdle bool) error {
 	p.js = js
 	created, err := js.StreamCreated(ctx, bus.StreamMD)
 	if err != nil {
@@ -313,6 +358,29 @@ func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec
 		return fmt.Errorf("recover: %w", err)
 	}
 	log.Printf("engine: recovered state from %d snapshots (ack floor %d)", n, p.lastSeq)
+	if exitWhenIdle {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			t := time.NewTicker(250 * time.Millisecond)
+			defer t.Stop()
+			for {
+				st, err1 := js.StreamState(ctx, bus.StreamMD)
+				floor, err2 := js.AckFloor(ctx, bus.StreamMD, engineDurable)
+				if err1 == nil && err2 == nil && floor >= st.LastSeq {
+					log.Printf("engine: caught up at MD seq %d; exiting (exit-when-idle)", floor)
+					cancel()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
 	err = js.Consume(ctx, spec, func(m bus.Msg) error { return p.handle(ctx, m) })
 	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 		return nil // shutdown requested; an Abort error is still returned even during shutdown

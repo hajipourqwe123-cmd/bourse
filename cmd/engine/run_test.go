@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -26,8 +28,19 @@ import (
 
 func startServer(t *testing.T) string {
 	t.Helper()
-	s, err := server.NewServer(&server.Options{Host: "127.0.0.1", Port: -1, JetStream: true,
-		StoreDir: t.TempDir(), NoLog: true, NoSigs: true})
+	dir := t.TempDir()
+	// max_file_store is an accounting limit (the default streams reserve 26 GiB of MaxBytes);
+	// it is only honoured from a config file, like infra/nats/nats.conf.
+	conf := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf("listen: \"127.0.0.1:-1\"\njetstream { store_dir: %q, max_file_store: 64G }\n", dir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := server.ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.NoLog, opts.NoSigs = true, true
+	s, err := server.NewServer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +146,7 @@ func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64) 
 	}()
 	spec := engineConsumer()
 	spec.AckWait, spec.Backoff = 300*time.Millisecond, []time.Duration{10 * time.Millisecond}
-	err := p.runNATS(ctx, js, spec)
+	err := p.runNATS(ctx, js, spec, false)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatal("processor did not reach the ack floor in time")
 	}
@@ -363,5 +376,44 @@ func TestMalformedSnapshotsReportedAndSkipped(t *testing.T) {
 	json.Unmarshal(g.Data, &gt)
 	if gt.Day != "2026-09-23" {
 		t.Fatalf("game totals %+v", gt)
+	}
+}
+
+type downPub struct{}
+
+func (downPub) Publish(string, any) error           { return errors.New("nats down") }
+func (downPub) PublishID(string, string, any) error { return errors.New("nats down") }
+
+// Deliveries count across processes: after 4 aborted runs the 5th process reports
+// POISON_SUSPECT once and stops; later processes stop too. The message is never dropped.
+func TestPoisonSuspectAcrossRestarts(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	snaps := day("2026-09-23", 1, 2, 4)
+	feed(t, url, js, []any{snaps[0], snaps[1]})
+	for run := 1; run <= 4; run++ {
+		if err := runUntil(t, js, downPub{}, 2); err == nil || !strings.Contains(err.Error(), "nats down") {
+			t.Fatalf("run %d: want publish abort, got %v", run, err)
+		}
+	}
+	for run := 5; run <= 6; run++ {
+		err := runUntil(t, js, js, 2)
+		if err == nil || !strings.Contains(err.Error(), "POISON_SUSPECT: MD seq 2") { // seq 1 is a baseline: no outputs, acked
+			t.Fatalf("run %d: want POISON_SUSPECT abort, got %v", run, err)
+		}
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 1 {
+		t.Fatalf("poisoned message acked/dropped: ack floor %d", f)
+	}
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := nc.JetStream()
+	info, err := jsc.StreamInfo(bus.StreamQuality)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := jsc.GetLastMsg(bus.StreamQuality, "quality.SYNTEST0000")
+	if err != nil || info.State.Msgs != 1 || !strings.Contains(string(m.Data), quality.PoisonSuspect) {
+		t.Fatalf("want exactly one POISON_SUSPECT issue (deduplicated across runs 5 and 6): msgs=%d err=%v", info.State.Msgs, err)
 	}
 }

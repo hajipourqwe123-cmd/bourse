@@ -48,6 +48,11 @@ func run() int {
 		log.Fatalf("unknown SOURCE %q", kind)
 	}
 
+	allowSynthetic := config.Str("ALLOW_SYNTHETIC_ON_BUS", "") == "1"
+	if allowSynthetic {
+		log.Printf("collector: WARNING: ALLOW_SYNTHETIC_ON_BUS=1: synthetic (SYN*) data may be published to the bus; " +
+			"only acceptable on a disposable local stack, never where the gateway or ClickHouse writer serve users (rule 5)")
+	}
 	var pub bus.Publisher
 	var retry []time.Duration // NDJSON: a failed stdout write is not retried (it could tear a line)
 	var guard func(*model.Snapshot) error
@@ -55,8 +60,7 @@ func run() int {
 	case "ndjson":
 		pub = bus.NewNDJSON(os.Stdout)
 	case "nats":
-		allow := config.Str("ALLOW_SYNTHETIC_ON_BUS", "") == "1"
-		guard = func(s *model.Snapshot) error { return busGuard(s, allow) }
+		guard = func(s *model.Snapshot) error { return busGuard(s, allowSynthetic) }
 		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", bus.DefaultStreams())
 		if err != nil {
 			log.Fatalf("collector: %v", err)

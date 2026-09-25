@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,8 +20,19 @@ import (
 // startServer runs an in-process JetStream server in a temp dir and returns its client URL.
 func startServer(t *testing.T) string {
 	t.Helper()
-	s, err := server.NewServer(&server.Options{Host: "127.0.0.1", Port: -1, JetStream: true,
-		StoreDir: t.TempDir(), NoLog: true, NoSigs: true})
+	dir := t.TempDir()
+	// max_file_store is an accounting limit (the default streams reserve 26 GiB of MaxBytes);
+	// it is only honoured from a config file, like infra/nats/nats.conf.
+	conf := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf("listen: \"127.0.0.1:-1\"\njetstream { store_dir: %q, max_file_store: 64G }\n", dir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := server.ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.NoLog, opts.NoSigs = true, true
+	s, err := server.NewServer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

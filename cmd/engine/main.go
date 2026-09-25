@@ -2,6 +2,7 @@
 //
 //	collector | engine                      # BUS=ndjson (default): NDJSON stdin → stdout
 //	BUS=nats NATS_URL=nats://… engine       # durable JetStream consumer on md.snap.> → JetStream
+//	ENGINE_EXIT_WHEN_IDLE=1                 # (nats) exit 0 once every stored snapshot is acknowledged
 package main
 
 import (
@@ -43,7 +44,7 @@ func main() {
 		go js.WatchLimits(ctx, 30*time.Second)
 		log.Printf("engine: bus=nats consumer=%s", engineDurable)
 		p := newProcessor(cfg, js)
-		err = p.runNATS(ctx, js, engineConsumer())
+		err = p.runNATS(ctx, js, engineConsumer(), config.Str("ENGINE_EXIT_WHEN_IDLE", "") == "1")
 		js.Close()
 		if err != nil {
 			log.Fatalf("engine: %v (unacked snapshot is redelivered to the next start)", err)

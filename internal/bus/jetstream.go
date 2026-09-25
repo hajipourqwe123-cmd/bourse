@@ -35,10 +35,16 @@ type StreamSpec struct {
 const gib = int64(1) << 30
 
 // DefaultStreams is the single source of truth for stream layout.
+//
+// Sizing (contracts/subjects.md): full market ~1500 instruments every 5s = 300 snapshots/s over a
+// 4.5h collection window (08:30–13:00) = 4.86M snapshots/day. Measured 673 B stored per snapshot
+// without order book, ~1.4 KB with a 5-level book → 3.3–6.8 GB/day, so MD holds at least one
+// full day with a book (the engine replays the current day on restart). FLOW: measured ~2
+// outputs of 261 B per snapshot → ~2.5 GB/day.
 func DefaultStreams() []StreamSpec {
 	return []StreamSpec{
-		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 8 * gib},
-		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 4 * gib},
+		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 16 * gib},
+		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 8 * gib},
 		{Name: StreamAI, Subjects: []string{"ai.signal.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
 		{Name: StreamQuality, Subjects: []string{"quality.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
 	}
@@ -164,18 +170,24 @@ func (j *JetStream) PublishID(subject, id string, v any) error {
 	return nil
 }
 
-// StreamState returns the first sequence still stored in a stream and when it was stored
-// (sequences below it were discarded by limits or deleted).
-func (j *JetStream) StreamState(ctx context.Context, stream string) (firstSeq uint64, firstStored time.Time, err error) {
+// StreamInfo is the part of a stream's state the services need.
+type StreamInfo struct {
+	FirstSeq    uint64    // first sequence still stored (lower ones were discarded or deleted)
+	FirstStored time.Time // when FirstSeq was stored
+	LastSeq     uint64    // last sequence stored
+}
+
+// StreamState returns the stream's current first/last sequences.
+func (j *JetStream) StreamState(ctx context.Context, stream string) (StreamInfo, error) {
 	s, err := j.js.Stream(ctx, stream)
 	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("jetstream: stream %s: %w", stream, err)
+		return StreamInfo{}, fmt.Errorf("jetstream: stream %s: %w", stream, err)
 	}
 	info, err := s.Info(ctx)
 	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("jetstream: stream %s info: %w", stream, err)
+		return StreamInfo{}, fmt.Errorf("jetstream: stream %s info: %w", stream, err)
 	}
-	return info.State.FirstSeq, info.State.FirstTime, nil
+	return StreamInfo{FirstSeq: info.State.FirstSeq, FirstStored: info.State.FirstTime, LastSeq: info.State.LastSeq}, nil
 }
 
 // StreamCreated returns the creation time of a stream (distinguishes re-created streams whose

@@ -14,6 +14,7 @@ import (
 	"bourse/internal/bus"
 	"bourse/internal/flow"
 	"bourse/internal/model"
+	"bourse/internal/quality"
 	"bourse/internal/tehran"
 )
 
@@ -64,9 +65,9 @@ func (f *fakeBus) GetMsg(_ context.Context, _ string, seq uint64) (string, []byt
 	}
 	return m.subj, m.data, m.stored, nil
 }
-func (f *fakeBus) StreamState(context.Context, string) (uint64, time.Time, error) {
-	first, _ := f.seqs()
-	return first, f.msgs[first].stored, nil
+func (f *fakeBus) StreamState(context.Context, string) (bus.StreamInfo, error) {
+	first, last := f.seqs()
+	return bus.StreamInfo{FirstSeq: first, FirstStored: f.msgs[first].stored, LastSeq: last}, nil
 }
 func (f *fakeBus) StreamCreated(context.Context, string) (time.Time, error) {
 	return time.Unix(1, 0), nil
@@ -99,6 +100,7 @@ func (f *fakeBus) Replay(_ context.Context, _, _ string, start time.Time, upTo u
 type recPub struct {
 	ids  []string
 	subj []string
+	vals []any
 	fail bool
 }
 
@@ -107,7 +109,7 @@ func (r *recPub) PublishID(subject, id string, v any) error {
 	if r.fail {
 		return errors.New("nats down")
 	}
-	r.ids, r.subj = append(r.ids, id), append(r.subj, subject)
+	r.ids, r.subj, r.vals = append(r.ids, id), append(r.subj, subject), append(r.vals, v)
 	return nil
 }
 
@@ -158,8 +160,8 @@ func TestRecoverStateReplaysTradingDayUpToFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(f.replayed) != "[2 3 4]" || n != 3 || p.lastSeq != 4 || p.truncated {
-		t.Fatalf("replayed %v (n=%d) lastSeq=%d truncated=%v; want [2 3 4], 3, 4, false", f.replayed, n, p.lastSeq, p.truncated)
+	if fmt.Sprint(f.replayed) != "[2 3 4]" || n != 3 || p.lastSeq != 4 || !p.partialBefore.IsZero() {
+		t.Fatalf("replayed %v (n=%d) lastSeq=%d partialBefore=%s; want [2 3 4], 3, 4, zero", f.replayed, n, p.lastSeq, p.partialBefore)
 	}
 	// State equals an engine that processed exactly today's snapshots 3 and 4.
 	ref := flow.New(flow.DefaultConfig())
@@ -192,8 +194,8 @@ func TestRecoverStateFloorMissingOrUndecodable(t *testing.T) {
 	if _, err := p.recoverState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !f.start.IsZero() || !p.truncated || p.lastSeq != 2 || len(f.replayed) != 0 {
-		t.Fatalf("missing floor: start=%s truncated=%v lastSeq=%d replayed=%v", f.start, p.truncated, p.lastSeq, f.replayed)
+	if !f.start.IsZero() || !p.partialBefore.Equal(d[2].SourceTime) || p.lastSeq != 2 || len(f.replayed) != 0 {
+		t.Fatalf("missing floor: start=%s partialBefore=%s lastSeq=%d replayed=%v", f.start, p.partialBefore, p.lastSeq, f.replayed)
 	}
 	// Floor is an undecodable message: window from its store day.
 	f = &fakeBus{floor: 2}
@@ -208,31 +210,85 @@ func TestRecoverStateFloorMissingOrUndecodable(t *testing.T) {
 	}
 }
 
-func TestTruncatedDayFlaggedOncePerInstrument(t *testing.T) {
-	d := day("2026-09-23", 2, 3, 5) // A0 B0 A1 B1 A2 B2
+// Part of today was discarded before a restart: today's GameTotals and the 10-minute windows
+// that began before the discard boundary carry Partial=true, each instrument gets exactly one
+// RECOVERY_TRUNCATED issue, and the next trading day is complete again.
+func TestTruncatedDayMarkedPartial(t *testing.T) {
+	d := day("2026-09-23", 2, 3, 5) // seqs 1..6 = A0 B0 A1 B1 A2 B2, all in the 09:00 window
 	f := &fakeBus{floor: 3}
 	for i := 2; i < len(d); i++ { // seqs 1-2 (today's start) were discarded
 		f.add(uint64(i+1), d[i].SourceTime, d[i])
 	}
+	next := day("2026-09-24", 1, 2, 6) // SYNTEST0000 on the next day: seqs 7, 8
+	f.add(7, next[0].SourceTime, next[0])
+	f.add(8, next[1].SourceTime, next[1])
 	pub := &recPub{}
 	p := newTestProcessor(f, pub)
-	if _, err := p.recoverState(context.Background()); err != nil || !p.truncated {
-		t.Fatalf("err=%v truncated=%v", err, p.truncated)
+	if _, err := p.recoverState(context.Background()); err != nil || !p.partialBefore.Equal(d[2].SourceTime) {
+		t.Fatalf("err=%v partialBefore=%s", err, p.partialBefore)
 	}
-	for seq := uint64(4); seq <= 6; seq++ {
+	for seq := uint64(4); seq <= 8; seq++ {
 		m := f.msgs[seq]
 		if err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: seq}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	count := map[string]int{}
-	for _, s := range pub.subj {
-		if strings.HasPrefix(s, "quality.") {
-			count[s]++
+	issues := map[string]int{}
+	games, windows := map[string]bool{}, map[string]bool{}
+	for _, v := range pub.vals {
+		switch v := v.(type) {
+		case model.QualityIssue:
+			if v.Code == quality.RecoveryTruncated {
+				issues[v.InsCode]++
+			}
+		case *model.GameTotals:
+			games[v.InsCode+" "+v.Day] = v.Partial
+		case *model.TenMinute:
+			windows[v.InsCode+" "+v.WindowStart.In(tehran.Loc).Format("2006-01-02 15:04")] = v.Partial
 		}
 	}
-	if count["quality.SYNTEST0000"] != 1 || count["quality.SYNTEST0001"] != 1 {
-		t.Fatalf("RECOVERY_TRUNCATED issues per instrument: %v", count)
+	if issues["SYNTEST0000"] != 1 || issues["SYNTEST0001"] != 1 {
+		t.Errorf("RECOVERY_TRUNCATED per instrument: %v", issues)
+	}
+	wantGames := map[string]bool{"SYNTEST0000 2026-09-23": true, "SYNTEST0001 2026-09-23": true, "SYNTEST0000 2026-09-24": false}
+	wantWindows := map[string]bool{"SYNTEST0000 2026-09-23 09:00": true, "SYNTEST0001 2026-09-23 09:00": true, "SYNTEST0000 2026-09-24 09:00": false}
+	if fmt.Sprint(games) != fmt.Sprint(wantGames) || fmt.Sprint(windows) != fmt.Sprint(wantWindows) {
+		t.Errorf("partial flags\n games   %v want %v\n windows %v want %v", games, wantGames, windows, wantWindows)
+	}
+}
+
+// A message delivered poisonAfter times (every earlier attempt crashed or aborted) is reported
+// once as POISON_SUSPECT and stops the engine without processing, acking or dropping it.
+func TestPoisonSuspectStopsWithoutProcessing(t *testing.T) {
+	d := day("2026-09-23", 1, 2, 5)
+	f := &fakeBus{}
+	f.add(1, d[0].SourceTime, d[0])
+	f.add(2, d[1].SourceTime, d[1])
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	ctx := context.Background()
+	m1 := f.msgs[1]
+	if err := p.handle(ctx, bus.Msg{Subject: m1.subj, Data: m1.data, StreamSeq: 1, NumDelivered: 4}); err != nil {
+		t.Fatalf("4th delivery must still be processed: %v", err)
+	}
+	m := f.msgs[2]
+	err := p.handle(ctx, bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 2, NumDelivered: poisonAfter, Stored: m.stored})
+	if err == nil || bus.IsPermanent(err) || !strings.Contains(err.Error(), "POISON_SUSPECT: MD seq 2") {
+		t.Fatalf("want abort with POISON_SUSPECT, got %v", err)
+	}
+	if p.lastSeq != 1 {
+		t.Fatalf("poisoned message recorded as applied: lastSeq=%d", p.lastSeq)
+	}
+	last := pub.vals[len(pub.vals)-1]
+	iss, ok := last.(model.QualityIssue)
+	if !ok || iss.Code != quality.PoisonSuspect || pub.ids[len(pub.ids)-1] != "eng:1:2:poison:0" || pub.subj[len(pub.subj)-1] != "quality.SYNTEST0000" {
+		t.Fatalf("last publish %T %+v id %s", last, last, pub.ids[len(pub.ids)-1])
+	}
+	// State untouched: the next accepted snapshot still sees seq 1 as its baseline.
+	ref := flow.New(flow.DefaultConfig())
+	ref.Process(d[0])
+	if got, want := p.eng.Process(d[1]).Game, ref.Process(d[1]).Game; got == nil || *got != *want {
+		t.Fatalf("poisoned message changed engine state: %+v vs %+v", got, want)
 	}
 }
 

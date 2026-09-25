@@ -37,6 +37,7 @@ make down
 اجرا روی NATS (پس از `make up`؛ پیش‌فرض همچنان NDJSON است):
 
 ```bash
+make demo-nats     # روز ساختگی → JetStream محلی؛ engine تا رسیدن به انتها اجرا و خارج می‌شود
 make build
 BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (فقط یک نمونه)
 # داده ساختگی فقط روی پشته محلی دورریختنی و با اجازه صریح (قاعده ۵):

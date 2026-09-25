@@ -18,6 +18,8 @@
 // Engine specifics (cmd/engine):
 //   - Its durable has unlimited MaxDeliver: it has no transient errors (only Permanent or
 //     Abort), so a limit would only count crash redeliveries and silently drop a snapshot.
+//     Instead, on the 5th delivery of one message the engine publishes POISON_SUSPECT and exits
+//     non-zero without processing it; it never skips it on its own.
 //   - Once the engine has run Process() on a snapshot it must never Nak it: a redelivery would be
 //     rejected by the engine as OUT_OF_ORDER and the outputs not yet published would be lost.
 //     Instead it retries publishing the SAME computed outputs with bounded backoff (Retry), then
@@ -28,7 +30,8 @@
 //     applied first, so state sees every stored snapshot exactly once, in order.
 //   - On restart it rebuilds its in-memory state by replaying, without publishing, the trading
 //     day of the snapshot at the durable's ack floor, up to that floor (AckFloor, Replay); if part
-//     of that day was already discarded, each instrument gets one RECOVERY_TRUNCATED issue.
+//     of that day was already discarded, GameTotals and TenMinute from before the discard
+//     boundary carry partial=true and each instrument gets one RECOVERY_TRUNCATED issue.
 //   - Run exactly one engine per durable (stop the old process before starting a new one):
 //     two instances would each see only part of the snapshots.
 package bus
