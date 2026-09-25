@@ -74,6 +74,7 @@ type hub struct {
 
 func newHub(cfg Config, pub publisher, valid func() error, now func() time.Time) *hub {
 	h := &hub{cfg: cfg, pub: pub, valid: valid, now: now, st: market.New(cfg.Market), pending: 4, synIns: map[string]bool{}}
+	h.st.SetSynthetic(h.synthetic, cfg.AllowSynthetic)
 	h.st.Advance(tehran.TradingDay(h.now()))
 	return h
 }
@@ -247,13 +248,22 @@ func (h *hub) flush(ctx context.Context) error {
 		h.lastSummary = sb
 		pubs = append(pubs, publication{Channel: chSummary, Data: summaryMsg{GW: now, Summary: sum}})
 	}
-	for _, s := range h.radar {
+	// Radar and hot items: synthetic ones are decided now (their snapshot may have arrived after
+	// them), left out or labelled.
+	radar, hot := h.radar, h.hot
+	h.radar, h.hot = nil, nil
+	for _, s := range radar {
+		if h.skip(s.Ins, h.synthetic(s.Ins)) {
+			continue
+		}
+		s.Syn = h.synthetic(s.Ins)
 		pubs = append(pubs, publication{Channel: chRadar, Data: signalMsg{GW: now, Signal: s}})
 	}
-	for _, e := range h.hot {
-		pubs = append(pubs, publication{Channel: chHot, Data: hotMsg{GW: now, Event: e}})
+	for _, e := range hot {
+		if !h.skipSynthetic(e.InsCode) {
+			pubs = append(pubs, publication{Channel: chHot, Data: hotMsg{GW: now, Event: e}})
+		}
 	}
-	h.radar, h.hot = nil, nil
 	h.mu.Unlock()
 
 	if len(pubs) == 0 {
@@ -277,6 +287,7 @@ func (h *hub) flush(ctx context.Context) error {
 		if summaryChanged {
 			h.lastSummary = nil
 		}
+		h.radar, h.hot = append(radar, h.radar...), append(hot, h.hot...)
 		h.mu.Unlock()
 	}
 	return nil

@@ -192,6 +192,50 @@ func (j *JetStream) PublishID(subject, id string, v any) error {
 	return nil
 }
 
+// BatchItem is one message of PublishBatch.
+type BatchItem struct {
+	Subject, ID string // ID: JetStream message ID ("" = no de-duplication)
+	V           any
+}
+
+// PublishBatch sends items without waiting in between (in order, on one connection) and then
+// waits for every stream ack; it returns one error per item (nil = stored). It is one publish
+// attempt for independent messages: the caller retries the failed ones.
+func (j *JetStream) PublishBatch(items []BatchItem) []error {
+	errs := make([]error, len(items))
+	futs := make([]jetstream.PubAckFuture, len(items))
+	for i, it := range items {
+		data, err := marshal(it.V)
+		if err != nil {
+			errs[i] = fmt.Errorf("jetstream: encode %s: %w", it.Subject, err)
+			continue
+		}
+		var opts []jetstream.PublishOpt
+		if it.ID != "" {
+			opts = append(opts, jetstream.WithMsgID(it.ID))
+		}
+		if futs[i], err = j.js.PublishAsync(it.Subject, data, opts...); err != nil {
+			errs[i] = fmt.Errorf("jetstream: publish %s: %w", it.Subject, err)
+		}
+	}
+	deadline := time.NewTimer(j.timeout)
+	defer deadline.Stop()
+	for i, f := range futs {
+		if f == nil {
+			continue
+		}
+		select {
+		case <-f.Ok():
+		case err := <-f.Err():
+			errs[i] = fmt.Errorf("jetstream: publish %s: %w", items[i].Subject, err)
+		case <-deadline.C:
+			errs[i] = fmt.Errorf("jetstream: publish %s: no ack within %s", items[i].Subject, j.timeout)
+			deadline.Reset(0) // the rest are late too
+		}
+	}
+	return errs
+}
+
 // StreamInfo is the part of a stream's state the services need.
 type StreamInfo struct {
 	FirstSeq    uint64    // first sequence still stored (lower ones were discarded or deleted)

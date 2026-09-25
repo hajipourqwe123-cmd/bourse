@@ -286,6 +286,15 @@ func (f *failingPub) PublishID(subject, id string, v any) error {
 	return f.JetStream.PublishID(subject, id, v)
 }
 
+// PublishBatch routes every item through PublishID, so failures are injected per output.
+func (f *failingPub) PublishBatch(items []bus.BatchItem) []error {
+	errs := make([]error, len(items))
+	for i, it := range items {
+		errs[i] = f.PublishID(it.Subject, it.ID, it.V)
+	}
+	return errs
+}
+
 // A publish failure after Process(): retries, then aborts without acking; the next process
 // recovers state up to the ack floor, gets the snapshot redelivered, recomputes the same outputs
 // and republishes them under the same message IDs, so partial output is not duplicated.
@@ -556,8 +565,21 @@ func (b *blockingPub) PublishID(subject, id string, v any) error {
 	return b.JetStream.PublishID(subject, id, v)
 }
 
-// The lease is lost while a snapshot's outputs are being published: the in-flight publish may
-// complete, but no further output is published and the snapshot is not acked.
+// PublishBatch is one attempt carrying all of a snapshot's outputs: it blocks as a whole (the
+// batch is in flight) and counts as one call.
+func (b *blockingPub) PublishBatch(items []bus.BatchItem) []error {
+	if b.first.CompareAndSwap(false, true) {
+		close(b.entered)
+		<-b.release
+	} else {
+		b.after.Add(1)
+	}
+	return b.JetStream.PublishBatch(items)
+}
+
+// The lease is lost while a snapshot's outputs are being published: the in-flight publish
+// attempt (one output, or one batch of a snapshot's outputs) may complete, but no further
+// attempt is made and the snapshot is not acked.
 func TestLostLeaseStopsPublishAndAck(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)

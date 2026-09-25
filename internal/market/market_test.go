@@ -550,3 +550,114 @@ func TestSessions(t *testing.T) {
 		}
 	}
 }
+
+// feed applies one stock snapshot of S1 every step from `from` to `to` with value growing by inc.
+func feed(st *State, from, to string, step time.Duration, v0, inc, vol0 int64) (int64, int64) {
+	v, vol := v0, vol0
+	for ts := at(from); !ts.After(at(to)); ts = ts.Add(step) {
+		sn := snap("S1", "09:00:00", 1, 1, vol, v)
+		sn.SourceTime, sn.IngestTime = ts, ts
+		st.ApplySnapshot(sn)
+		v += inc
+		vol++
+	}
+	return v, vol
+}
+
+// The vendor still shows yesterday's totals just after the open and resets at 09:00:10 (owner
+// scenario, internal/flow session_test (a)): the series re-baselines at the reset.
+func TestSeriesVendorResetAfterOpen(t *testing.T) {
+	st := testState()
+	st.ApplySnapshot(snap("S1", "09:00:05", 1, 1, 5_000_000, 50_000_000_000)) // yesterday's totals
+	feed(st, "09:00:10", "09:19:50", 20*time.Second, 1_000_000, 1_000_000, 100)
+	got := bars(st)
+	if b := got["09:00"]; !b.Partial {
+		t.Errorf("09:00 = %+v, want partial (yesterday's totals, then the reset)", b)
+	}
+	// 09:10 … 09:19:50: 30 snapshots × 1,000,000, the first booked against 09:09:50's value.
+	if b := got["09:10"]; b.Partial || b.Value == nil || *b.Value != 30_000_000 {
+		t.Errorf("09:10 = value %v partial %v, want 30,000,000 complete", deref(b.Value), b.Partial)
+	}
+}
+
+func TestSeriesDips(t *testing.T) {
+	// Same window: dip and recovery; the increment is booked against the kept baseline.
+	st := testState()
+	st.ApplySnapshot(snap("S1", "09:10:00", 1, 1, 1, 1_000))
+	st.ApplySnapshot(snap("S1", "09:10:05", 1, 1, 1, 900))
+	st.ApplySnapshot(snap("S1", "09:10:10", 1, 1, 1, 1_100))
+	if b := bars(st)["09:10"]; !b.Partial || b.Value == nil || *b.Value != 100 {
+		t.Errorf("same-window dip: %+v value %v", b, deref(b.Value))
+	}
+	// Straddling a boundary: the recovery window is partial too.
+	st = testState()
+	st.ApplySnapshot(snap("S1", "08:59:00", 1, 1, 0, 0))
+	st.ApplySnapshot(snap("S1", "09:09:50", 1, 1, 1, 1_000))
+	st.ApplySnapshot(snap("S1", "09:09:55", 1, 1, 1, 900))
+	st.ApplySnapshot(snap("S1", "09:10:05", 1, 1, 1, 1_100))
+	if b := bars(st)["09:10"]; !b.Partial || *b.Value != 100 {
+		t.Errorf("straddling dip: recovery window %+v value %v, want partial 100", b, deref(b.Value))
+	}
+	// A dip that outlasts its window is a new level: re-baseline there.
+	st = testState()
+	st.ApplySnapshot(snap("S1", "08:59:00", 1, 1, 0, 0))
+	st.ApplySnapshot(snap("S1", "09:09:50", 1, 1, 1, 1_000))
+	st.ApplySnapshot(snap("S1", "09:09:55", 1, 1, 1, 900))
+	st.ApplySnapshot(snap("S1", "09:10:05", 1, 1, 1, 950))
+	st.ApplySnapshot(snap("S1", "09:10:25", 1, 1, 1, 1_000))
+	if b := bars(st)["09:10"]; !b.Partial || *b.Value != 50 {
+		t.Errorf("outlasting dip: %+v value %v, want partial 50 (from the new level 950)", b, deref(b.Value))
+	}
+}
+
+func TestSeriesGapClippedToSession(t *testing.T) {
+	st := testState()
+	feed(st, "12:10:00", "12:29:50", 10*time.Second, 1_000, 10, 1) // 12:10 partial: first value > 0
+	sn := snap("S1", "12:45:00", 1, 1, 200, 1_000+120*10+5)        // after the 12:30 close
+	st.ApplySnapshot(sn)
+	if b := bars(st)["12:20"]; b.Partial {
+		t.Errorf("12:20 = %+v: 10 s of trading time before the close is no gap", b)
+	}
+}
+
+func TestShowsTradingValueWithoutVolume(t *testing.T) {
+	st := testState()
+	st.ApplySnapshot(snap("S1", "09:10:00", 1010, 1000, 0, 5)) // volume 0 but value > 0
+	if r := st.Rows()[0]; r.NetHot != nil || !r.Traded || r.Chg == nil {
+		t.Errorf("row = %+v: value > 0 is trading (net_hot unknown)", r)
+	}
+	st.ApplySnapshot(snap("S2", "09:10:00", 1010, 1000, 0, 0))
+	if r := st.Rows()[1]; r.Traded || r.Chg != nil || r.Last == nil {
+		t.Errorf("untraded row = %+v: no change of today, last price kept", r)
+	}
+}
+
+func TestLaggingIgnoresSnapshotsTheEngineSkips(t *testing.T) {
+	st := testState()
+	st.ApplySnapshot(snap("S1", "09:10:00", 1, 1, 10, 100))
+	st.ApplyGame(game("S1", Stock, "09:10:00", 10, 0, 0, 0, 0, false))
+	sn := snap("S1", "09:11:00", 1, 1, 20, 200)
+	sn.Missing = []string{model.FIndBuyCount} // incomplete: never processed by the engine
+	st.ApplySnapshot(sn)
+	if st.Rows()[0].Lagging {
+		t.Error("an incomplete snapshot cannot make the totals lag")
+	}
+}
+
+func TestSyntheticPredicateCoversEarlyData(t *testing.T) {
+	syn := map[string]bool{}
+	st := testState()
+	st.SetSynthetic(func(ins string) bool { return syn[ins] }, false)
+	// Signal and issue of IRX1 arrive before the snapshot that identifies it as synthetic.
+	st.ApplySignal(anomaly.Event{InsCode: "IRX1", Kind: "anomaly", At: at("09:10:00"), Reason: "r"})
+	st.ApplyIssue(model.QualityIssue{InsCode: "IRX1", Code: quality.Stale, At: at("09:10:00")})
+	st.ApplyIssue(model.QualityIssue{Code: quality.Stale, At: at("09:10:00")}) // no instrument: counted
+	syn["IRX1"] = true
+	if len(st.Radar()) != 0 || st.Summary().Issues != 1 {
+		t.Errorf("radar %d issues %d: synthetic data must be left out", len(st.Radar()), st.Summary().Issues)
+	}
+	st.SetSynthetic(func(ins string) bool { return syn[ins] }, true)
+	if r := st.Radar(); len(r) != 1 || !r[0].Syn || st.Summary().Issues != 2 || !st.Summary().Syn {
+		t.Errorf("shown: radar %+v issues %d syn %v, want labelled", r, st.Summary().Issues, st.Summary().Syn)
+	}
+}

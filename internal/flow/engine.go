@@ -160,9 +160,10 @@ func (e *Engine) Process(s model.Snapshot) Result {
 			cp := s // re-baseline on inconsistent totals; the bad interval is dropped
 			st.prev = &cp
 			// The dropped interval's trades are missing from the day totals and from the window
-			// the re-baseline falls in: both are partial from now on (rule 1). Consumers learn it
+			// the re-baseline falls in: both are partial from now on (rule 1). The totals are now
+			// as of this snapshot (its volume is accounted for, as dropped): consumers learn both
 			// now, not only with the next trade (there may be none).
-			if !st.game.Partial {
+			if !st.game.Partial || st.game.Volume != s.Volume {
 				st.game.Partial = true
 				st.game.AsOf, st.game.Volume = s.SourceTime, s.Volume
 				g := st.game

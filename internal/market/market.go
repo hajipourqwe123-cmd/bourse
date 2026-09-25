@@ -76,6 +76,7 @@ type Row struct {
 	NetHot  *int64     `json:"net_hot"`
 	HotAsOf *time.Time `json:"hot_as_of"` // source time the totals are as of; null without totals
 	Lagging bool       `json:"lagging"`   // totals do not cover the latest snapshot's trading yet
+	Traded  bool       `json:"traded"`    // a snapshot of today showed trading; else chg is null (no trade today)
 	Partial bool       `json:"partial"`   // day flow totals are partial (docs/data-quality.md DAY_START_MISSED)
 	Missing []string   `json:"missing,omitempty"`
 	Src     time.Time  `json:"src"` // source_time of the latest snapshot
@@ -196,6 +197,7 @@ type Signal struct {
 	Z      float64   `json:"z,omitempty"`
 	Reason string    `json:"reason"`
 	At     time.Time `json:"at"`
+	Syn    bool      `json:"syn,omitempty"`
 }
 
 // Unavailable metrics of the current data contract (docs/phase1-plan.md D-03).
@@ -214,9 +216,11 @@ type inst struct {
 	class      string
 	dirty      bool
 	everTraded bool // a snapshot of today showed trading (or unknown volume)
-	// Series: the value baseline (the highest value booked so far) and when it was seen.
+	// Series: the value baseline (the highest value booked so far), when it was seen, and when
+	// the value first fell below it (a dip: zero when none).
 	base   int64
 	baseAt time.Time
+	dipAt  time.Time
 	hasVal bool
 }
 
@@ -234,8 +238,25 @@ type State struct {
 	carried map[string]bool // instruments with only carry-over snapshots so far
 	series  map[string]*series
 	radar   []Signal
-	issues  int
+	issues  int // issues without an instrument
+	// synthetic reports an instrument whose data is not real (rule 5); showSyn keeps it
+	// (labelled) instead of hiding it. Set by the owner (SetSynthetic).
+	synthetic func(ins string) bool
+	showSyn   bool
 }
+
+// SetSynthetic tells the state which instruments carry non-real data and whether to show them
+// (labelled) or leave them out of the radar and the issue counts. (Rows of synthetic snapshots
+// are the owner's to filter before ApplySnapshot.) It covers data that arrived before the
+// instrument's first snapshot identified it, since the four streams are read independently.
+func (s *State) SetSynthetic(pred func(ins string) bool, show bool) {
+	s.synthetic, s.showSyn = pred, show
+}
+
+func (s *State) isSyn(ins string) bool { return s.synthetic != nil && s.synthetic(ins) }
+
+// hidden reports data of a synthetic instrument that must not be shown.
+func (s *State) hidden(ins string) bool { return !s.showSyn && s.isSyn(ins) }
 
 // New returns an empty state; nothing is accepted until Advance names the trading day.
 func New(cfg Config) *State {
@@ -325,11 +346,12 @@ func (s *State) ApplySnapshot(sn model.Snapshot) {
 		return
 	}
 	delete(s.carried, sn.InsCode)
+	prev := in.snap
 	in.snap = sn
 	in.dirty = true
 	in.everTraded = in.everTraded || showsTrading(&sn)
 	if id := seriesKPI(in.class); id != "" && sn.Has(model.FValue) {
-		s.book(id, in, &sn)
+		s.book(id, in, &prev, &sn)
 	}
 }
 
@@ -347,14 +369,19 @@ func seriesKPI(class string) string {
 }
 
 // book adds the instrument's value increment to its KPI's 10-minute bar (the window of the
-// snapshot that shows it):
+// snapshot that shows it). The baseline is the highest value booked so far:
 //   - the first value of the day is the baseline; above zero, the trading before it cannot be
 //     placed, so every window up to it is partial;
-//   - a value below the baseline (inconsistent source) books nothing and marks its window
-//     partial; the baseline stays, so a recovery is not booked as new trading;
-//   - an interval with more than GapAfter of the instrument's trading time that crosses a window
-//     boundary spreads trading over windows in an unknown way: every window it touches is partial.
-func (s *State) book(id string, in *inst, sn *model.Snapshot) {
+//   - a value below the baseline is a dip: nothing is booked and its window is partial; the
+//     baseline stays, so a recovery from a glitch is not booked as new trading, and the window
+//     of the recovery is partial too (the dip's split is ambiguous);
+//   - a reset (value AND volume fell: the source restarted its day totals, e.g. yesterday's
+//     totals still shown after the open), or a dip that outlasts its window, is a new level:
+//     re-baseline there, the windows from the dip to it partial;
+//   - an increment over more than GapAfter of the instrument's trading time (clipped to its
+//     session) that crosses a window boundary spreads trading over windows in an unknown way:
+//     every window it touches is partial.
+func (s *State) book(id string, in *inst, prev, sn *model.Snapshot) {
 	se := s.series[id]
 	if se == nil {
 		se = &series{bars: map[time.Time]int64{}, partial: map[time.Time]bool{}}
@@ -362,26 +389,54 @@ func (s *State) book(id string, in *inst, sn *model.Snapshot) {
 	}
 	w := tehran.Floor10m(sn.SourceTime)
 	se.bars[w] += 0 // observed
-	switch {
-	case !in.hasVal:
+	markFrom := func(from time.Time) {
+		for x := tehran.Floor10m(from); !x.After(w); x = x.Add(Window) {
+			se.partial[x] = true
+		}
+	}
+	if !in.hasVal {
 		if sn.Value > 0 && w.After(se.partialUntil) {
 			se.partialUntil = w
 		}
 		in.base, in.baseAt, in.hasVal = sn.Value, sn.SourceTime, true
 		return
-	case sn.Value < in.base:
+	}
+	if sn.Value < in.base {
+		reset := prev.Has(model.FVolume) && sn.Has(model.FVolume) && sn.Volume < prev.Volume
+		outlasted := !in.dipAt.IsZero() && w.After(tehran.Floor10m(in.dipAt))
+		if reset || outlasted {
+			from := in.dipAt
+			if from.IsZero() {
+				from = sn.SourceTime
+			}
+			markFrom(from)
+			in.base, in.baseAt, in.dipAt = sn.Value, sn.SourceTime, time.Time{}
+			return
+		}
 		se.partial[w] = true
+		if in.dipAt.IsZero() {
+			in.dipAt = sn.SourceTime
+		}
 		return
 	}
-	// Only the instrument's own trading time counts (nothing trades before its open, so a
-	// pre-open baseline followed by the first trade is not a gap).
-	from := in.baseAt
-	if sess, ok := s.cfg.Sessions.Session(sn.InsCode, sn.SourceTime); ok && from.Before(sess.Open) {
-		from = sess.Open
+	if !in.dipAt.IsZero() {
+		se.partial[w] = true // recovered from a dip
+		in.dipAt = time.Time{}
 	}
-	if pw := tehran.Floor10m(from); sn.SourceTime.Sub(from) > s.cfg.GapAfter && w.After(pw) {
-		for x := pw; !x.After(w); x = x.Add(Window) {
-			se.partial[x] = true
+	if sn.Value > in.base {
+		// Only the instrument's own trading time counts: nothing trades before its open or
+		// after its close.
+		from, to := in.baseAt, sn.SourceTime
+		if sess, ok := s.cfg.Sessions.Session(sn.InsCode, sn.SourceTime); ok {
+			if from.Before(sess.Open) {
+				from = sess.Open
+			}
+			if to.After(sess.Close) {
+				to = sess.Close
+			}
+		}
+		if to.Sub(from) > s.cfg.GapAfter && tehran.Floor10m(to).After(tehran.Floor10m(from)) {
+			markFrom(from)
 		}
 	}
 	se.bars[w] += sn.Value - in.base
@@ -407,7 +462,8 @@ func (s *State) ApplySignal(e anomaly.Event) (Signal, bool) {
 	if !s.today(e.At) {
 		return Signal{}, false
 	}
-	sig := Signal{Ins: e.InsCode, Kind: e.Kind, Z: e.Z, Reason: e.Reason, At: e.At, Class: s.cfg.Sessions.Class(e.InsCode)}
+	sig := Signal{Ins: e.InsCode, Kind: e.Kind, Z: e.Z, Reason: e.Reason, At: e.At, Class: s.cfg.Sessions.Class(e.InsCode),
+		Syn: s.isSyn(e.InsCode)}
 	if in := s.ins[e.InsCode]; in != nil {
 		sig.Sym = in.snap.Symbol
 	}
@@ -424,8 +480,8 @@ func (s *State) ApplyIssue(q model.QualityIssue) {
 	if q.Code == quality.TimeEstimated || !s.today(q.At) {
 		return
 	}
-	s.issues++
 	if q.InsCode == "" {
+		s.issues++
 		return
 	}
 	in := s.get(q.InsCode) // the issue may precede the snapshot
@@ -442,13 +498,30 @@ func (s *State) MarkDirty(ins []string) {
 	}
 }
 
-// Radar returns the recent signals, newest first.
+// Radar returns the recent signals to show, newest first (synthetic ones labelled or left out,
+// decided now: an instrument may have been identified as synthetic after its signal arrived).
 func (s *State) Radar() []Signal {
-	out := make([]Signal, len(s.radar))
-	for i, r := range s.radar {
-		out[len(s.radar)-1-i] = r
+	out := make([]Signal, 0, len(s.radar))
+	for i := len(s.radar) - 1; i >= 0; i-- {
+		r := s.radar[i]
+		if s.hidden(r.Ins) {
+			continue
+		}
+		r.Syn = s.isSyn(r.Ins)
+		out = append(out, r)
 	}
 	return out
+}
+
+// issueCount is the number of today's issues to show.
+func (s *State) issueCount() int {
+	n := s.issues
+	for k, in := range s.ins {
+		if !s.hidden(k) {
+			n += in.issues
+		}
+	}
+	return n
 }
 
 func i64(v int64) *int64 { return &v }
@@ -463,17 +536,29 @@ func ChangePct(sn *model.Snapshot) *float64 {
 }
 
 // lagging: the totals are older than the snapshot by more than LagAfter and do not include all
-// of its volume (the engine is behind).
+// of its volume (the engine is behind). A snapshot the engine cannot use (a flow field missing:
+// never a baseline) does not count.
 func (s *State) lagging(in *inst) bool {
 	g, sn := in.game, &in.snap
-	return g != nil && sn.Has(model.FVolume) && sn.Volume > g.Volume && sn.SourceTime.Sub(g.AsOf) > s.cfg.LagAfter
+	if g == nil {
+		return false
+	}
+	for _, f := range model.FlowFields {
+		if !sn.Has(f) {
+			return false
+		}
+	}
+	return sn.Volume > g.Volume && sn.SourceTime.Sub(g.AsOf) > s.cfg.LagAfter
 }
 
 func (s *State) row(in *inst) Row {
 	sn := &in.snap
 	r := Row{Ins: sn.InsCode, Sym: sn.Symbol, Class: in.class, Src: sn.SourceTime, Ing: sn.IngestTime,
-		Est: sn.SourceTimeEstimated, Syn: model.IsSynthetic(sn), Issues: in.issues, Missing: sn.Missing,
-		Chg: ChangePct(sn)}
+		Est: sn.SourceTimeEstimated, Syn: model.IsSynthetic(sn) || s.isSyn(sn.InsCode), Issues: in.issues,
+		Missing: sn.Missing, Traded: in.everTraded}
+	if in.everTraded {
+		r.Chg = ChangePct(sn) // no trade today: the vendor's prices are yesterday's, no change of today
+	}
 	if sn.Has(model.FPriceLast) && sn.PriceLast > 0 {
 		r.Last = i64(sn.PriceLast)
 	}
@@ -556,7 +641,7 @@ func (b *Breadth) bucket(last, y int64) {
 
 // Summary computes every aggregate above the symbols table.
 func (s *State) Summary() Summary {
-	sum := Summary{Day: s.day, Issues: s.issues, Queues: QueuesUnavailable, Carryover: len(s.carried)}
+	sum := Summary{Day: s.day, Issues: s.issueCount(), Queues: QueuesUnavailable, Carryover: len(s.carried)}
 	flows := map[string]*ClassFlow{}
 	type acc struct {
 		value, n, missing, withV int64
@@ -573,7 +658,7 @@ func (s *State) Summary() Summary {
 		sn := &in.snap
 		sum.Instruments++
 		sum.AsOf = later(sum.AsOf, sn.SourceTime)
-		sum.Syn = sum.Syn || model.IsSynthetic(sn)
+		sum.Syn = sum.Syn || model.IsSynthetic(sn) || s.isSyn(sn.InsCode)
 		sum.Est = sum.Est || sn.SourceTimeEstimated
 		if in.class == calendar.Unknown {
 			sum.Unknown++
@@ -637,6 +722,11 @@ func (s *State) Summary() Summary {
 				br.AsOf = later(br.AsOf, sn.SourceTime)
 				br.Est = br.Est || sn.SourceTimeEstimated
 			}
+		}
+	}
+	if s.showSyn {
+		for _, r := range s.radar {
+			sum.Syn = sum.Syn || s.isSyn(r.Ins)
 		}
 	}
 	if sum.Instruments > 0 {

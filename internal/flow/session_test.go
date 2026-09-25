@@ -199,8 +199,15 @@ func TestRebaselineMarksPartial(t *testing.T) {
 	if r.Game == nil || !r.Game.Partial || !r.Game.AsOf.Equal(glitch.SourceTime) || r.Game.Volume != 400_000 {
 		t.Errorf("(b) re-baseline must publish partial totals as of the glitch: %+v", r.Game)
 	}
-	next := sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 500_000, 350_000, 360_000, 7, 5)
-	next.InstBuyVol, next.IndBuyVol = 200_000, 350_000 // Δbuy 50,000 + 50,000 = Δvolume 100,000
+	// A second re-baseline on an already partial day still moves as_of/volume (else consumers
+	// would see the totals lagging behind the snapshots until the next trade).
+	glitch2 := sn("IRSTOCK", tt("2026-09-26", "09:00:12"), 10_000, 450_000, 330_000, 260_000, 6, 5)
+	glitch2.InstBuyVol = 200_000
+	if r2 := e.Process(glitch2); !codes(r2)[quality.SideMismatch] || r2.Game == nil || r2.Game.Volume != 450_000 {
+		t.Errorf("(b) second re-baseline: issues %+v game %+v, want totals as of 450,000", r2.Issues, r2.Game)
+	}
+	next := sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 550_000, 380_000, 360_000, 7, 5)
+	next.InstBuyVol, next.IndBuyVol = 250_000, 380_000 // Δbuy 50,000 + 50,000 = Δvolume 100,000
 	r = e.Process(next)
 	if r.Game == nil || !r.Game.Partial || !r.Window.Partial {
 		t.Errorf("(b) after the glitch: game %+v window %+v, want both partial", r.Game, r.Window)

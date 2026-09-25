@@ -134,6 +134,18 @@ type idPublisher interface {
 	PublishID(subject, id string, v any) error
 }
 
+// batchPublisher sends several messages in one attempt (bus.JetStream).
+type batchPublisher interface {
+	PublishBatch(items []bus.BatchItem) []error
+}
+
+func outputID(o output, idPrefix string, i int) string {
+	if o.id == "" && idPrefix != "" {
+		return fmt.Sprintf("%s:%d", idPrefix, i)
+	}
+	return o.id
+}
+
 // publish sends outs in order. A failed output is retried (the SAME value, same message ID)
 // with bounded backoff, then the error is returned; outputs already sent are not resent.
 // idPrefix != "" gives output i the message ID idPrefix:i (JetStream de-duplication).
@@ -149,12 +161,29 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 		}
 	}
 	var guardErr error
-	for i, o := range outs {
-		alive()
-		id := o.id
-		if id == "" && idPrefix != "" {
-			id = fmt.Sprintf("%s:%d", idPrefix, i)
+	done := make([]bool, len(outs))
+	// First attempt: every output at once (one round trip instead of one per output), after the
+	// lease guard; anything not stored is retried one by one below, same value and message ID.
+	if bp, ok := p.pub.(batchPublisher); ok && len(outs) > 1 {
+		if p.guard != nil {
+			if err := p.guard(); err != nil {
+				return fmt.Errorf("before output 1/%d: %w", len(outs), err)
+			}
 		}
+		items := make([]bus.BatchItem, len(outs))
+		for i, o := range outs {
+			items[i] = bus.BatchItem{Subject: o.subject, ID: outputID(o, idPrefix, i), V: o.v}
+		}
+		for i, err := range bp.PublishBatch(items) {
+			done[i] = err == nil
+		}
+	}
+	for i, o := range outs {
+		if done[i] {
+			continue
+		}
+		alive()
+		id := outputID(o, idPrefix, i)
 		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if p.guard != nil { // before EVERY attempt, retries included
 				if guardErr = p.guard(); guardErr != nil {

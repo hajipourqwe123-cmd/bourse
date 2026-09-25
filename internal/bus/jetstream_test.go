@@ -547,3 +547,26 @@ func TestTailEmptyStreamIsCaughtUp(t *testing.T) {
 		t.Fatal("empty stream never reported caught up")
 	}
 }
+
+func TestPublishBatchOrderDedupAndErrors(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	errs := j.PublishBatch([]BatchItem{
+		{Subject: SubjGame("A"), ID: "b:1", V: map[string]int{"n": 1}},
+		{Subject: "nowhere.x", ID: "b:2", V: 1}, // no stream: error for this item only
+		{Subject: SubjWindow("A"), ID: "b:3", V: map[string]int{"n": 3}},
+		{Subject: SubjGame("A"), ID: "b:1", V: map[string]int{"n": 9}}, // duplicate ID: acked, not stored
+	})
+	if errs[0] != nil || errs[1] == nil || errs[2] != nil || errs[3] != nil {
+		t.Fatalf("errs = %v", errs)
+	}
+	var got []string
+	if _, err := j.Replay(ctxT(t), StreamFlow, "flow.>", time.Time{}, 10, func(m Msg) error {
+		got = append(got, m.Subject+" "+string(m.Data))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != `flow.game.A {"n":1}|flow.10m.A {"n":3}` {
+		t.Errorf("stored = %v, want both in order and the duplicate dropped", got)
+	}
+}

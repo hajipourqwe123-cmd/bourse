@@ -183,3 +183,38 @@ func TestDayAdvancesFromClock(t *testing.T) {
 		t.Errorf("new-day summary = day %s instruments %d", last.Summary.Day, last.Summary.Instruments)
 	}
 }
+
+// Radar, issues and hot events of an instrument arriving before the snapshot that identifies it
+// as synthetic (the four streams are read independently) are still left out.
+func TestSyntheticIdentifiedLate(t *testing.T) {
+	now := tehranAt("10:00")
+	h, p, _ := hubAt(t, now, false)
+	ready(h)
+	h.onSignal(msg("ai.signal.IRX1", anomaly.Event{InsCode: "IRX1", Kind: "anomaly", At: now, Reason: "r"}))
+	h.onIssue(msg("quality.IRX1", model.QualityIssue{InsCode: "IRX1", Code: quality.Stale, At: now}))
+	h.onFlow(msg("flow.event.IRX1", model.FlowEvent{InsCode: "IRX1", Band: model.BandHot, IntervalTo: now}))
+	s := snapAt("IRX1", now, 1, 1)
+	s.Source = "rebase:replay"
+	h.onSnapshot(msg("md.snap.IRX1", s))
+	_ = h.flush(context.Background())
+	st, _ := h.state(now)
+	if len(st.Radar) != 0 || st.Summary.Issues != 0 || len(p.on(chRadar)) != 0 || len(p.on(chHot)) != 0 {
+		t.Errorf("late-identified synthetic data leaked: radar %d issues %d published radar %d hot %d",
+			len(st.Radar), st.Summary.Issues, len(p.on(chRadar)), len(p.on(chHot)))
+	}
+}
+
+func TestFailedPublishRequeuesRadarAndHot(t *testing.T) {
+	now := tehranAt("10:00")
+	h, p, _ := hubAt(t, now, false)
+	ready(h)
+	_ = h.flush(context.Background()) // initial summary
+	h.onSignal(msg("ai.signal.S1", anomaly.Event{InsCode: "S1", Kind: "anomaly", At: now, Reason: "r"}))
+	h.onFlow(msg("flow.event.S1", model.FlowEvent{InsCode: "S1", Band: model.BandHot, IntervalTo: now}))
+	p.fail = true
+	_ = h.flush(context.Background())
+	_ = h.flush(context.Background())
+	if len(p.on(chRadar)) != 1 || len(p.on(chHot)) != 1 {
+		t.Errorf("after a failed publish: radar %d hot %d, want both re-sent once", len(p.on(chRadar)), len(p.on(chHot)))
+	}
+}
