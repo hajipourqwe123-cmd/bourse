@@ -38,11 +38,10 @@ make down
 اجرا روی NATS (پس از `make up`؛ پیش‌فرض همچنان NDJSON است):
 
 ```bash
-make demo-nats     # روز ساختگی → JetStream محلی؛ engine تا رسیدن به انتها اجرا و خارج می‌شود
+make demo-nats     # روز ساختگی → یک NATS دورریختنی جدا (نه پشته مشترک)؛ engine تا انتها اجرا و خارج می‌شود
 make build
-BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (فقط یک نمونه)
-# داده ساختگی فقط روی پشته محلی دورریختنی و با اجازه صریح (قاعده ۵):
-ALLOW_SYNTHETIC_ON_BUS=1 BUS=nats SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector
+BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (اجاره تک‌نمونه)
+SOURCE=sourcearena BUS=nats bin/collector                             # فقط در COLLECT_WINDOW (پیش‌فرض ۰۸:۳۰–۱۳:۰۰)
 go run ./cmd/syngen -n 300 > /tmp/syn300.ndjson                        # بار آزمایشی ۳۰۰ نماد
 ```
 

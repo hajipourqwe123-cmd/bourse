@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -115,4 +116,10 @@ func DecodeSnapshot(data []byte) (Snapshot, error) {
 		}
 	}
 	return s, nil
+}
+
+// IsSynthetic reports SYNTHETIC development data (rule 5: never shown to users or used in
+// backtests): source "synthetic" or a SYN* instrument code or symbol.
+func IsSynthetic(s *Snapshot) bool {
+	return s.Source == "synthetic" || strings.HasPrefix(s.InsCode, "SYN") || strings.HasPrefix(s.Symbol, "SYN")
 }

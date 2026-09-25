@@ -426,3 +426,53 @@ func TestConsumerDefaults(t *testing.T) {
 		t.Fatalf("unlimited MaxDeliver overwritten: %d", c.MaxDeliver)
 	}
 }
+
+func TestCheckpointRoundTrip(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	if _, ok, err := j.LoadCheckpoint(ctxT(t), "engine"); ok || err != nil {
+		t.Fatalf("empty: ok=%v err=%v", ok, err)
+	}
+	for _, cp := range []Checkpoint{{Seq: 7, Day: "2026-09-23"}, {Seq: 90, Day: "2026-09-24"}} {
+		if err := j.SaveCheckpoint(ctxT(t), "engine", cp); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok, err := j.LoadCheckpoint(ctxT(t), "engine"); !ok || err != nil || got != cp {
+			t.Fatalf("got %+v ok=%v err=%v, want %+v", got, ok, err, cp)
+		}
+	}
+}
+
+// BeforeAck failing stops the consumer without acking: the message comes back to the next one.
+func TestConsumeBeforeAckBlocksAck(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, "1", "2")
+	spec := mdSpec()
+	stop := errors.New("lease lost")
+	n := 0
+	spec.BeforeAck = func() error {
+		if n++; n == 2 {
+			return stop
+		}
+		return nil
+	}
+	err := consumeUntil(t, j, spec, func(Msg) error { return nil }, func() bool { return false })
+	if !errors.Is(err, stop) {
+		t.Fatalf("err %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if f, _ := j.AckFloor(ctxT(t), StreamMD, "engine"); f != 1 {
+		t.Fatalf("ack floor %d, want 1", f)
+	}
+}
+
+func TestDialDoesNotTouchStreams(t *testing.T) {
+	url := startServer(t)
+	j, err := DialJetStream(context.Background(), url, "test", DefaultStreams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if _, err := j.js.Stream(ctxT(t), StreamMD); err == nil {
+		t.Fatal("DialJetStream created streams")
+	}
+}

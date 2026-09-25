@@ -38,17 +38,84 @@ type processor struct {
 	js      jsBus
 	epoch   int64  // MD stream creation time: makes output IDs unique per stream lifetime
 	lastSeq uint64 // highest MD sequence applied to state AND fully published (or reported undecodable)
-	// partialBefore is set when recovery found part of its replay window already discarded from
-	// MD: snapshots stored before it are lost, so days and 10-minute windows starting before it
-	// are published with Partial=true, and each instrument gets one RECOVERY_TRUNCATED issue.
-	partialBefore time.Time
-	flagged       map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
+	cpDay   string // latest trading day recorded in the checkpoint
+
+	// loss is set by recovery when snapshots were discarded from MD before this engine applied
+	// them (or before it could replay them). Each instrument's first complete snapshot after
+	// recovery is its new baseline; first records whether data of that day before it was lost.
+	loss    *lossInfo
+	first   map[string]firstSeen
+	flagged map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
+
+	guard          func() error // e.g. lease validity; checked before every publish (nil = none)
+	allowSynthetic bool         // accept SYN* snapshots (ALLOW_SYNTHETIC_ON_BUS=1, local demos only)
+	retryPoisonSeq uint64       // operator override: process this seq despite POISON_SUSPECT
 }
 
 func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
 	return &processor{eng: flow.New(cfg), radar: anomaly.New(anomaly.DefaultConfig()), pub: pub,
 		retry:   []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second},
+		first:   map[string]firstSeen{},
 		flagged: map[string]bool{}}
+}
+
+// lossInfo describes snapshots discarded from MD that the current state never saw.
+type lossInfo struct {
+	unprocessedBefore time.Time // never-applied snapshots stored before this were discarded
+	replayDay         string    // applied snapshots of this trading day are missing from the replay
+	replayBefore      time.Time // as replayDay when the day is unknown: those stored before this
+}
+
+// firstSeen is an instrument's first complete snapshot after recovery (its new baseline).
+type firstSeen struct {
+	day     string    // its trading day
+	window  time.Time // its 10-minute window
+	partial bool      // trades of that day before it were lost: day totals and that window are partial
+}
+
+func (l *lossInfo) decide(s model.Snapshot) firstSeen {
+	day, ds := tehran.TradingDay(s.SourceTime), tehran.DayStart(s.SourceTime)
+	lost := (!l.unprocessedBefore.IsZero() && ds.Before(l.unprocessedBefore)) ||
+		(l.replayDay != "" && day == l.replayDay) ||
+		(!l.replayBefore.IsZero() && ds.Before(l.replayBefore))
+	// Volume is day-to-date: zero means nothing traded that day before this baseline.
+	return firstSeen{day: day, window: tehran.Floor10m(s.SourceTime), partial: lost && s.Volume > 0}
+}
+
+func hasFlowFields(s *model.Snapshot) bool {
+	for _, f := range model.FlowFields {
+		if !s.Has(f) {
+			return false
+		}
+	}
+	return true
+}
+
+// markPartial flags the day totals and the 10-minute window that contain an instrument's lost
+// data. The flow engine re-baselines each instrument on its first complete snapshot after
+// recovery, so what is missing is that day's activity up to that snapshot: the day totals of
+// that day and the window containing the snapshot (later windows are complete).
+func (p *processor) markPartial(s *model.Snapshot, r *flow.Result) {
+	if p.loss == nil {
+		return
+	}
+	fs, ok := p.first[s.InsCode]
+	if !ok {
+		if !hasFlowFields(s) {
+			return // incomplete snapshots never become baselines
+		}
+		fs = p.loss.decide(*s)
+		p.first[s.InsCode] = fs
+	}
+	if !fs.partial {
+		return
+	}
+	if r.Game != nil && r.Game.Day == fs.day {
+		r.Game.Partial = true
+	}
+	if r.Window != nil && !r.Window.WindowStart.After(fs.window) {
+		r.Window.Partial = true
+	}
 }
 
 // compute runs one snapshot through the engine and radar. It mutates state exactly once per
@@ -56,6 +123,7 @@ func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
 func (p *processor) compute(s model.Snapshot) []output {
 	var outs []output
 	r := p.eng.Process(s)
+	p.markPartial(&s, &r) // before the radar: AI-02 must not run on a partial window
 	for _, i := range r.Issues {
 		outs = append(outs, output{bus.SubjQuality(s.InsCode), i})
 	}
@@ -67,8 +135,10 @@ func (p *processor) compute(s model.Snapshot) []output {
 	}
 	if r.Window != nil {
 		outs = append(outs, output{bus.SubjWindow(s.InsCode), r.Window})
-		if ev := p.radar.Divergence(r.Window); ev != nil {
-			outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+		if !r.Window.Partial {
+			if ev := p.radar.Divergence(r.Window); ev != nil {
+				outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+			}
 		}
 	}
 	for _, ev := range p.radar.Observe(r.Interval) {
@@ -98,6 +168,11 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 	}
 	for i, o := range outs {
 		alive()
+		if p.guard != nil {
+			if err := p.guard(); err != nil {
+				return fmt.Errorf("before output %d/%d: %w", i+1, len(outs), err)
+			}
+		}
 		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if useID {
 				return idp.PublishID(o.subject, fmt.Sprintf("%s:%d", idPrefix, i), o.v)
@@ -172,6 +247,8 @@ type jsBus interface {
 	Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(bus.Msg) error) (uint64, error)
 	StreamCreated(ctx context.Context, stream string) (time.Time, error)
 	Consume(ctx context.Context, spec bus.ConsumerSpec, fn func(bus.Msg) error) error
+	LoadCheckpoint(ctx context.Context, name string) (bus.Checkpoint, bool, error)
+	SaveCheckpoint(ctx context.Context, name string, cp bus.Checkpoint) error
 }
 
 // recoveryStart picks where replay begins: 1h before the Tehran day start of the snapshot at
@@ -192,6 +269,11 @@ func recoveryStart(floorSource, floorStored time.Time) time.Time {
 // radar only re-warms on that window (its longer history is not restored). Snapshots of the
 // previous day inside the 1h margin only rebuild that day's state; a later snapshot of today
 // resets the instrument, and an earlier-day snapshot after today's is OUT_OF_ORDER (flow).
+//
+// The floor's trading day comes from the floor message, or from the checkpoint when that
+// message has been discarded. Loss is classified so that only affected days become partial:
+// never-applied snapshots discarded (first retained seq > floor+1), and applied snapshots of the
+// floor's day missing from the replay.
 func (p *processor) recoverState(ctx context.Context) (replayed int, err error) {
 	floor, err := p.js.AckFloor(ctx, bus.StreamMD, engineDurable)
 	if err != nil || floor == 0 {
@@ -201,27 +283,50 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	if err != nil {
 		return 0, err
 	}
+	cp, cpOK, err := p.js.LoadCheckpoint(ctx, engineDurable)
+	if err != nil {
+		return 0, err
+	}
+	if cpOK {
+		p.cpDay = cp.Day
+	}
 	var start time.Time // zero = whole retained stream
+	floorDay := ""
 	subj, data, stored, gerr := p.js.GetMsg(ctx, bus.StreamMD, floor)
 	switch {
-	case gerr != nil:
-		log.Printf("engine: recovery: message at ack floor %d unavailable (%v); replaying the whole stream", floor, gerr)
-	default:
+	case gerr == nil:
 		if s, err := decode(subj, data); err == nil {
-			start = recoveryStart(s.SourceTime, stored)
+			start, floorDay = recoveryStart(s.SourceTime, stored), tehran.TradingDay(s.SourceTime)
 		} else { // it was terminated as UNDECODABLE: fall back to its store day
-			start = recoveryStart(stored, stored)
+			start, floorDay = recoveryStart(stored, stored), tehran.TradingDay(stored)
+		}
+	case cpOK && cp.Seq <= floor:
+		if d, err := time.ParseInLocation("2006-01-02", cp.Day, tehran.Loc); err == nil {
+			start, floorDay = d.Add(-time.Hour), cp.Day
+		}
+		log.Printf("engine: recovery: message at ack floor %d unavailable (%v); its trading day %s comes from the checkpoint", floor, gerr, cp.Day)
+	default:
+		log.Printf("engine: recovery: message at ack floor %d unavailable (%v) and no usable checkpoint; replaying the whole stream", floor, gerr)
+	}
+	var loss lossInfo
+	if st.FirstSeq > floor+1 {
+		loss.unprocessedBefore = st.FirstStored
+	}
+	if gerr != nil || (st.FirstSeq > 1 && !start.IsZero() && st.FirstStored.After(start)) {
+		if floorDay != "" {
+			loss.replayDay = floorDay
+		} else {
+			loss.replayBefore = st.FirstStored
 		}
 	}
-	// Part of the window already gone (limits/age): state for today would be understated.
-	if st.FirstSeq > 1 && (start.IsZero() || st.FirstStored.After(start)) {
-		p.partialBefore = st.FirstStored
-		log.Printf("engine: recovery: MD starts at seq %d stored %s, after the replay start; totals from before then are incomplete (partial=true, RECOVERY_TRUNCATED)",
-			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339))
+	if loss != (lossInfo{}) {
+		p.loss = &loss
+		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: affected day totals and windows will be published partial=true with RECOVERY_TRUNCATED",
+			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339), floor, floorDay)
 	}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
 		s, err := decode(m.Subject, m.Data)
-		if err != nil {
+		if err != nil || (model.IsSynthetic(&s) && !p.allowSynthetic) {
 			return nil // was terminated (and reported) when first consumed
 		}
 		p.compute(s)
@@ -246,13 +351,18 @@ func (p *processor) handle(ctx context.Context, m bus.Msg) error {
 	if m.StreamSeq <= p.lastSeq {
 		return nil // applied and fully published before: just ack again
 	}
+	// Checked before the gap fill: a crash while applying a skipped sequence also counts as a
+	// delivery of this message, so the report names the whole range.
+	if m.NumDelivered >= poisonAfter {
+		if m.StreamSeq != p.retryPoisonSeq {
+			return p.poison(ctx, m)
+		}
+		log.Printf("engine: WARNING: processing MD seq %d despite %d deliveries (ENGINE_RETRY_POISON_SEQ)", m.StreamSeq, m.NumDelivered)
+	}
 	if m.StreamSeq > p.lastSeq+1 {
 		if err := p.fillGap(ctx, m.StreamSeq); err != nil {
 			return err
 		}
-	}
-	if m.NumDelivered >= poisonAfter {
-		return p.poison(ctx, m)
 	}
 	return p.apply(ctx, m, m.InProgress)
 }
@@ -262,10 +372,15 @@ func (p *processor) handle(ctx context.Context, m bus.Msg) error {
 // processing, acking or terminating it: it stays first in line until someone investigates.
 func (p *processor) poison(ctx context.Context, m bus.Msg) error {
 	ins := strings.TrimPrefix(m.Subject, "md.snap.")
+	seqs := fmt.Sprintf("seq %d", m.StreamSeq)
+	if from := p.lastSeq + 1; from < m.StreamSeq {
+		seqs = fmt.Sprintf("seqs %d..%d (the crash may be in any of them; the earlier ones were fetched to fill a gap)", from, m.StreamSeq)
+	}
 	iss := model.QualityIssue{InsCode: ins, Code: quality.PoisonSuspect, At: m.Stored,
-		Detail: fmt.Sprintf("stream seq %d delivered %d times without being processed; engine stopped, message kept for investigation", m.StreamSeq, m.NumDelivered)}
-	err := fmt.Errorf("POISON_SUSPECT: MD seq %d (%s) delivered %d times without success; not processing it. "+
-		"Inspect it (stream MD, that sequence), fix the cause, then restart; the engine will not skip it on its own", m.StreamSeq, m.Subject, m.NumDelivered)
+		Detail: fmt.Sprintf("MD %s: delivered %d times without being processed; engine stopped, message kept for investigation", seqs, m.NumDelivered)}
+	err := fmt.Errorf("POISON_SUSPECT: MD %s (%s) delivered %d times without success; not processing it. "+
+		"Inspect it (stream MD), fix the cause, then restart with ENGINE_RETRY_POISON_SEQ=%d to process it once more; "+
+		"the engine never skips it on its own", seqs, m.Subject, m.NumDelivered, m.StreamSeq)
 	if perr := p.publish(ctx, []output{{bus.SubjQuality(ins), iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
 		err = fmt.Errorf("%w (reporting it also failed: %v)", err, perr)
 	}
@@ -308,38 +423,32 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 		p.lastSeq = m.StreamSeq
 		return bus.Permanent(derr)
 	}
+	if model.IsSynthetic(&s) && !p.allowSynthetic {
+		// Rule 5: never compute or publish metrics for SYN* on the bus. No quality issue either
+		// (it would itself carry a SYN* instrument).
+		p.lastSeq = m.StreamSeq
+		return bus.Permanent(fmt.Errorf("synthetic instrument %s refused (ALLOW_SYNTHETIC_ON_BUS is not set)", s.InsCode))
+	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
-	if !p.partialBefore.IsZero() {
-		outs = p.markPartial(s, outs)
+	if fs, ok := p.first[s.InsCode]; ok && fs.partial && !p.flagged[s.InsCode] && tehran.TradingDay(s.SourceTime) == fs.day {
+		p.flagged[s.InsCode] = true
+		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
+			Detail: fmt.Sprintf("engine restarted after snapshots of %s before %s were discarded from the bus; day totals and that 10-minute window are partial",
+				fs.day, fs.window.In(tehran.Loc).Format("15:04")), At: s.IngestTime}})
 	}
 	if err := p.publish(ctx, outs, id, keepAlive); err != nil {
 		return bus.Abort(err)
 	}
 	p.lastSeq = m.StreamSeq
-	return nil
-}
-
-// markPartial flags outputs whose day or window started before partialBefore (their earlier
-// snapshots were lost) and adds one RECOVERY_TRUNCATED issue per instrument for such a day.
-func (p *processor) markPartial(s model.Snapshot, outs []output) []output {
-	for _, o := range outs {
-		switch v := o.v.(type) {
-		case *model.GameTotals:
-			if d, err := time.ParseInLocation("2006-01-02", v.Day, tehran.Loc); err == nil && d.Before(p.partialBefore) {
-				v.Partial = true
-			}
-		case *model.TenMinute:
-			v.Partial = v.WindowStart.Before(p.partialBefore)
+	if day := tehran.TradingDay(s.SourceTime); day > p.cpDay {
+		if err := p.js.SaveCheckpoint(ctx, engineDurable, bus.Checkpoint{Seq: m.StreamSeq, Day: day}); err != nil {
+			log.Printf("engine: checkpoint: %v (recovery will be conservative)", err) // retried on the next snapshot
+		} else {
+			p.cpDay = day
 		}
 	}
-	if !p.flagged[s.InsCode] && tehran.DayStart(s.SourceTime).Before(p.partialBefore) {
-		p.flagged[s.InsCode] = true
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
-			Detail: fmt.Sprintf("engine restarted after snapshots stored before %s were discarded from the bus; day totals and windows before then are partial",
-				p.partialBefore.UTC().Format(time.RFC3339)), At: s.IngestTime}})
-	}
-	return outs
+	return nil
 }
 
 // runNATS consumes md.snap.> through the durable "engine" consumer (BUS=nats). It returns nil
@@ -391,15 +500,18 @@ func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec
 // leaseBucket holds the single-engine lease (P-02); the key is the durable's name.
 const leaseBucket = "engine_lease"
 
-// leaser is what runLeased needs from *bus.JetStream.
+// leaser is what runLeased needs from *bus.JetStream besides jsBus.
 type leaser interface {
 	AcquireLease(ctx context.Context, bucket, key, holder string, ttl time.Duration) (*bus.Lease, error)
+	EnsureStreams(ctx context.Context) error
+	WatchLimits(ctx context.Context, interval time.Duration)
 }
 
-// runLeased runs the NATS engine only while it holds the single-engine lease: it refuses to
-// start (bus.ErrLeaseHeld) when another engine holds it, and stops with bus.ErrLeaseLost when
-// the lease is lost while running (it may have been taken over). Two engines on one durable
-// would each see only part of the snapshots.
+// runLeased runs the NATS engine only while it holds the single-engine lease. It takes the
+// lease before touching anything (streams, consumer, state): a second engine refuses to start
+// with bus.ErrLeaseHeld. While running, the lease is checked before every publish and every ack,
+// and the engine stops with bus.ErrLeaseLost once it is lost or not renewed in time. Two engines
+// on one durable would each see only part of the snapshots.
 func runLeased(ctx context.Context, js interface {
 	jsBus
 	leaser
@@ -416,8 +528,12 @@ func runLeased(ctx context.Context, js interface {
 		}
 	}()
 	log.Printf("engine: holding lease %s/%s as %s (ttl %s)", leaseBucket, spec.Durable, holder, ttl)
+	if err := js.EnsureStreams(ctx); err != nil {
+		return err
+	}
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	go js.WatchLimits(lctx, 30*time.Second)
 	go func() {
 		select {
 		case <-lease.Lost():
@@ -425,11 +541,10 @@ func runLeased(ctx context.Context, js interface {
 		case <-lctx.Done():
 		}
 	}()
+	p.guard, spec.BeforeAck = lease.Valid, lease.Valid
 	err = p.runNATS(lctx, js, spec, exitWhenIdle)
-	select {
-	case <-lease.Lost():
+	if lerr := lease.Valid(); lerr != nil || errors.Is(err, bus.ErrLeaseLost) {
 		return fmt.Errorf("stopping: %w (another engine may have taken over)", bus.ErrLeaseLost)
-	default:
 	}
 	return err
 }

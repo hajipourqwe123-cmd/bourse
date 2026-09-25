@@ -20,6 +20,7 @@ import (
 
 // fakeBus is an in-memory MD stream with controlled store times.
 type fakeBus struct {
+	cp        *bus.Checkpoint
 	msgs      map[uint64]fakeMsg
 	floor     uint64
 	stopAfter uint64 // Replay stops (without error) after this sequence; 0 = never
@@ -72,6 +73,16 @@ func (f *fakeBus) StreamState(context.Context, string) (bus.StreamInfo, error) {
 func (f *fakeBus) StreamCreated(context.Context, string) (time.Time, error) {
 	return time.Unix(1, 0), nil
 }
+func (f *fakeBus) LoadCheckpoint(context.Context, string) (bus.Checkpoint, bool, error) {
+	if f.cp == nil {
+		return bus.Checkpoint{}, false, nil
+	}
+	return *f.cp, true, nil
+}
+func (f *fakeBus) SaveCheckpoint(_ context.Context, _ string, cp bus.Checkpoint) error {
+	f.cp = &cp
+	return nil
+}
 func (f *fakeBus) Consume(context.Context, bus.ConsumerSpec, func(bus.Msg) error) error {
 	return errors.New("not used")
 }
@@ -117,6 +128,7 @@ func newTestProcessor(f *fakeBus, pub bus.Publisher) *processor {
 	p := newProcessor(flow.DefaultConfig(), pub)
 	p.retry = []time.Duration{time.Millisecond}
 	p.js, p.epoch = f, 1
+	p.allowSynthetic = true // test instruments are SYN*
 	return p
 }
 
@@ -160,8 +172,8 @@ func TestRecoverStateReplaysTradingDayUpToFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(f.replayed) != "[2 3 4]" || n != 3 || p.lastSeq != 4 || !p.partialBefore.IsZero() {
-		t.Fatalf("replayed %v (n=%d) lastSeq=%d partialBefore=%s; want [2 3 4], 3, 4, zero", f.replayed, n, p.lastSeq, p.partialBefore)
+	if fmt.Sprint(f.replayed) != "[2 3 4]" || n != 3 || p.lastSeq != 4 || p.loss != nil {
+		t.Fatalf("replayed %v (n=%d) lastSeq=%d loss=%+v; want [2 3 4], 3, 4, none", f.replayed, n, p.lastSeq, p.loss)
 	}
 	// State equals an engine that processed exactly today's snapshots 3 and 4.
 	ref := flow.New(flow.DefaultConfig())
@@ -186,7 +198,8 @@ func TestRecoverStateFailsWhenReplayStopsBeforeFloor(t *testing.T) {
 
 func TestRecoverStateFloorMissingOrUndecodable(t *testing.T) {
 	d := day("2026-09-23", 1, 4, 5)
-	// Floor 2 was discarded; the stream now starts at 3: whole-stream replay, truncated.
+	// Floor 2 was discarded, no checkpoint; the stream now starts at 3: whole-stream replay,
+	// conservative loss (day unknown).
 	f := &fakeBus{floor: 2}
 	f.add(3, d[2].SourceTime, d[2])
 	f.add(4, d[3].SourceTime, d[3])
@@ -194,8 +207,8 @@ func TestRecoverStateFloorMissingOrUndecodable(t *testing.T) {
 	if _, err := p.recoverState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !f.start.IsZero() || !p.partialBefore.Equal(d[2].SourceTime) || p.lastSeq != 2 || len(f.replayed) != 0 {
-		t.Fatalf("missing floor: start=%s partialBefore=%s lastSeq=%d replayed=%v", f.start, p.partialBefore, p.lastSeq, f.replayed)
+	if !f.start.IsZero() || p.loss == nil || !p.loss.replayBefore.Equal(d[2].SourceTime) || p.lastSeq != 2 || len(f.replayed) != 0 {
+		t.Fatalf("missing floor: start=%s loss=%+v lastSeq=%d replayed=%v", f.start, p.loss, p.lastSeq, f.replayed)
 	}
 	// Floor is an undecodable message: window from its store day.
 	f = &fakeBus{floor: 2}
@@ -210,31 +223,16 @@ func TestRecoverStateFloorMissingOrUndecodable(t *testing.T) {
 	}
 }
 
-// Part of today was discarded before a restart: today's GameTotals and the 10-minute windows
-// that began before the discard boundary carry Partial=true, each instrument gets exactly one
-// RECOVERY_TRUNCATED issue, and the next trading day is complete again.
-func TestTruncatedDayMarkedPartial(t *testing.T) {
-	d := day("2026-09-23", 2, 3, 5) // seqs 1..6 = A0 B0 A1 B1 A2 B2, all in the 09:00 window
-	f := &fakeBus{floor: 3}
-	for i := 2; i < len(d); i++ { // seqs 1-2 (today's start) were discarded
-		f.add(uint64(i+1), d[i].SourceTime, d[i])
-	}
-	next := day("2026-09-24", 1, 2, 6) // SYNTEST0000 on the next day: seqs 7, 8
-	f.add(7, next[0].SourceTime, next[0])
-	f.add(8, next[1].SourceTime, next[1])
-	pub := &recPub{}
-	p := newTestProcessor(f, pub)
-	if _, err := p.recoverState(context.Background()); err != nil || !p.partialBefore.Equal(d[2].SourceTime) {
-		t.Fatalf("err=%v partialBefore=%s", err, p.partialBefore)
-	}
-	for seq := uint64(4); seq <= 8; seq++ {
+// partialFlags runs seqs through handle and collects partial flags and RECOVERY_TRUNCATED issues.
+func partialFlags(t *testing.T, p *processor, f *fakeBus, pub *recPub, from, to uint64) (games, windows map[string]bool, issues map[string]int) {
+	t.Helper()
+	for seq := from; seq <= to; seq++ {
 		m := f.msgs[seq]
-		if err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: seq}); err != nil {
+		if err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: seq, Stored: m.stored}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	issues := map[string]int{}
-	games, windows := map[string]bool{}, map[string]bool{}
+	games, windows, issues = map[string]bool{}, map[string]bool{}, map[string]int{}
 	for _, v := range pub.vals {
 		switch v := v.(type) {
 		case model.QualityIssue:
@@ -247,6 +245,27 @@ func TestTruncatedDayMarkedPartial(t *testing.T) {
 			windows[v.InsCode+" "+v.WindowStart.In(tehran.Loc).Format("2006-01-02 15:04")] = v.Partial
 		}
 	}
+	return
+}
+
+// Applied snapshots of today are gone from the replay: today's GameTotals and the window of each
+// instrument's first retained snapshot are partial, one RECOVERY_TRUNCATED per instrument, and
+// the next trading day is complete again.
+func TestTruncatedDayMarkedPartial(t *testing.T) {
+	d := day("2026-09-23", 2, 3, 5) // seqs 1..6 = A0 B0 A1 B1 A2 B2, all in the 09:00 window
+	f := &fakeBus{floor: 3}
+	for i := 2; i < len(d); i++ { // seqs 1-2 (applied, today) were discarded
+		f.add(uint64(i+1), d[i].SourceTime, d[i])
+	}
+	next := day("2026-09-24", 1, 2, 6) // SYNTEST0000 on the next day: seqs 7, 8
+	f.add(7, next[0].SourceTime, next[0])
+	f.add(8, next[1].SourceTime, next[1])
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss == nil || p.loss.replayDay != "2026-09-23" {
+		t.Fatalf("err=%v loss=%+v", err, p.loss)
+	}
+	games, windows, issues := partialFlags(t, p, f, pub, 4, 8)
 	if issues["SYNTEST0000"] != 1 || issues["SYNTEST0001"] != 1 {
 		t.Errorf("RECOVERY_TRUNCATED per instrument: %v", issues)
 	}
@@ -254,6 +273,98 @@ func TestTruncatedDayMarkedPartial(t *testing.T) {
 	wantWindows := map[string]bool{"SYNTEST0000 2026-09-23 09:00": true, "SYNTEST0001 2026-09-23 09:00": true, "SYNTEST0000 2026-09-24 09:00": false}
 	if fmt.Sprint(games) != fmt.Sprint(wantGames) || fmt.Sprint(windows) != fmt.Sprint(wantWindows) {
 		t.Errorf("partial flags\n games   %v want %v\n windows %v want %v", games, wantGames, windows, wantWindows)
+	}
+}
+
+// The cut lands just before a 10-minute boundary: the window holding the first retained
+// snapshot (09:10) lacks the interval that ended at it, so it is partial; the next window is
+// complete. The floor message is gone; its day comes from the checkpoint.
+func TestPartialWindowAtTenMinuteBoundary(t *testing.T) {
+	d := day("2026-09-23", 1, 250, 8) // index i = 09:00 + 5s*i; index 120 = 09:10:00, 240 = 09:20:00
+	f := &fakeBus{floor: 120, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23"}}
+	for i := 120; i < len(d); i++ { // seqs 1..120 (up to 09:09:55) were applied and are gone
+		f.add(uint64(i+1), d[i].SourceTime, d[i])
+	}
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss == nil || p.loss.replayDay != "2026-09-23" {
+		t.Fatalf("err=%v loss=%+v", err, p.loss)
+	}
+	games, windows, _ := partialFlags(t, p, f, pub, 121, uint64(len(d)))
+	if !games["SYNTEST0000 2026-09-23"] || !windows["SYNTEST0000 2026-09-23 09:10"] || windows["SYNTEST0000 2026-09-23 09:20"] {
+		t.Fatalf("games %v windows %v; want day partial, 09:10 partial, 09:20 complete", games, windows)
+	}
+}
+
+// Wednesday's floor message aged out; the engine restarts on Saturday after the collector has
+// published Saturday's first snapshots. Nothing unapplied was lost and Wednesday is over, so
+// Saturday is complete (checkpoint). Without a checkpoint the day is unknown: conservative.
+func TestAgedOutFloorOnNewDay(t *testing.T) {
+	sat := day("2026-09-26", 1, 3, 9)
+	build := func(cp *bus.Checkpoint) (*fakeBus, *recPub, *processor) {
+		f := &fakeBus{floor: 500, cp: cp}
+		for i, s := range sat { // seqs 501.. : FirstSeq == floor+1
+			f.add(uint64(501+i), s.SourceTime.Add(time.Second), s)
+		}
+		pub := &recPub{}
+		p := newTestProcessor(f, pub)
+		if _, err := p.recoverState(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return f, pub, p
+	}
+	f, pub, p := build(&bus.Checkpoint{Seq: 420, Day: "2026-09-23"})
+	games, _, issues := partialFlags(t, p, f, pub, 501, 503)
+	if games["SYNTEST0000 2026-09-26"] || len(issues) != 0 {
+		t.Fatalf("with checkpoint: games %v issues %v; Saturday must be complete", games, issues)
+	}
+	f, pub, p = build(nil)
+	games, _, _ = partialFlags(t, p, f, pub, 501, 503)
+	if !games["SYNTEST0000 2026-09-26"] {
+		t.Fatalf("without checkpoint the loss cannot be placed and must be conservative: %v", games)
+	}
+}
+
+// Never-applied snapshots were discarded (first retained seq > floor+1): days that began before
+// the first retained message are partial; an instrument with no trades before its baseline is not.
+func TestUnprocessedLossMarksDayPartial(t *testing.T) {
+	d := day("2026-09-23", 1, 6, 10)
+	// DiscardOld removes from the front: applied seqs 1-2 and never-applied 3-4 are all gone.
+	f := &fakeBus{floor: 2, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23"}}
+	for i := 4; i < 6; i++ {
+		f.add(uint64(i+1), d[i].SourceTime, d[i])
+	}
+	quiet := d[5]
+	quiet.InsCode, quiet.Symbol = "SYNTEST0009", "SYN-Q"
+	quiet.Volume, quiet.Value, quiet.IndBuyVol, quiet.IndSellVol, quiet.InstBuyVol, quiet.InstSellVol = 0, 0, 0, 0, 0, 0
+	quiet.IndBuyCount, quiet.IndSellCount = 0, 0
+	f.add(7, quiet.SourceTime, quiet)
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss == nil || p.loss.unprocessedBefore.IsZero() {
+		t.Fatalf("err=%v loss=%+v", err, p.loss)
+	}
+	games, _, issues := partialFlags(t, p, f, pub, 5, 7)
+	if !games["SYNTEST0000 2026-09-23"] || issues["SYNTEST0000"] != 1 || issues["SYNTEST0009"] != 0 {
+		t.Fatalf("games %v issues %v", games, issues)
+	}
+	if fs := p.first["SYNTEST0009"]; fs.partial {
+		t.Fatal("instrument with zero day volume before its baseline marked partial")
+	}
+}
+
+// Rule 5: without ALLOW_SYNTHETIC_ON_BUS a SYN* snapshot is terminated, never computed.
+func TestSyntheticRefusedByDefault(t *testing.T) {
+	d := day("2026-09-23", 1, 2, 5)
+	f := &fakeBus{}
+	f.add(1, d[0].SourceTime, d[0])
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	p.allowSynthetic = false
+	m := f.msgs[1]
+	err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 1})
+	if !bus.IsPermanent(err) || len(pub.ids) != 0 || p.lastSeq != 1 {
+		t.Fatalf("err=%v publishes=%d lastSeq=%d", err, len(pub.ids), p.lastSeq)
 	}
 }
 
@@ -283,6 +394,10 @@ func TestPoisonSuspectStopsWithoutProcessing(t *testing.T) {
 	iss, ok := last.(model.QualityIssue)
 	if !ok || iss.Code != quality.PoisonSuspect || pub.ids[len(pub.ids)-1] != "eng:1:2:poison:0" || pub.subj[len(pub.subj)-1] != "quality.SYNTEST0000" {
 		t.Fatalf("last publish %T %+v id %s", last, last, pub.ids[len(pub.ids)-1])
+	}
+	// An already-applied sequence is acked, not poisoned, whatever its delivery count.
+	if err := p.handle(ctx, bus.Msg{Subject: m1.subj, Data: m1.data, StreamSeq: 1, NumDelivered: 9}); err != nil {
+		t.Fatalf("applied seq redelivered 9 times: %v", err)
 	}
 	// State untouched: the next accepted snapshot still sees seq 1 as its baseline.
 	ref := flow.New(flow.DefaultConfig())
@@ -353,5 +468,61 @@ func TestUndecodableIssuePublishFailureAborts(t *testing.T) {
 	err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 1, Stored: m.stored})
 	if err == nil || bus.IsPermanent(err) || !strings.Contains(err.Error(), "nats down") || p.lastSeq != 0 {
 		t.Fatalf("err=%v permanent=%v lastSeq=%d", err, bus.IsPermanent(err), p.lastSeq)
+	}
+}
+
+// The poison check runs before the gap fill and names the whole range; the operator override
+// processes the message once more.
+func TestPoisonRangeAndOperatorRelease(t *testing.T) {
+	d := day("2026-09-23", 1, 4, 5)
+	f := &fakeBus{}
+	for i, s := range d {
+		f.add(uint64(i+1), s.SourceTime, s)
+	}
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	ctx := context.Background()
+	m := f.msgs[4]
+	msg := bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 4, NumDelivered: 7, Stored: m.stored}
+	err := p.handle(ctx, msg)
+	if err == nil || !strings.Contains(err.Error(), "POISON_SUSPECT: MD seqs 1..4") || p.lastSeq != 0 || len(pub.ids) != 1 {
+		t.Fatalf("err=%v lastSeq=%d publishes=%d (want range 1..4 reported, nothing applied)", err, p.lastSeq, len(pub.ids))
+	}
+	p.retryPoisonSeq = 4
+	if err := p.handle(ctx, msg); err != nil || p.lastSeq != 4 {
+		t.Fatalf("released message not processed: err=%v lastSeq=%d", err, p.lastSeq)
+	}
+}
+
+// AI-02 must not run on a partial window (its NetHot and PriceOpen are incomplete).
+func TestDivergenceSkippedOnPartialWindow(t *testing.T) {
+	at := tehranTime("2026-09-23", "10:00")
+	mk := func(at time.Time, vol, indBuy, indSell, buyN, sellN int64) model.Snapshot {
+		return model.Snapshot{InsCode: "SYNTEST0000", Symbol: "SYN-D", Source: "synthetic", SourceTime: at, IngestTime: at,
+			PriceLast: 10_000, Volume: vol, Value: vol * 10_000, IndBuyVol: indBuy, InstBuyVol: vol - indBuy,
+			IndSellVol: indSell, InstSellVol: vol - indSell, IndBuyCount: buyN, IndSellCount: sellN}
+	}
+	s1 := mk(at, 1_000_000, 600_000, 600_000, 50, 60)
+	// +600,000 shares at a flat 10,000: one new buyer takes all (6,000,000,000 rial, hot), the
+	// sell side goes to 100 new sellers (60,000,000 each, retail). NetHot 6e9 >= 5e9, price
+	// change 0% <= 0.2%: an "absorption" divergence on a complete window.
+	s2 := mk(at.Add(5*time.Second), 1_600_000, 1_200_000, 1_200_000, 51, 160)
+	ai := func(p *processor) int {
+		p.compute(s1)
+		n := 0
+		for _, o := range p.compute(s2) {
+			if strings.HasPrefix(o.subject, "ai.signal.") {
+				n++
+			}
+		}
+		return n
+	}
+	if n := ai(newProcessor(flow.DefaultConfig(), &recPub{})); n != 1 {
+		t.Fatalf("setup: complete window produced %d AI-02 events, want 1", n)
+	}
+	p := newProcessor(flow.DefaultConfig(), &recPub{})
+	p.loss = &lossInfo{replayDay: "2026-09-23"}
+	if n := ai(p); n != 0 {
+		t.Fatalf("partial window produced %d AI events", n)
 	}
 }

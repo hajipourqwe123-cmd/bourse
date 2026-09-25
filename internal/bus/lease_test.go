@@ -68,7 +68,7 @@ func TestLeaseHeartbeatOutlivesTTL(t *testing.T) {
 func TestLeaseExpiresAfterCrash(t *testing.T) {
 	j := connect(t, DefaultStreams())
 	a := mustAcquire(t, j, "engine-a")
-	close(a.stop) // simulate a crash: no more renewals, no release
+	a.stopOnce.Do(func() { close(a.stop) }) // simulate a crash: no more renewals, no release
 	<-a.done
 	wantHeld(t, j, "engine-b", "engine-a")
 	deadline := time.Now().Add(5 * leaseTTL)
@@ -118,4 +118,63 @@ func TestLeaseBucketHasTTL(t *testing.T) {
 	if err != nil || st.TTL() != leaseTTL || st.History() != 1 {
 		t.Fatalf("bucket status %+v %v", st, err)
 	}
+}
+
+// A refused process configured with another TTL must not change the running holder's expiry.
+func TestLeaseTTLMismatchRefusedWithoutTouchingBucket(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	a := mustAcquire(t, j, "engine-a")
+	defer a.Release(ctxT(t))
+	_, err := j.AcquireLease(ctxT(t), "test_lease", "engine", "engine-b", 5*leaseTTL)
+	if err == nil || errors.Is(err, ErrLeaseHeld) || !strings.Contains(err.Error(), "has TTL 1s but this process is configured with 5s") {
+		t.Fatalf("want TTL mismatch error, got %v", err)
+	}
+	st, _ := a.kv.Status(ctxT(t))
+	if st.TTL() != leaseTTL {
+		t.Fatalf("bucket TTL changed to %s", st.TTL())
+	}
+	time.Sleep(2 * leaseTTL)
+	if a.Valid() != nil || isLost(a) {
+		t.Fatal("holder lost its lease after a refused process tried another TTL")
+	}
+	if _, err := j.AcquireLease(ctxT(t), "test_lease", "engine", "x", 500*time.Millisecond); err == nil {
+		t.Fatal("TTL below the minimum accepted")
+	}
+}
+
+// A renewal that succeeded on the server but whose reply was lost leaves a stale revision;
+// the holder must recognise its own value and continue, not report the lease lost.
+func TestLeaseRenewalWithLostReplyIsAdopted(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	a := mustAcquire(t, j, "engine-a")
+	defer a.Release(ctxT(t))
+	a.stopOnce.Do(func() { close(a.stop) }) // drive renewals by hand
+	<-a.done
+	e, _ := a.kv.Get(ctxT(t), "engine")
+	if _, err := a.kv.Update(ctxT(t), "engine", e.Value(), a.rev); err != nil { // the "lost reply" write
+		t.Fatal(err)
+	}
+	if lost, reason := a.renew(e.Value()); lost {
+		t.Fatalf("own earlier renewal treated as loss: %s", reason)
+	}
+	if lost, reason := a.renew(e.Value()); lost { // and the adopted revision works for the next one
+		t.Fatalf("renewal after adopting failed: %s", reason)
+	}
+}
+
+// Valid() turns false before the server can expire the key, even with no renewal errors seen
+// (e.g. the process was paused).
+func TestLeaseValidDeadline(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	a := mustAcquire(t, j, "engine-a")
+	if a.Valid() != nil {
+		t.Fatal("fresh lease invalid")
+	}
+	a.stopOnce.Do(func() { close(a.stop) }) // a paused process: no renewals
+	<-a.done
+	time.Sleep(leaseTTL * 3 / 4)
+	if err := a.Valid(); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("lease still valid 3/4 TTL after the last renewal: %v", err)
+	}
+	wantHeld(t, j, "engine-b", "engine-a") // the key itself has not expired yet
 }

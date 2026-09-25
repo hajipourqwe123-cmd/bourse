@@ -36,11 +36,11 @@ const gib = int64(1) << 30
 
 // DefaultStreams is the single source of truth for stream layout.
 //
-// Sizing (contracts/subjects.md): full market ~1500 instruments every 5s = 300 snapshots/s over a
-// 4.5h collection window (08:30–13:00) = 4.86M snapshots/day. Measured 673 B stored per snapshot
-// without order book, ~1.4 KB with a 5-level book → 3.3–6.8 GB/day, so MD holds at least one
-// full day with a book (the engine replays the current day on restart). FLOW: measured ~2
-// outputs of 261 B per snapshot → ~2.5 GB/day.
+// Sizing (contracts/subjects.md, TestStreamSizingAssumption): full market ~1500 instruments every
+// 5s = 300 snapshots/s over the collector's 4.5h COLLECT_WINDOW (08:30–13:00) = 4.86M
+// snapshots/day. A worst-case stored snapshot (5-level book, message-ID header) measures 1270 B
+// (assumed <= 1400 B) → ~6.2 GB/day, so MD holds >= 1.2 full days (the engine replays the
+// current day on restart). FLOW: measured ~2 outputs of 261 B per snapshot → ~2.5 GB/day.
 func DefaultStreams() []StreamSpec {
 	return []StreamSpec{
 		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 16 * gib},
@@ -63,9 +63,24 @@ type JetStream struct {
 	timeout time.Duration // per publish / API call
 }
 
-// ConnectJetStream connects to url, then creates or updates streams. name identifies the client
-// in NATS monitoring. Errors never contain the URL (it may carry credentials).
+// ConnectJetStream is DialJetStream followed by EnsureStreams.
 func ConnectJetStream(ctx context.Context, rawURL, name string, streams []StreamSpec) (*JetStream, error) {
+	j, err := DialJetStream(ctx, rawURL, name, streams)
+	if err != nil {
+		return nil, err
+	}
+	if err := j.EnsureStreams(ctx); err != nil {
+		j.nc.Close()
+		return nil, err
+	}
+	return j, nil
+}
+
+// DialJetStream connects to url without creating or changing streams (a process that must
+// first take a lease uses it, so a refused process cannot alter the running one's streams).
+// name identifies the client in NATS monitoring. Errors never contain the URL (it may carry
+// credentials).
+func DialJetStream(ctx context.Context, rawURL, name string, streams []StreamSpec) (*JetStream, error) {
 	nc, err := nats.Connect(rawURL,
 		nats.Name(name),
 		nats.MaxReconnects(-1),
@@ -85,12 +100,7 @@ func ConnectJetStream(ctx context.Context, rawURL, name string, streams []Stream
 		nc.Close()
 		return nil, fmt.Errorf("nats: jetstream: %w", err)
 	}
-	j := &JetStream{nc: nc, js: js, streams: streams, timeout: 5 * time.Second}
-	if err := j.EnsureStreams(ctx); err != nil {
-		nc.Close()
-		return nil, err
-	}
-	return j, nil
+	return &JetStream{nc: nc, js: js, streams: streams, timeout: 5 * time.Second}, nil
 }
 
 // redactURL removes the URL (or comma-separated server list) from msg, then any credentials
@@ -293,6 +303,9 @@ type ConsumerSpec struct {
 	AckWait                 time.Duration   // default 10s; must exceed the handler's worst case (or use InProgress)
 	MaxDeliver              int             // default 5; < 0 = unlimited (crash redeliveries also count)
 	Backoff                 []time.Duration // redelivery delay after the n-th failed attempt; default 1s,2s,4s,8s
+	// BeforeAck, if set, is checked before every ack; an error stops Consume WITHOUT acking
+	// (e.g. the process's single-instance lease is no longer valid).
+	BeforeAck func() error
 }
 
 func (c *ConsumerSpec) defaults() {
@@ -474,6 +487,11 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 		var abort abortError
 		switch {
 		case herr == nil:
+			if spec.BeforeAck != nil {
+				if err := spec.BeforeAck(); err != nil {
+					return err // unacked: redelivered after AckWait
+				}
+			}
 			if err := m.Ack(); err != nil {
 				log.Printf("jetstream: ack %s seq %d: %v", m.Subject(), seq, err)
 			}

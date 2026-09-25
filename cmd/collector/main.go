@@ -4,6 +4,7 @@
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
 //	                                         # (SYN* refused unless ALLOW_SYNTHETIC_ON_BUS=1)
+//	COLLECT_WINDOW=08:30-13:00               # live sources poll only in this Tehran-time span ("always")
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"bourse/internal/config"
 	"bourse/internal/model"
 	"bourse/internal/source"
+	"bourse/internal/tehran"
 )
 
 func main() { os.Exit(run()) }
@@ -76,8 +78,34 @@ func run() int {
 	replayDelay := config.Dur("REPLAY_DELAY", 0)
 	backoff := time.Second
 	log.Printf("collector: source=%s interval=%s bus=%s", src.Name(), interval, config.Str("BUS", "ndjson"))
+	_, isReplay := src.(*source.Replay)
+	win, err := parseWindow(config.Str("COLLECT_WINDOW", "08:30-13:00"))
+	if err != nil {
+		log.Printf("collector: COLLECT_WINDOW: %v", err)
+		return 1
+	}
+	if isReplay {
+		win = window{always: true} // a recording is replayed whatever the wall clock says
+	}
+	outside := false
 
 	for {
+		if !win.contains(time.Now()) {
+			if !outside {
+				log.Printf("collector: outside the collection window %s (Tehran); not polling", win)
+				outside = true
+			}
+			select {
+			case <-ctx.Done():
+				return 0
+			case <-time.After(interval):
+			}
+			continue
+		}
+		if outside {
+			log.Printf("collector: collection window %s open; polling", win)
+			outside = false
+		}
 		batch, err := src.Fetch(ctx)
 		if errors.Is(err, source.ErrDone) {
 			log.Printf("collector: source exhausted")
@@ -144,8 +172,52 @@ func busGuard(s *model.Snapshot, allowSynthetic bool) error {
 	if allowSynthetic {
 		return nil
 	}
-	if s.Source == "synthetic" || strings.HasPrefix(s.InsCode, "SYN") || strings.HasPrefix(s.Symbol, "SYN") {
+	if model.IsSynthetic(s) {
 		return fmt.Errorf("refusing to publish synthetic instrument %s to the bus (set ALLOW_SYNTHETIC_ON_BUS=1 only on a disposable local stack)", s.InsCode)
 	}
 	return nil
+}
+
+// window is the daily Tehran-time span in which the collector polls a live source
+// (COLLECT_WINDOW="HH:MM-HH:MM", or "always"). It bounds the bus volume that the stream sizing
+// in bus.DefaultStreams assumes (08:30-13:00 by default).
+type window struct {
+	from, to time.Duration // since Tehran midnight, [from, to)
+	always   bool
+}
+
+func parseWindow(v string) (window, error) {
+	if v == "always" {
+		return window{always: true}, nil
+	}
+	a, b, ok := strings.Cut(v, "-")
+	parse := func(x string) (time.Duration, error) {
+		t, err := time.Parse("15:04", strings.TrimSpace(x))
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute, nil
+	}
+	from, err1 := parse(a)
+	to, err2 := parse(b)
+	if !ok || err1 != nil || err2 != nil || to <= from {
+		return window{}, fmt.Errorf("%q: want HH:MM-HH:MM (Tehran, start before end) or always", v)
+	}
+	return window{from: from, to: to}, nil
+}
+
+func (w window) contains(t time.Time) bool {
+	if w.always {
+		return true
+	}
+	since := t.Sub(tehran.DayStart(t))
+	return since >= w.from && since < w.to
+}
+
+func (w window) String() string {
+	if w.always {
+		return "always"
+	}
+	f := func(d time.Duration) string { return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60) }
+	return f(w.from) + "-" + f(w.to)
 }

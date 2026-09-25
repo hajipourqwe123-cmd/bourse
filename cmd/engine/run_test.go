@@ -130,10 +130,14 @@ type rawMsg struct{ ins, data string }
 
 // runUntil runs a fresh processor over NATS until the durable's ack floor reaches floor.
 // It returns runNATS's error.
-func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64) error {
+func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64, opts ...func(*processor)) error {
 	t.Helper()
 	p := newProcessor(flow.DefaultConfig(), pub)
 	p.retry = []time.Duration{time.Millisecond, time.Millisecond}
+	p.allowSynthetic = true // test instruments are SYN*
+	for _, o := range opts {
+		o(p)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	go func() {
@@ -406,6 +410,11 @@ func TestPoisonSuspectAcrossRestarts(t *testing.T) {
 	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 1 {
 		t.Fatalf("poisoned message acked/dropped: ack floor %d", f)
 	}
+	defer func() { // operator release: processed once more, then acked
+		if err := runUntil(t, js, js, 2, func(p *processor) { p.retryPoisonSeq = 2 }); err != nil {
+			t.Fatalf("released run: %v", err)
+		}
+	}()
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
 	jsc, _ := nc.JetStream()
@@ -422,7 +431,13 @@ func TestPoisonSuspectAcrossRestarts(t *testing.T) {
 // startLeased runs an engine under the single-engine lease in the background.
 func startLeased(t *testing.T, js *bus.JetStream, holder string) (stop func() error) {
 	t.Helper()
-	p := newProcessor(flow.DefaultConfig(), js)
+	return startLeasedWith(t, js, js, holder)
+}
+
+func startLeasedWith(t *testing.T, js *bus.JetStream, pub bus.Publisher, holder string) (stop func() error) {
+	t.Helper()
+	p := newProcessor(flow.DefaultConfig(), pub)
+	p.allowSynthetic = true
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	spec := engineConsumer()
@@ -469,6 +484,7 @@ func TestSecondEngineRefusesToStart(t *testing.T) {
 
 	pub := &recPub{}
 	b := newProcessor(flow.DefaultConfig(), pub)
+	b.allowSynthetic = true
 	err := runLeased(context.Background(), js, b, engineConsumer(), true, "engine-b", time.Second)
 	if !errors.Is(err, bus.ErrLeaseHeld) || !strings.Contains(err.Error(), "engine-a") {
 		t.Fatalf("second engine: want ErrLeaseHeld naming engine-a, got %v", err)
@@ -481,6 +497,7 @@ func TestSecondEngineRefusesToStart(t *testing.T) {
 		t.Fatalf("first engine: %v", err)
 	}
 	c := newProcessor(flow.DefaultConfig(), js)
+	c.allowSynthetic = true
 	if err := runLeased(context.Background(), js, c, engineConsumer(), true, "engine-c", time.Second); err != nil {
 		t.Fatalf("engine after a clean stop: %v", err)
 	}
@@ -518,5 +535,95 @@ func TestEngineStopsWhenLeaseLost(t *testing.T) {
 	time.Sleep(2 * time.Second) // > one renewal period (ttl/3) plus slack
 	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
 		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+}
+
+// blockingPub blocks its first publish until released, then counts later publishes.
+type blockingPub struct {
+	*bus.JetStream
+	entered, release chan struct{}
+	after            atomic.Int64
+	first            atomic.Bool
+}
+
+func (b *blockingPub) PublishID(subject, id string, v any) error {
+	if b.first.CompareAndSwap(false, true) {
+		close(b.entered)
+		<-b.release
+	} else {
+		b.after.Add(1)
+	}
+	return b.JetStream.PublishID(subject, id, v)
+}
+
+// The lease is lost while a snapshot's outputs are being published: the in-flight publish may
+// complete, but no further output is published and the snapshot is not acked.
+func TestLostLeaseStopsPublishAndAck(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	snaps := day("2026-09-23", 1, 2, 11) // seq 1 is a baseline (no outputs), seq 2 has several
+	feed(t, url, js, []any{snaps[0], snaps[1]})
+	bp := &blockingPub{JetStream: js, entered: make(chan struct{}), release: make(chan struct{})}
+	stop := startLeasedWith(t, js, bp, "engine-a")
+	select {
+	case <-bp.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine never published")
+	}
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	kv, err := jsc.KeyValue(context.Background(), leaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil { // lease taken away
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second) // > one renewal period: the holder notices the revision change
+	close(bp.release)
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+	if n := bp.after.Load(); n != 0 {
+		t.Fatalf("%d outputs published after the lease was lost", n)
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 1 {
+		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
+	}
+}
+
+// The lease is lost while the only output of a snapshot is in flight: the handler then
+// succeeds, and the ack guard alone must keep the snapshot unacked.
+func TestLostLeaseBlocksAck(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	s := day("2026-09-23", 1, 1, 12)[0]
+	s.Missing = []string{model.FIndSellCount} // INCOMPLETE: exactly one output (the issue)
+	feed(t, url, js, []any{s})
+	bp := &blockingPub{JetStream: js, entered: make(chan struct{}), release: make(chan struct{})}
+	stop := startLeasedWith(t, js, bp, "engine-a")
+	select {
+	case <-bp.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine never published")
+	}
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	kv, err := jsc.KeyValue(context.Background(), leaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	close(bp.release)
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 0 {
+		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
 	}
 }
