@@ -16,8 +16,9 @@ const StateBucket = "service_state"
 // applied on that day. It lets a restart know which day its ack floor belongs to even after
 // the floor message itself was discarded from the stream.
 type Checkpoint struct {
-	Seq uint64 `json:"seq"`
-	Day string `json:"day"` // Tehran trading day, YYYY-MM-DD
+	Seq   uint64 `json:"seq"`
+	Day   string `json:"day"`   // Tehran trading day, YYYY-MM-DD
+	Epoch int64  `json:"epoch"` // creation time (unix ns) of the stream Seq refers to; a mismatch means it was recreated
 }
 
 func (j *JetStream) stateBucket(ctx context.Context) (jetstream.KeyValue, error) {
@@ -35,20 +36,41 @@ func (j *JetStream) stateBucket(ctx context.Context) (jetstream.KeyValue, error)
 	return kv, nil
 }
 
-// LoadCheckpoint returns the checkpoint stored under name; ok is false if there is none.
-func (j *JetStream) LoadCheckpoint(ctx context.Context, name string) (cp Checkpoint, ok bool, err error) {
+// StateGet returns the value stored under key in StateBucket; ok is false if there is none.
+func (j *JetStream) StateGet(ctx context.Context, key string) (val []byte, ok bool, err error) {
 	kv, err := j.stateBucket(ctx)
 	if err != nil {
-		return cp, false, err
+		return nil, false, err
 	}
-	e, err := kv.Get(ctx, name)
+	e, err := kv.Get(ctx, key)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return cp, false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return cp, false, fmt.Errorf("state: get %s: %w", name, err)
+		return nil, false, fmt.Errorf("state: get %s: %w", key, err)
 	}
-	if err := json.Unmarshal(e.Value(), &cp); err != nil {
+	return e.Value(), true, nil
+}
+
+// StatePut stores val under key in StateBucket.
+func (j *JetStream) StatePut(ctx context.Context, key string, val []byte) error {
+	kv, err := j.stateBucket(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := kv.Put(ctx, key, val); err != nil {
+		return fmt.Errorf("state: put %s: %w", key, err)
+	}
+	return nil
+}
+
+// LoadCheckpoint returns the checkpoint stored under name; ok is false if there is none.
+func (j *JetStream) LoadCheckpoint(ctx context.Context, name string) (cp Checkpoint, ok bool, err error) {
+	b, ok, err := j.StateGet(ctx, name)
+	if err != nil || !ok {
+		return cp, false, err
+	}
+	if err := json.Unmarshal(b, &cp); err != nil {
 		return cp, false, fmt.Errorf("state: decode %s: %w", name, err)
 	}
 	return cp, true, nil
@@ -56,13 +78,6 @@ func (j *JetStream) LoadCheckpoint(ctx context.Context, name string) (cp Checkpo
 
 // SaveCheckpoint stores cp under name.
 func (j *JetStream) SaveCheckpoint(ctx context.Context, name string, cp Checkpoint) error {
-	kv, err := j.stateBucket(ctx)
-	if err != nil {
-		return err
-	}
 	b, _ := json.Marshal(cp)
-	if _, err := kv.Put(ctx, name, b); err != nil {
-		return fmt.Errorf("state: put %s: %w", name, err)
-	}
-	return nil
+	return j.StatePut(ctx, name, b)
 }

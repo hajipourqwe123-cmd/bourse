@@ -21,6 +21,8 @@ import (
 // fakeBus is an in-memory MD stream with controlled store times.
 type fakeBus struct {
 	cp        *bus.Checkpoint
+	state     map[string][]byte
+	getErr    error // returned by GetMsg for every sequence when set
 	msgs      map[uint64]fakeMsg
 	floor     uint64
 	stopAfter uint64 // Replay stops (without error) after this sequence; 0 = never
@@ -60,6 +62,9 @@ func (f *fakeBus) seqs() (first, last uint64) {
 
 func (f *fakeBus) AckFloor(context.Context, string, string) (uint64, error) { return f.floor, nil }
 func (f *fakeBus) GetMsg(_ context.Context, _ string, seq uint64) (string, []byte, time.Time, error) {
+	if f.getErr != nil {
+		return "", nil, time.Time{}, f.getErr
+	}
 	m, ok := f.msgs[seq]
 	if !ok {
 		return "", nil, time.Time{}, jetstream.ErrMsgNotFound
@@ -81,6 +86,17 @@ func (f *fakeBus) LoadCheckpoint(context.Context, string) (bus.Checkpoint, bool,
 }
 func (f *fakeBus) SaveCheckpoint(_ context.Context, _ string, cp bus.Checkpoint) error {
 	f.cp = &cp
+	return nil
+}
+func (f *fakeBus) StateGet(_ context.Context, key string) ([]byte, bool, error) {
+	v, ok := f.state[key]
+	return v, ok, nil
+}
+func (f *fakeBus) StatePut(_ context.Context, key string, val []byte) error {
+	if f.state == nil {
+		f.state = map[string][]byte{}
+	}
+	f.state[key] = val
 	return nil
 }
 func (f *fakeBus) Consume(context.Context, bus.ConsumerSpec, func(bus.Msg) error) error {
@@ -281,7 +297,7 @@ func TestTruncatedDayMarkedPartial(t *testing.T) {
 // complete. The floor message is gone; its day comes from the checkpoint.
 func TestPartialWindowAtTenMinuteBoundary(t *testing.T) {
 	d := day("2026-09-23", 1, 250, 8) // index i = 09:00 + 5s*i; index 120 = 09:10:00, 240 = 09:20:00
-	f := &fakeBus{floor: 120, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23"}}
+	f := &fakeBus{floor: 120, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23", Epoch: 1}}
 	for i := 120; i < len(d); i++ { // seqs 1..120 (up to 09:09:55) were applied and are gone
 		f.add(uint64(i+1), d[i].SourceTime, d[i])
 	}
@@ -313,7 +329,7 @@ func TestAgedOutFloorOnNewDay(t *testing.T) {
 		}
 		return f, pub, p
 	}
-	f, pub, p := build(&bus.Checkpoint{Seq: 420, Day: "2026-09-23"})
+	f, pub, p := build(&bus.Checkpoint{Seq: 420, Day: "2026-09-23", Epoch: 1})
 	games, _, issues := partialFlags(t, p, f, pub, 501, 503)
 	if games["SYNTEST0000 2026-09-26"] || len(issues) != 0 {
 		t.Fatalf("with checkpoint: games %v issues %v; Saturday must be complete", games, issues)
@@ -330,7 +346,7 @@ func TestAgedOutFloorOnNewDay(t *testing.T) {
 func TestUnprocessedLossMarksDayPartial(t *testing.T) {
 	d := day("2026-09-23", 1, 6, 10)
 	// DiscardOld removes from the front: applied seqs 1-2 and never-applied 3-4 are all gone.
-	f := &fakeBus{floor: 2, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23"}}
+	f := &fakeBus{floor: 2, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23", Epoch: 1}}
 	for i := 4; i < 6; i++ {
 		f.add(uint64(i+1), d[i].SourceTime, d[i])
 	}
@@ -348,7 +364,7 @@ func TestUnprocessedLossMarksDayPartial(t *testing.T) {
 	if !games["SYNTEST0000 2026-09-23"] || issues["SYNTEST0000"] != 1 || issues["SYNTEST0009"] != 0 {
 		t.Fatalf("games %v issues %v", games, issues)
 	}
-	if fs := p.first["SYNTEST0009"]; fs.partial {
+	if fs := p.first[dayKey("SYNTEST0009", "2026-09-23")]; fs.partial {
 		t.Fatal("instrument with zero day volume before its baseline marked partial")
 	}
 }
@@ -524,5 +540,119 @@ func TestDivergenceSkippedOnPartialWindow(t *testing.T) {
 	p.loss = &lossInfo{replayDay: "2026-09-23"}
 	if n := ai(p); n != 0 {
 		t.Fatalf("partial window produced %d AI events", n)
+	}
+}
+
+// A checkpoint from an earlier (recreated) MD stream is ignored: the day is unknown again and
+// the rule stays conservative.
+func TestCheckpointFromOtherStreamIgnored(t *testing.T) {
+	sat := day("2026-09-26", 1, 3, 9)
+	f := &fakeBus{floor: 500, cp: &bus.Checkpoint{Seq: 420, Day: "2026-09-23", Epoch: 99}}
+	for i, s := range sat {
+		f.add(uint64(501+i), s.SourceTime.Add(time.Second), s)
+	}
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p.loss == nil || p.loss.replayDay != "" || p.loss.replayBefore.IsZero() {
+		t.Fatalf("foreign checkpoint used: loss=%+v", p.loss)
+	}
+}
+
+// The checkpoint records the first sequence of each trading day with the stream epoch, and a
+// snapshot dated far ahead of its ingest time does not move it.
+func TestCheckpointSaving(t *testing.T) {
+	d := day("2026-09-23", 1, 2, 5)
+	next := day("2026-09-24", 1, 1, 5)
+	future := next[0]
+	future.SourceTime, future.IngestTime = tehranTime("2027-01-01", "10:00"), next[0].IngestTime
+	future.InsCode, future.Symbol = "SYNTEST0007", "SYN-F"
+	f := &fakeBus{}
+	f.add(1, d[0].SourceTime, d[0])
+	f.add(2, d[1].SourceTime, d[1])
+	f.add(3, future.IngestTime, future)
+	f.add(4, next[0].SourceTime, next[0])
+	p := newTestProcessor(f, &recPub{})
+	var got []string
+	for seq := uint64(1); seq <= 4; seq++ {
+		m := f.msgs[seq]
+		if err := p.handle(context.Background(), bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: seq}); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fmt.Sprintf("%d:%s", f.cp.Seq, f.cp.Day))
+	}
+	if fmt.Sprint(got) != "[1:2026-09-23 1:2026-09-23 1:2026-09-23 4:2026-09-24]" || f.cp.Epoch != 1 {
+		t.Fatalf("checkpoints %v epoch %d", got, f.cp.Epoch)
+	}
+}
+
+// Only "message not found" proves the floor message is gone; any other error (timeout) must
+// stop recovery instead of taking the conservative loss path.
+func TestRecoverStateGetMsgErrorIsNotLoss(t *testing.T) {
+	d := day("2026-09-23", 1, 2, 5)
+	f := &fakeBus{floor: 1, getErr: errors.New("nats: timeout")}
+	f.add(1, d[0].SourceTime, d[0])
+	p := newTestProcessor(f, &recPub{})
+	if _, err := p.recoverState(context.Background()); err == nil || p.loss != nil {
+		t.Fatalf("err=%v loss=%+v", err, p.loss)
+	}
+}
+
+// A previous-day snapshot inside the replay's 1h margin is seen first; the damaged day must
+// still be decided on its own baseline (decision per instrument AND day).
+func TestPartialDecidedPerDay(t *testing.T) {
+	prev := day("2026-09-22", 1, 1, 5)[0]
+	prev.SourceTime = tehranTime("2026-09-22", "23:40")
+	d := day("2026-09-23", 1, 3, 5)
+	f := &fakeBus{floor: 3}
+	// seq 1 (applied, today) was discarded: the floor day lost data.
+	f.add(2, prev.SourceTime, prev) // late previous-day snapshot, inside the margin
+	f.add(3, d[1].SourceTime, d[1]) // floor: today's first retained snapshot
+	f.add(4, d[2].SourceTime, d[2])
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss == nil || p.loss.replayDay != "2026-09-23" {
+		t.Fatalf("err=%v loss=%+v", err, p.loss)
+	}
+	games, _, issues := partialFlags(t, p, f, pub, 4, 4)
+	if !games["SYNTEST0000 2026-09-23"] || issues["SYNTEST0000"] != 1 {
+		t.Fatalf("games %v issues %v", games, issues)
+	}
+}
+
+// ENGINE_RETRY_POISON_SEQ is one-shot: recorded before processing, so a second delivery (e.g.
+// the released message crashed again) is reported as POISON_SUSPECT, and a restart with the
+// same value ignores it.
+func TestPoisonReleaseIsOneShot(t *testing.T) {
+	d := day("2026-09-23", 1, 2, 5)
+	f := &fakeBus{}
+	f.add(1, d[0].SourceTime, d[0])
+	f.add(2, d[1].SourceTime, d[1])
+	p := newTestProcessor(f, &recPub{})
+	p.retryPoisonSeq = 2
+	ctx := context.Background()
+	if err := p.handle(ctx, bus.Msg{Subject: f.msgs[1].subj, Data: f.msgs[1].data, StreamSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	m := f.msgs[2]
+	p.lastSeq = 1
+	p.guard = func() error { return errors.New("crash stand-in") } // processing fails after the release
+	if err := p.handle(ctx, bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 2, NumDelivered: 6}); err == nil || strings.Contains(err.Error(), "POISON") {
+		t.Fatalf("released message not attempted: %v", err)
+	}
+	if string(f.state[poisonReleaseKey]) != "2" || p.retryPoisonSeq != 0 {
+		t.Fatalf("release not recorded: %q, retryPoisonSeq=%d", f.state[poisonReleaseKey], p.retryPoisonSeq)
+	}
+	p.guard = nil
+	if err := p.handle(ctx, bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: 2, NumDelivered: 7}); err == nil || !strings.Contains(err.Error(), "POISON_SUSPECT") {
+		t.Fatalf("second delivery after a used release: %v", err)
+	}
+	q := newTestProcessor(f, &recPub{}) // a restart with the same ENGINE_RETRY_POISON_SEQ
+	q.retryPoisonSeq = 2
+	_ = q.runNATS(ctx, f, engineConsumer(), false)
+	if q.retryPoisonSeq != 0 {
+		t.Fatal("used release honoured again after a restart")
 	}
 }

@@ -23,13 +23,16 @@ var (
 const MinLeaseTTL = time.Second
 
 // Lease is an exclusive, expiring claim on one key of a JetStream KV bucket (the bucket's TTL
-// is the lease TTL). The holder renews it every TTL/3 with a compare-and-set on the revision it
+// is the lease TTL). The holder renews it every TTL/6 with a compare-and-set on the revision it
 // owns; a holder that crashes stops renewing and the key expires after at most TTL.
 //
 // Valid() is a local, conservative deadline: 2/3 TTL after the SEND time of the last successful
 // renewal (the server can only expire the key TTL after the write, which is later). Holders must
-// check it before every externally visible action (publish, ack), so a holder that is paused or
-// cut off stops acting before a successor can acquire. It is still not a fencing token.
+// check it before every externally visible action (publish attempt, ack), so a holder that is
+// paused or cut off stops acting in time in the normal case. It is not a fencing token: an
+// action already in flight when the deadline passes (at most one publish attempt, bounded by its
+// timeout) can still land; deterministic output IDs de-duplicate it when the successor computes
+// the same output.
 type Lease struct {
 	kv     jetstream.KeyValue
 	key    string
@@ -144,7 +147,7 @@ func (l *Lease) markLost(reason string) {
 
 func (l *Lease) heartbeat(val []byte) {
 	defer close(l.done)
-	t := time.NewTicker(l.ttl / 3)
+	t := time.NewTicker(l.ttl / 6) // several attempts fit in the 2/3-TTL validity margin
 	defer t.Stop()
 	for {
 		select {
@@ -162,7 +165,7 @@ func (l *Lease) heartbeat(val []byte) {
 // renew performs one compare-and-set renewal. It reports lost when the revision moved to
 // someone else, or when no renewal succeeded before the local deadline.
 func (l *Lease) renew(val []byte) (lost bool, reason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), l.ttl/3)
+	ctx, cancel := context.WithTimeout(context.Background(), l.ttl/6)
 	defer cancel()
 	// Only this goroutine changes rev; the lock guards readers of deadline, never network calls.
 	l.mu.Lock()
@@ -180,12 +183,17 @@ func (l *Lease) renew(val []byte) (lost bool, reason string) {
 		return false, ""
 	}
 	if errors.Is(err, jetstream.ErrKeyExists) { // revision moved: ours (lost reply) or someone else's
-		if e, gerr := l.kv.Get(ctx, l.key); gerr == nil && string(e.Value()) == string(val) {
-			// An earlier renewal succeeded but its reply was lost: adopt that revision.
-			set(e.Revision(), e.Created().Add(l.ttl*2/3))
+		e, gerr := l.kv.Get(ctx, l.key)
+		switch {
+		case gerr == nil && string(e.Value()) == string(val):
+			// An earlier renewal succeeded but its reply was lost. Adopt its revision but keep the
+			// current deadline (from an earlier LOCAL send time): never trust the server's clock.
+			set(e.Revision(), deadline)
 			return false, ""
+		case gerr == nil || errors.Is(gerr, jetstream.ErrKeyNotFound) || errors.Is(gerr, jetstream.ErrKeyDeleted):
+			return true, "revision changed: " + err.Error()
 		}
-		return true, "revision changed: " + err.Error()
+		err = gerr // could not tell: retry until the deadline
 	}
 	if time.Now().After(deadline) {
 		return true, fmt.Sprintf("not renewed in time (last error: %v)", err)
@@ -205,6 +213,7 @@ func (l *Lease) Release(ctx context.Context) error {
 	default:
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.kv.Delete(ctx, l.key, jetstream.LastRevision(l.rev))
+	rev := l.rev
+	l.mu.Unlock()
+	return l.kv.Delete(ctx, l.key, jetstream.LastRevision(rev))
 }

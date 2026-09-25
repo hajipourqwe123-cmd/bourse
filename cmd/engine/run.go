@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,14 +39,14 @@ type processor struct {
 	js      jsBus
 	epoch   int64  // MD stream creation time: makes output IDs unique per stream lifetime
 	lastSeq uint64 // highest MD sequence applied to state AND fully published (or reported undecodable)
-	cpDay   string // latest trading day recorded in the checkpoint
+	cpDay   string // trading day recorded in the checkpoint (for this MD epoch)
 
 	// loss is set by recovery when snapshots were discarded from MD before this engine applied
 	// them (or before it could replay them). Each instrument's first complete snapshot after
 	// recovery is its new baseline; first records whether data of that day before it was lost.
 	loss    *lossInfo
-	first   map[string]firstSeen
-	flagged map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
+	first   map[string]firstSeen // by instrument and trading day (dayKey)
+	flagged map[string]bool      // (instrument, day) already given a RECOVERY_TRUNCATED issue
 
 	guard          func() error // e.g. lease validity; checked before every publish (nil = none)
 	allowSynthetic bool         // accept SYN* snapshots (ALLOW_SYNTHETIC_ON_BUS=1, local demos only)
@@ -66,7 +67,10 @@ type lossInfo struct {
 	replayBefore      time.Time // as replayDay when the day is unknown: those stored before this
 }
 
-// firstSeen is an instrument's first complete snapshot after recovery (its new baseline).
+func dayKey(ins, day string) string { return ins + "|" + day }
+
+// firstSeen is an instrument's first complete snapshot of a trading day after recovery (its
+// baseline for that day).
 type firstSeen struct {
 	day     string    // its trading day
 	window  time.Time // its 10-minute window
@@ -99,13 +103,14 @@ func (p *processor) markPartial(s *model.Snapshot, r *flow.Result) {
 	if p.loss == nil {
 		return
 	}
-	fs, ok := p.first[s.InsCode]
+	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
+	fs, ok := p.first[key]
 	if !ok {
 		if !hasFlowFields(s) {
 			return // incomplete snapshots never become baselines
 		}
 		fs = p.loss.decide(*s)
-		p.first[s.InsCode] = fs
+		p.first[key] = fs
 	}
 	if !fs.partial {
 		return
@@ -166,19 +171,23 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 			last = time.Now()
 		}
 	}
+	var guardErr error
 	for i, o := range outs {
 		alive()
-		if p.guard != nil {
-			if err := p.guard(); err != nil {
-				return fmt.Errorf("before output %d/%d: %w", i+1, len(outs), err)
-			}
-		}
 		err := bus.Retry(ctx, p.retry, alive, func() error {
+			if p.guard != nil { // before EVERY attempt, retries included
+				if guardErr = p.guard(); guardErr != nil {
+					return bus.Permanent(guardErr) // no point retrying without the lease
+				}
+			}
 			if useID {
 				return idp.PublishID(o.subject, fmt.Sprintf("%s:%d", idPrefix, i), o.v)
 			}
 			return p.pub.Publish(o.subject, o.v)
 		})
+		if guardErr != nil {
+			return fmt.Errorf("before output %d/%d: %w", i+1, len(outs), guardErr)
+		}
 		if err != nil {
 			return fmt.Errorf("output %d/%d on %s: %w", i+1, len(outs), o.subject, err)
 		}
@@ -225,9 +234,10 @@ func (p *processor) runNDJSON(r io.Reader) (n, bad int, err error) {
 }
 
 const (
-	engineDurable = "engine"
-	snapFilter    = "md.snap.>"
-	poisonAfter   = 5 // deliveries of one MD message before the engine stops with POISON_SUSPECT
+	engineDurable    = "engine"
+	snapFilter       = "md.snap.>"
+	poisonReleaseKey = "engine_poison_released" // service_state key: last seq released by ENGINE_RETRY_POISON_SEQ
+	poisonAfter      = 5                        // deliveries of one MD message before the engine stops with POISON_SUSPECT
 )
 
 // engineConsumer is the durable consumer spec. MaxDeliver is unlimited on purpose: every
@@ -249,6 +259,8 @@ type jsBus interface {
 	Consume(ctx context.Context, spec bus.ConsumerSpec, fn func(bus.Msg) error) error
 	LoadCheckpoint(ctx context.Context, name string) (bus.Checkpoint, bool, error)
 	SaveCheckpoint(ctx context.Context, name string, cp bus.Checkpoint) error
+	StateGet(ctx context.Context, key string) ([]byte, bool, error)
+	StatePut(ctx context.Context, key string, val []byte) error
 }
 
 // recoveryStart picks where replay begins: 1h before the Tehran day start of the snapshot at
@@ -287,12 +299,19 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	if err != nil {
 		return 0, err
 	}
+	if cpOK && cp.Epoch != p.epoch {
+		log.Printf("engine: recovery: checkpoint belongs to an earlier MD stream; ignored")
+		cpOK = false
+	}
 	if cpOK {
 		p.cpDay = cp.Day
 	}
 	var start time.Time // zero = whole retained stream
 	floorDay := ""
 	subj, data, stored, gerr := p.js.GetMsg(ctx, bus.StreamMD, floor)
+	if gerr != nil && !errors.Is(gerr, jetstream.ErrMsgNotFound) {
+		return 0, fmt.Errorf("recovery: read ack floor message %d: %w", floor, gerr) // not proof of loss: retry on restart
+	}
 	switch {
 	case gerr == nil:
 		if s, err := decode(subj, data); err == nil {
@@ -357,7 +376,13 @@ func (p *processor) handle(ctx context.Context, m bus.Msg) error {
 		if m.StreamSeq != p.retryPoisonSeq {
 			return p.poison(ctx, m)
 		}
-		log.Printf("engine: WARNING: processing MD seq %d despite %d deliveries (ENGINE_RETRY_POISON_SEQ)", m.StreamSeq, m.NumDelivered)
+		// One-shot: recorded before processing, so a crash while processing it again cannot loop
+		// (the next start finds the release used and reports POISON_SUSPECT again).
+		if err := p.js.StatePut(ctx, poisonReleaseKey, []byte(strconv.FormatUint(m.StreamSeq, 10))); err != nil {
+			return bus.Abort(fmt.Errorf("record poison release: %w", err))
+		}
+		p.retryPoisonSeq = 0
+		log.Printf("engine: WARNING: processing MD seq %d once more despite %d deliveries (ENGINE_RETRY_POISON_SEQ)", m.StreamSeq, m.NumDelivered)
 	}
 	if m.StreamSeq > p.lastSeq+1 {
 		if err := p.fillGap(ctx, m.StreamSeq); err != nil {
@@ -373,7 +398,11 @@ func (p *processor) handle(ctx context.Context, m bus.Msg) error {
 func (p *processor) poison(ctx context.Context, m bus.Msg) error {
 	ins := strings.TrimPrefix(m.Subject, "md.snap.")
 	seqs := fmt.Sprintf("seq %d", m.StreamSeq)
-	if from := p.lastSeq + 1; from < m.StreamSeq {
+	from := p.lastSeq + 1
+	if st, err := p.js.StreamState(ctx, bus.StreamMD); err == nil && st.FirstSeq > from {
+		from = st.FirstSeq // earlier ones are gone, they cannot be the cause
+	}
+	if from < m.StreamSeq {
 		seqs = fmt.Sprintf("seqs %d..%d (the crash may be in any of them; the earlier ones were fetched to fill a gap)", from, m.StreamSeq)
 	}
 	iss := model.QualityIssue{InsCode: ins, Code: quality.PoisonSuspect, At: m.Stored,
@@ -431,8 +460,9 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
-	if fs, ok := p.first[s.InsCode]; ok && fs.partial && !p.flagged[s.InsCode] && tehran.TradingDay(s.SourceTime) == fs.day {
-		p.flagged[s.InsCode] = true
+	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
+	if fs, ok := p.first[key]; ok && fs.partial && !p.flagged[key] {
+		p.flagged[key] = true
 		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
 			Detail: fmt.Sprintf("engine restarted after snapshots of %s before %s were discarded from the bus; day totals and that 10-minute window are partial",
 				fs.day, fs.window.In(tehran.Loc).Format("15:04")), At: s.IngestTime}})
@@ -441,14 +471,26 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 		return bus.Abort(err)
 	}
 	p.lastSeq = m.StreamSeq
-	if day := tehran.TradingDay(s.SourceTime); day > p.cpDay {
-		if err := p.js.SaveCheckpoint(ctx, engineDurable, bus.Checkpoint{Seq: m.StreamSeq, Day: day}); err != nil {
-			log.Printf("engine: checkpoint: %v (recovery will be conservative)", err) // retried on the next snapshot
-		} else {
-			p.cpDay = day
-		}
-	}
+	p.checkpoint(ctx, s, m.StreamSeq)
 	return nil
+}
+
+// checkpoint records the first MD sequence of each new trading day, so a restart can place its
+// ack floor on a day after the floor message itself is discarded. A snapshot whose source time
+// is implausibly ahead of its ingest time does not move it.
+func (p *processor) checkpoint(ctx context.Context, s model.Snapshot, seq uint64) {
+	day := tehran.TradingDay(s.SourceTime)
+	if day == p.cpDay || s.SourceTime.After(s.IngestTime.Add(time.Hour)) {
+		return
+	}
+	if p.guard != nil && p.guard() != nil {
+		return
+	}
+	if err := p.js.SaveCheckpoint(ctx, engineDurable, bus.Checkpoint{Seq: seq, Day: day, Epoch: p.epoch}); err != nil {
+		log.Printf("engine: checkpoint: %v (recovery will be conservative)", err) // retried on the next snapshot
+		return
+	}
+	p.cpDay = day
 }
 
 // runNATS consumes md.snap.> through the durable "engine" consumer (BUS=nats). It returns nil
@@ -462,6 +504,14 @@ func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec
 		return err
 	}
 	p.epoch = created.UnixNano()
+	if p.retryPoisonSeq != 0 {
+		if b, ok, err := js.StateGet(ctx, poisonReleaseKey); err != nil {
+			return err
+		} else if ok && string(b) == strconv.FormatUint(p.retryPoisonSeq, 10) {
+			log.Printf("engine: ENGINE_RETRY_POISON_SEQ=%d was already used once; ignoring it (remove it, or investigate again)", p.retryPoisonSeq)
+			p.retryPoisonSeq = 0
+		}
+	}
 	n, err := p.recoverState(ctx)
 	if err != nil {
 		return fmt.Errorf("recover: %w", err)
@@ -544,7 +594,11 @@ func runLeased(ctx context.Context, js interface {
 	p.guard, spec.BeforeAck = lease.Valid, lease.Valid
 	err = p.runNATS(lctx, js, spec, exitWhenIdle)
 	if lerr := lease.Valid(); lerr != nil || errors.Is(err, bus.ErrLeaseLost) {
-		return fmt.Errorf("stopping: %w (another engine may have taken over)", bus.ErrLeaseLost)
+		lost := fmt.Errorf("stopping: %w (another engine may have taken over)", bus.ErrLeaseLost)
+		if err != nil && !errors.Is(err, bus.ErrLeaseLost) && !errors.Is(err, context.Canceled) {
+			return errors.Join(lost, err) // keep the real failure visible
+		}
+		return lost
 	}
 	return err
 }

@@ -382,6 +382,10 @@ func TestRetry(t *testing.T) {
 	if err := Retry(ctx, []time.Duration{0, 0}, nil, func() error { n++; return errors.New("x") }); err == nil || n != 3 {
 		t.Fatalf("exhausted: err=%v n=%d", err, n)
 	}
+	n = 0
+	if err := Retry(ctx, []time.Duration{time.Hour}, nil, func() error { n++; return Permanent(errors.New("x")) }); err == nil || n != 1 {
+		t.Fatalf("permanent error retried: err=%v n=%d", err, n)
+	}
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
 	n = 0

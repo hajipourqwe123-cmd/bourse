@@ -86,6 +86,8 @@ func run() int {
 	}
 	if isReplay {
 		win = window{always: true} // a recording is replayed whatever the wall clock says
+	} else if win.always || win.to-win.from > 4*time.Hour+30*time.Minute {
+		log.Printf("collector: WARNING: COLLECT_WINDOW=%s is longer than the 4.5h the bus stream sizing assumes (contracts/subjects.md)", win)
 	}
 	outside := false
 

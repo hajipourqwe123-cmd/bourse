@@ -85,6 +85,10 @@ func DialJetStream(ctx context.Context, rawURL, name string, streams []StreamSpe
 		nats.Name(name),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(time.Second),
+		// No reconnect buffer: a publish while disconnected fails now (and is retried by the
+		// caller) instead of being delivered later, possibly after this process gave up on it
+		// or lost its lease.
+		nats.ReconnectBufSize(-1),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				log.Printf("nats: disconnected: %s", redactURL(err.Error(), rawURL))
@@ -500,6 +504,11 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 		case ctx.Err() != nil:
 			return ctx.Err() // unacked: redelivered after AckWait
 		case errors.As(herr, &perm):
+			if spec.BeforeAck != nil {
+				if err := spec.BeforeAck(); err != nil {
+					return err // not ours to terminate any more
+				}
+			}
 			log.Printf("jetstream: %s seq %d: permanent error, terminated: %v", m.Subject(), seq, herr)
 			_ = m.Term()
 		case spec.MaxDeliver > 0 && meta.NumDelivered >= uint64(spec.MaxDeliver):
@@ -523,13 +532,14 @@ func (j *JetStream) filterIsWholeStream(stream, filter string) bool {
 }
 
 // Retry calls f until it succeeds, sleeping backoff[i] between attempts (len(backoff)+1 attempts
-// in total) and calling beforeSleep (may be nil) before each sleep. It returns f's last error,
-// or, if ctx ends during a sleep, that error joined with ctx's.
+// in total) and calling beforeSleep (may be nil) before each sleep. An error marked Permanent
+// stops it at once. It returns f's last error, or, if ctx ends during a sleep, that error joined
+// with ctx's.
 func Retry(ctx context.Context, backoff []time.Duration, beforeSleep func(), f func() error) error {
 	err := f()
 	for _, d := range backoff {
-		if err == nil {
-			return nil
+		if err == nil || IsPermanent(err) {
+			return err
 		}
 		if beforeSleep != nil {
 			beforeSleep()

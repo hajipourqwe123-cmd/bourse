@@ -172,7 +172,11 @@ func TestLeaseValidDeadline(t *testing.T) {
 	}
 	a.stopOnce.Do(func() { close(a.stop) }) // a paused process: no renewals
 	<-a.done
-	time.Sleep(leaseTTL * 3 / 4)
+	time.Sleep(leaseTTL * 45 / 100)
+	if err := a.Valid(); err != nil { // deadline is 2/3 TTL after the last renewal was sent
+		t.Fatalf("lease invalid before 2/3 TTL: %v", err)
+	}
+	time.Sleep(leaseTTL * 30 / 100)
 	if err := a.Valid(); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("lease still valid 3/4 TTL after the last renewal: %v", err)
 	}
