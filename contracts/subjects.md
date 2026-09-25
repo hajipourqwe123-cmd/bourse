@@ -90,6 +90,7 @@
 - Centrifugo هم فقط روی 127.0.0.1 است. `allowed_origins` فقط مبداهای محلی را دارد. فضاهای نام `mkt`، `radar`، `flow` و `sym` اشتراک کلاینت احرازشده را می‌پذیرند و تاریخچه و بازیابی دارند.
 - داده `SYN*` فقط با `ALLOW_SYNTHETIC_ON_BUS=1` نمایش داده می‌شود، با برچسب «داده نمایشی – غیرواقعی» (قاعده ۵).
 - `HOT_THRESHOLD_RIAL`، `PLUS_THRESHOLD_RIAL`، `STALE_AFTER` و `SESSIONS_FILE` باید همان مقادیر engine باشند.
+- gateway آخرین جمع‌های روز هر نماد را هر دقیقه در KV `service_state` (کلید `gateway_totals`؛ نسخه روز قبل در `gateway_prev_totals`) ذخیره می‌کند. قاعده «در انتظار بازنشانی منبع» (`docs/market-metrics.md`) به آن نیاز دارد. فقط دارنده اجاره می‌نویسد.
 
 **بازپخش توسعه:** collector با `SOURCE=replay REPLAY_REBASE=today|now` یک ضبط را به زمان حال منتقل می‌کند. بخش گذشته فوری منتشر می‌شود و بقیه با سرعت واقعی. مبنای جابه‌جایی روز و ساعت **دریافت** نخستین snapshot است.
 

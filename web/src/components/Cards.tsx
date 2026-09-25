@@ -95,6 +95,7 @@ function KpiCard({ k }: { k: KPI }) {
       {k.secondary && (
         <span className="t-label">
           {CLASS_LABEL[k.secondary.class]} (جدا): <Money rial={k.secondary.value} />
+          {k.secondary.awaiting > 0 && <> · در انتظار بازنشانی منبع: <span className="num">{num(k.secondary.awaiting)}</span></>}
         </span>
       )}
       <div className="bars desktop-only" role="img" aria-label="ارزش معاملات هر ۱۰ دقیقه">
@@ -109,6 +110,7 @@ function KpiCard({ k }: { k: KPI }) {
       <div className="card-foot">
         <Age at={k.as_of} />
         {k.missing > 0 && <span className="chip chip-muted">داده ناقص: {num(k.missing)} نماد</span>}
+        {k.awaiting > 0 && <span className="chip chip-warn">در انتظار بازنشانی منبع: {num(k.awaiting)} نماد</span>}
         {k.note && <span className="chip chip-warn">{k.note}</span>}
       </div>
     </section>
@@ -178,6 +180,7 @@ export function FlowCard({ fixedClass }: { fixedClass?: ClassName }) {
           {f.partial && <span className="chip chip-warn">روز ناقص</span>}
           {f.missing > 0 && <span className="chip chip-muted">داده ناقص: {num(f.missing)} نماد</span>}
           {f.lagging > 0 && <span className="chip chip-stale">بیات: {num(f.lagging)} نماد</span>}
+          {f.awaiting > 0 && <span className="chip chip-warn">در انتظار بازنشانی منبع: {num(f.awaiting)} نماد</span>}
           {f.value_missing > 0 && <span className="chip chip-muted">بدون ارزش: {num(f.value_missing)} نماد</span>}
         </div>
       )}
@@ -215,7 +218,7 @@ export function QueueBreadthCard() {
   const s = useMarket();
   const b = s.summary?.breadth;
   const q = s.summary?.queues;
-  const covered = b ? b.instruments - b.missing - b.untraded : 0;
+  const covered = b ? b.instruments - b.missing - b.untraded - b.awaiting : 0;
   const segs = b
     ? [
         { n: b.floor, color: "var(--breadth-1)", label: "در کف دامنه (≤ −۳٪)" },
@@ -261,6 +264,7 @@ export function QueueBreadthCard() {
           <Age at={b.as_of} />
           {b.missing > 0 && <span className="chip chip-muted">بدون قیمت: {num(b.missing)} نماد</span>}
           {b.untraded > 0 && <span className="chip chip-muted">بی‌معامله: {num(b.untraded)} نماد</span>}
+          {b.awaiting > 0 && <span className="chip chip-warn">در انتظار بازنشانی منبع: {num(b.awaiting)} نماد</span>}
         </div>
       )}
     </section>

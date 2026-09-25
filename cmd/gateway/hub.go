@@ -53,9 +53,24 @@ type (
 )
 
 // hub owns the market state: bus messages update it, the loop publishes changes every tick.
+// stateStore persists small service state (bus.JetStream: KV bucket service_state).
+type stateStore interface {
+	StateGet(ctx context.Context, key string) ([]byte, bool, error)
+	StatePut(ctx context.Context, key string, val []byte) error
+}
+
+// KV keys of the instruments' last day totals (post-open carryover rule): today's, saved every
+// minute, and the previous day's (the last saved record of an earlier day).
+const (
+	keyTotals     = "gateway_totals"
+	keyPrevTotals = "gateway_prev_totals"
+	saveEvery     = time.Minute
+)
+
 type hub struct {
 	cfg   Config
 	pub   publisher
+	store stateStore       // nil: no persistence (tests)
 	valid func() error     // lease validity, checked before every publish
 	now   func() time.Time // wall clock: drives the trading day
 
@@ -70,6 +85,8 @@ type hub struct {
 	undecodable int
 	synSkipped  bool
 	synIns      map[string]bool // instruments seen with synthetic snapshots
+	saved       []byte          // last record written to (or read from) keyTotals
+	savedDay    string
 }
 
 func newHub(cfg Config, pub publisher, valid func() error, now func() time.Time) *hub {
@@ -203,20 +220,97 @@ func (h *hub) onIssue(m bus.Msg) {
 	}
 }
 
-// loop publishes every tick until ctx ends; it returns on a lost lease.
+// loop publishes every tick until ctx ends; it returns on a lost lease. It saves the day totals
+// every minute and once more when stopping.
 func (h *hub) loop(ctx context.Context) error {
 	t := time.NewTicker(h.cfg.Tick)
 	defer t.Stop()
+	lastSave := h.now()
 	for {
 		select {
 		case <-ctx.Done():
+			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			h.saveTotals(sctx)
+			cancel()
 			return ctx.Err()
 		case <-t.C:
 		}
 		if err := h.flush(ctx); err != nil {
 			return err
 		}
+		if h.now().Sub(lastSave) >= saveEvery {
+			h.saveTotals(ctx)
+			lastSave = h.now()
+		}
 	}
+}
+
+// loadPrevTotals gives the state the previous trading day's last totals from storage: the saved
+// record if it is of an earlier day, else the rotated previous one.
+func (h *hub) loadPrevTotals(ctx context.Context) {
+	if h.store == nil {
+		return
+	}
+	read := func(key string) (market.DayTotals, []byte) {
+		var dt market.DayTotals
+		b, ok, err := h.store.StateGet(ctx, key)
+		if err != nil {
+			log.Printf("gateway: load %s: %v", key, err)
+			return dt, nil
+		}
+		if ok && json.Unmarshal(b, &dt) != nil {
+			log.Printf("gateway: %s undecodable; ignored", key)
+			return market.DayTotals{}, nil
+		}
+		return dt, b
+	}
+	cur, curB := read(keyTotals)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.saved, h.savedDay = curB, cur.Day
+	today := h.st.Day()
+	switch prev, _ := read(keyPrevTotals); {
+	case cur.Day != "" && cur.Day < today:
+		h.st.SetPrevTotals(cur)
+	case prev.Day != "" && prev.Day < today:
+		h.st.SetPrevTotals(prev)
+	default:
+		return
+	}
+	log.Printf("gateway: previous-day totals loaded for the post-open carryover rule")
+}
+
+// saveTotals stores today's last totals; a stored record of an earlier day is first rotated to
+// the previous-day key. Only the lease holder writes; failures are logged (retried next time).
+func (h *hub) saveTotals(ctx context.Context) {
+	if h.store == nil || h.valid() != nil {
+		return
+	}
+	h.mu.Lock()
+	if !h.ready {
+		h.mu.Unlock()
+		return
+	}
+	lt := h.st.LastTotals()
+	oldB, oldDay := h.saved, h.savedDay
+	h.mu.Unlock()
+	b, err := json.Marshal(lt)
+	if err != nil {
+		return
+	}
+	if oldDay != "" && oldDay < lt.Day && oldB != nil {
+		if err := h.store.StatePut(ctx, keyPrevTotals, oldB); err != nil {
+			log.Printf("gateway: save %s: %v", keyPrevTotals, err)
+			return
+		}
+	}
+	if err := h.store.StatePut(ctx, keyTotals, b); err != nil {
+		log.Printf("gateway: save %s: %v", keyTotals, err)
+		return
+	}
+	h.mu.Lock()
+	h.saved, h.savedDay = b, lt.Day
+	h.mu.Unlock()
 }
 
 // flush publishes what changed since the last tick in one batch. A failed publish is logged and

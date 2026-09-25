@@ -147,6 +147,8 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	}()
 
 	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, time.Now)
+	h.store = js
+	h.loadPrevTotals(ctx)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 6)

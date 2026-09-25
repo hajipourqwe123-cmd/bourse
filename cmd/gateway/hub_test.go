@@ -10,6 +10,7 @@ import (
 
 	"bourse/internal/anomaly"
 	"bourse/internal/bus"
+	"bourse/internal/market"
 	"bourse/internal/model"
 	"bourse/internal/quality"
 	"bourse/internal/tehran"
@@ -216,5 +217,52 @@ func TestFailedPublishRequeuesRadarAndHot(t *testing.T) {
 	_ = h.flush(context.Background())
 	if len(p.on(chRadar)) != 1 || len(p.on(chHot)) != 1 {
 		t.Errorf("after a failed publish: radar %d hot %d, want both re-sent once", len(p.on(chRadar)), len(p.on(chHot)))
+	}
+}
+
+type memStore struct{ m map[string][]byte }
+
+func (s *memStore) StateGet(_ context.Context, k string) ([]byte, bool, error) {
+	b, ok := s.m[k]
+	return b, ok, nil
+}
+func (s *memStore) StatePut(_ context.Context, k string, v []byte) error { s.m[k] = v; return nil }
+
+// The previous day's last totals survive restarts (MD keeps only 48 h: a Saturday needs
+// Wednesday's): saved every minute, rotated when the day changes, loaded at start.
+func TestPrevTotalsPersistAcrossRestarts(t *testing.T) {
+	store := &memStore{m: map[string][]byte{}}
+	day1 := tehranAt("12:29")
+	h, _, _ := hubAt(t, day1, false)
+	h.store = store
+	ready(h)
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", day1, 1010, 5000)))
+	h.saveTotals(context.Background())
+
+	day2 := day1.Add(21 * time.Hour) // 09:29 next day
+	start := func() *hub {
+		h2, _, _ := hubAt(t, day2, false)
+		h2.store = store
+		h2.loadPrevTotals(context.Background())
+		ready(h2)
+		return h2
+	}
+	h2 := start()
+	carried := snapAt("S1", day2, 1010, 5000) // same totals as yesterday's last, after the open
+	h2.onSnapshot(msg("md.snap.S1", carried))
+	if st, _ := h2.state(day2); len(st.Rows) != 1 || !st.Rows[0].AwaitingReset {
+		t.Fatalf("rows = %+v, want S1 awaiting a reset", st.Rows)
+	}
+	h2.saveTotals(context.Background()) // rotates yesterday's record to the previous-day key
+	var prev market.DayTotals
+	_ = json.Unmarshal(store.m[keyPrevTotals], &prev)
+	if prev.Day != "2026-09-23" {
+		t.Fatalf("previous-day record = %q, want 2026-09-23", prev.Day)
+	}
+	// Restart on the same day: today's record is today's, so the rotated one is used.
+	h3 := start()
+	h3.onSnapshot(msg("md.snap.S1", carried))
+	if st, _ := h3.state(day2); !st.Rows[0].AwaitingReset {
+		t.Error("after a same-day restart the previous-day totals must still apply")
 	}
 }

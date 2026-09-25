@@ -5,7 +5,7 @@ import { MarketStore } from "./store";
 import type { Row, SessionInfo, State } from "./types";
 
 const row = (ins: string, over: Partial<Row> = {}): Row => ({
-  ins, sym: "s" + ins, class: "stock", last: 1000, chg: 1, value: 5, net_hot: 0, hot_as_of: null, lagging: false, traded: true, partial: false,
+  ins, sym: "s" + ins, class: "stock", last: 1000, chg: 1, value: 5, net_hot: 0, hot_as_of: null, lagging: false, traded: true, awaiting_reset: false, partial: false,
   src: "2026-09-23T06:30:00Z", ing: "2026-09-23T06:30:01Z", issues: 0, ...over,
 });
 const state = (seq: number, rows: Row[]): State => ({
@@ -63,6 +63,9 @@ const sess = (cls: SessionInfo["class"], start: string, close: string): SessionI
 describe("row status", () => {
   const sessions = [sess("stock", "2026-09-23T05:30:00Z", "2026-09-23T09:00:00Z")];
   const now = Date.parse("2026-09-23T06:31:00Z");
+  it("awaiting a source reset comes first", () => {
+    expect(rowStatus(row("A", { awaiting_reset: true, partial: true, last: null }), sessions, now, 30_000)).toBe("awaiting");
+  });
   it("lagging flow totals are stale", () => {
     expect(rowStatus(row("A", { lagging: true }), sessions, Date.parse("2026-09-23T10:00:00Z"), 30_000)).toBe("stale");
   });

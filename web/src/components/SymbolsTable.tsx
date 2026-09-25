@@ -16,6 +16,7 @@ const TABS: { id: Tab; label: string; available: boolean }[] = [
   { id: "hot_in", label: "ورود پول درشت", available: true },
 ];
 const STATUS_CHIP: Record<RowStatus, string> = {
+  awaiting: "chip chip-warn",
   live: "chip chip-live",
   stale: "chip chip-stale",
   partial: "chip chip-warn",

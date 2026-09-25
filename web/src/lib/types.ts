@@ -13,6 +13,7 @@ export interface Row {
   hot_as_of: string | null;
   lagging: boolean;
   traded: boolean; // false: no trade today (chg is null)
+  awaiting_reset: boolean; // source still shows the previous day's totals: no figures, not aggregated
   partial: boolean;
   missing?: string[];
   src: string;
@@ -33,6 +34,7 @@ export interface ClassFlow {
   missing: number;
   lagging: number;
   value_missing: number;
+  awaiting: number;
   net_hot: number | null;
   net_hot_plus: number | null;
   net_retail: number | null;
@@ -58,10 +60,11 @@ export interface KPI {
   value: number | null;
   instruments: number;
   missing: number;
+  awaiting: number;
   as_of: string;
   est?: boolean;
   series: Bar[];
-  secondary?: { class: ClassName; value: number | null; instruments: number; missing: number };
+  secondary?: { class: ClassName; value: number | null; instruments: number; missing: number; awaiting: number };
   note?: string;
 }
 
@@ -70,6 +73,7 @@ export interface Breadth {
   instruments: number;
   missing: number;
   untraded: number;
+  awaiting: number;
   floor: number;
   down: number;
   flat: number;
@@ -94,6 +98,7 @@ export interface Summary {
   unknown_share: number;
   unknown_notice: boolean;
   carryover: number;
+  awaiting_reset: number;
   issues: number;
   flows: ClassFlow[];
   kpis: KPI[];

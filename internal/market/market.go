@@ -77,13 +77,17 @@ type Row struct {
 	HotAsOf *time.Time `json:"hot_as_of"` // source time the totals are as of; null without totals
 	Lagging bool       `json:"lagging"`   // totals do not cover the latest snapshot's trading yet
 	Traded  bool       `json:"traded"`    // a snapshot of today showed trading; else chg is null (no trade today)
-	Partial bool       `json:"partial"`   // day flow totals are partial (docs/data-quality.md DAY_START_MISSED)
-	Missing []string   `json:"missing,omitempty"`
-	Src     time.Time  `json:"src"` // source_time of the latest snapshot
-	Ing     time.Time  `json:"ing"` // ingest_time of the latest snapshot
-	Est     bool       `json:"est,omitempty"`
-	Syn     bool       `json:"syn,omitempty"`
-	Issues  int        `json:"issues"` // quality issues today (SOURCE_TIME_ESTIMATED excluded)
+	// AwaitingReset: after the open the source still shows exactly the instrument's last totals
+	// of the previous trading day; its figures are not today's: prices, value and flow are null
+	// and it is left out of every aggregate until a reset or a change is observed.
+	AwaitingReset bool      `json:"awaiting_reset"`
+	Partial       bool      `json:"partial"` // day flow totals are partial (docs/data-quality.md DAY_START_MISSED)
+	Missing       []string  `json:"missing,omitempty"`
+	Src           time.Time `json:"src"` // source_time of the latest snapshot
+	Ing           time.Time `json:"ing"` // ingest_time of the latest snapshot
+	Est           bool      `json:"est,omitempty"`
+	Syn           bool      `json:"syn,omitempty"`
+	Issues        int       `json:"issues"` // quality issues today (SOURCE_TIME_ESTIMATED excluded)
 }
 
 // Unavailable describes a metric the current data contract cannot provide.
@@ -109,7 +113,8 @@ type ClassFlow struct {
 	Missing         int       `json:"missing"`
 	Lagging         int       `json:"lagging"`
 	ValueMissing    int       `json:"value_missing"`
-	NetHot          *int64    `json:"net_hot"` // null when no instrument contributes
+	Awaiting        int       `json:"awaiting"` // awaiting a source reset: not in the sums
+	NetHot          *int64    `json:"net_hot"`  // null when no instrument contributes
 	NetHotPlus      *int64    `json:"net_hot_plus"`
 	NetRetail       *int64    `json:"net_retail"`
 	NetUnattributed *int64    `json:"net_unattributed"`
@@ -133,6 +138,7 @@ type Secondary struct {
 	Value       *int64 `json:"value"`
 	Instruments int    `json:"instruments"`
 	Missing     int    `json:"missing"`
+	Awaiting    int    `json:"awaiting"`
 }
 
 // KPI is one card of the KPI row.
@@ -143,7 +149,8 @@ type KPI struct {
 	Classes     []string   `json:"classes,omitempty"`
 	Value       *int64     `json:"value"` // rial, Σ day-to-date value; null = no instrument with a value
 	Instruments int        `json:"instruments"`
-	Missing     int        `json:"missing"` // instruments whose value is missing (not in Value)
+	Missing     int        `json:"missing"`  // instruments whose value is missing (not in Value)
+	Awaiting    int        `json:"awaiting"` // instruments awaiting a source reset (not in Value)
 	AsOf        time.Time  `json:"as_of"`
 	Est         bool       `json:"est,omitempty"`
 	Series      []Bar      `json:"series"`
@@ -157,6 +164,7 @@ type Breadth struct {
 	Instruments int       `json:"instruments"` // stock instruments seen today
 	Missing     int       `json:"missing"`     // no last price or no yesterday price
 	Untraded    int       `json:"untraded"`    // no trade today: not in the buckets
+	Awaiting    int       `json:"awaiting"`    // awaiting a source reset: not in the buckets
 	Floor       int       `json:"floor"`       // last ≤ the −3 % limit price  («در کف دامنه»)
 	Down        int       `json:"down"`        // below yesterday, above the floor
 	Flat        int       `json:"flat"`        // last = yesterday
@@ -180,12 +188,15 @@ type Summary struct {
 	UnknownNotice bool `json:"unknown_notice"`
 	// Carryover counts instruments whose only snapshots today are pre-open ones already showing
 	// trading (the vendor's previous-day totals): ignored until real data of today arrives.
-	Carryover int         `json:"carryover"`
-	Issues    int         `json:"issues"`
-	Flows     []ClassFlow `json:"flows"`
-	KPIs      []KPI       `json:"kpis"`
-	Breadth   Breadth     `json:"breadth"`
-	Queues    Unavailable `json:"queues"`
+	Carryover int `json:"carryover"`
+	// AwaitingReset counts instruments whose totals after the open still equal their last totals
+	// of the previous trading day (left out of every aggregate until a reset or a change).
+	AwaitingReset int         `json:"awaiting_reset"`
+	Issues        int         `json:"issues"`
+	Flows         []ClassFlow `json:"flows"`
+	KPIs          []KPI       `json:"kpis"`
+	Breadth       Breadth     `json:"breadth"`
+	Queues        Unavailable `json:"queues"`
 }
 
 // Signal is one radar item (AI-01 anomaly or AI-02 divergence).
@@ -216,6 +227,8 @@ type inst struct {
 	class      string
 	dirty      bool
 	everTraded bool // a snapshot of today showed trading (or unknown volume)
+	awaiting   bool // latest snapshot repeats the previous day's last totals (awaiting a reset)
+	resolved   bool // a snapshot after the open differed from the previous day's totals: no more checks today
 	// Series: the value baseline (the highest value booked so far), when it was seen, and when
 	// the value first fell below it (a dip: zero when none).
 	base   int64
@@ -239,6 +252,10 @@ type State struct {
 	series  map[string]*series
 	radar   []Signal
 	issues  int // issues without an instrument
+	// prev holds each instrument's last totals of the previous trading day (prevDay), for the
+	// post-open carryover rule.
+	prev    map[string]Totals
+	prevDay string
 	// synthetic reports an instrument whose data is not real (rule 5); showSyn keeps it
 	// (labelled) instead of hiding it. Set by the owner (SetSynthetic).
 	synthetic func(ins string) bool
@@ -300,9 +317,60 @@ func (s *State) Advance(day string) bool {
 	if day <= s.day {
 		return false
 	}
+	if s.day != "" {
+		last := s.LastTotals()
+		s.prev, s.prevDay = last.Totals, last.Day
+	}
 	s.day = day
 	s.reset()
 	return true
+}
+
+// Totals are an instrument's cumulative day totals as the source shows them.
+type Totals struct {
+	Volume     int64 `json:"v"`
+	Value      int64 `json:"val"`
+	TradeCount int64 `json:"n"`
+}
+
+// DayTotals are the last totals of every instrument seen on (or carried into) Day.
+type DayTotals struct {
+	Day    string            `json:"day"`
+	Totals map[string]Totals `json:"totals"`
+}
+
+// SetPrevTotals sets the previous trading day's last totals (e.g. loaded from storage after a
+// restart); ignored unless dt is of an earlier day than the state's.
+func (s *State) SetPrevTotals(dt DayTotals) {
+	if s.day != "" && dt.Day < s.day {
+		s.prev, s.prevDay = dt.Totals, dt.Day
+	}
+}
+
+// LastTotals returns the latest totals of today per instrument, carrying over the previous
+// day's for instruments not seen today (a halted instrument keeps showing them).
+func (s *State) LastTotals() DayTotals {
+	out := DayTotals{Day: s.day, Totals: map[string]Totals{}}
+	for k, v := range s.prev {
+		out.Totals[k] = v
+	}
+	for k, in := range s.ins {
+		if sn := &in.snap; sn.InsCode != "" && sn.Has(model.FVolume) && sn.Has(model.FValue) {
+			out.Totals[k] = Totals{Volume: sn.Volume, Value: sn.Value, TradeCount: sn.TradeCount}
+		}
+	}
+	return out
+}
+
+// repeatsPrev reports a snapshot taken at or after the instrument's own open whose totals equal
+// its last totals of the previous trading day, with some activity: the source has not reset
+// its day totals yet (owner decision on PR #3; rule 1).
+func (s *State) repeatsPrev(sn *model.Snapshot) bool {
+	p, ok := s.prev[sn.InsCode]
+	if !ok || !sn.Has(model.FVolume) || !sn.Has(model.FValue) || (p.Volume == 0 && p.Value == 0 && p.TradeCount == 0) {
+		return false
+	}
+	return sn.Volume == p.Volume && sn.Value == p.Value && sn.TradeCount == p.TradeCount
 }
 
 func (s *State) today(t time.Time) bool { return s.day != "" && tehran.TradingDay(t) == s.day }
@@ -350,6 +418,15 @@ func (s *State) ApplySnapshot(sn model.Snapshot) {
 	prev := in.snap
 	in.snap = sn
 	in.dirty = true
+	// Post-open carryover: until a reset or a change is observed, the snapshot is shown as
+	// awaiting and feeds nothing (not even the series baseline).
+	if !in.resolved {
+		if s.repeatsPrev(&sn) {
+			in.awaiting = true
+			return
+		}
+		in.awaiting, in.resolved = false, true
+	}
 	in.everTraded = in.everTraded || showsTrading(&sn)
 	if id := seriesKPI(in.class); id != "" && sn.Has(model.FValue) {
 		s.book(id, in, &prev, &sn)
@@ -557,6 +634,10 @@ func (s *State) row(in *inst) Row {
 	r := Row{Ins: sn.InsCode, Sym: sn.Symbol, Class: in.class, Src: sn.SourceTime, Ing: sn.IngestTime,
 		Est: sn.SourceTimeEstimated, Syn: model.IsSynthetic(sn) || s.isSyn(sn.InsCode), Issues: in.issues,
 		Missing: sn.Missing, Traded: in.everTraded}
+	if in.awaiting {
+		r.AwaitingReset = true
+		return r // the figures are the previous day's: nothing of today to show
+	}
 	if in.everTraded {
 		r.Chg = ChangePct(sn) // no trade today: the vendor's prices are yesterday's, no change of today
 	}
@@ -645,9 +726,9 @@ func (s *State) Summary() Summary {
 	sum := Summary{Day: s.day, Issues: s.issueCount(), Queues: QueuesUnavailable, Carryover: len(s.carried)}
 	flows := map[string]*ClassFlow{}
 	type acc struct {
-		value, n, missing, withV int64
-		asOf                     time.Time
-		est                      bool
+		value, n, missing, withV, awaiting int64
+		asOf                               time.Time
+		est                                bool
 	}
 	values := map[string]*acc{}
 	for _, c := range Classes {
@@ -661,8 +742,26 @@ func (s *State) Summary() Summary {
 		sum.AsOf = later(sum.AsOf, sn.SourceTime)
 		sum.Syn = sum.Syn || model.IsSynthetic(sn) || s.isSyn(sn.InsCode)
 		sum.Est = sum.Est || sn.SourceTimeEstimated
+		if in.awaiting {
+			sum.AwaitingReset++
+		}
 		if in.class == calendar.Unknown {
 			sum.Unknown++
+			continue
+		}
+		if in.awaiting { // left out of every aggregate, counted
+			if a := values[in.class]; a != nil {
+				a.n++
+				a.awaiting++
+			}
+			if f := flows[in.class]; f != nil {
+				f.Instruments++
+				f.Awaiting++
+			}
+			if in.class == Stock {
+				br.Instruments++
+				br.Awaiting++
+			}
 			continue
 		}
 		if a := values[in.class]; a != nil {
@@ -736,7 +835,7 @@ func (s *State) Summary() Summary {
 	}
 	for _, c := range Classes {
 		f := flows[c]
-		if !f.Partial && f.Missing == 0 && f.Lagging == 0 && f.ValueMissing == 0 && f.NetHot != nil {
+		if !f.Partial && f.Missing == 0 && f.Lagging == 0 && f.ValueMissing == 0 && f.Awaiting == 0 && f.NetHot != nil {
 			f.Pattern = pattern(*f.NetHot, *f.NetRetail, f.Value, s.cfg.Materiality)
 		}
 		sum.Flows = append(sum.Flows, *f)
@@ -749,6 +848,7 @@ func (s *State) Summary() Summary {
 			a := values[c]
 			k.Instruments += int(a.n)
 			k.Missing += int(a.missing)
+			k.Awaiting += int(a.awaiting)
 			if a.withV > 0 {
 				add(&k.Value, a.value)
 			}
@@ -760,7 +860,7 @@ func (s *State) Summary() Summary {
 	stock := kpi("value_stock", Stock)
 	stock.Note = NoteBlockTrades
 	etf := values[EquityETF]
-	stock.Secondary = &Secondary{Class: EquityETF, Instruments: int(etf.n), Missing: int(etf.missing)}
+	stock.Secondary = &Secondary{Class: EquityETF, Instruments: int(etf.n), Missing: int(etf.missing), Awaiting: int(etf.awaiting)}
 	if etf.withV > 0 {
 		stock.Secondary.Value = i64(etf.value)
 	}

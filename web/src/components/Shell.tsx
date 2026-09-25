@@ -79,6 +79,11 @@ export function DataHealth() {
         <span className="num">{num(s.summary?.instruments ?? s.rows.size)}</span> نماد ·{" "}
         <span className="num">{num(s.summary?.issues ?? 0)}</span> رخداد کیفیت
       </span>
+      {(s.summary?.awaiting_reset ?? 0) > 0 && (
+        <span className="t-label">
+          <span className="num">{num(s.summary?.awaiting_reset ?? 0)}</span> نماد در انتظار بازنشانی منبع
+        </span>
+      )}
       {(s.summary?.carryover ?? 0) > 0 && (
         <span className="t-label">
           <span className="num">{num(s.summary?.carryover ?? 0)}</span> نماد هنوز داده روز قبل را نشان می‌دهند
