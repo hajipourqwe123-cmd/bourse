@@ -64,3 +64,52 @@ func TestStreamSizingAssumption(t *testing.T) {
 		}
 	}
 }
+
+// storedPerMsg publishes n copies of v (with an engine-style message ID) and returns the stored
+// bytes per message.
+func storedPerMsg(t *testing.T, j *JetStream, stream, subject string, v any, n int) float64 {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if err := j.PublishID(subject, fmt.Sprintf("eng:1790316029123456789:%d:%d", 1_000_000+i, i%9), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := streamInfo(t, j, stream).State
+	return float64(st.Bytes) / float64(st.Msgs)
+}
+
+// FLOW and QUALITY are sized from the same worst-case day: at most 2 flow outputs per snapshot
+// (measured ≈ 2.0 on the demo day) and, for QUALITY, one issue per snapshot for the whole day.
+func TestFlowAndQualitySizing(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	now := time.Date(2026, 9, 23, 6, 30, 0, 0, time.UTC)
+	game := &model.GameTotals{InsCode: "46348559193224090", Class: "fixed_income", Day: "2026-09-23",
+		NetHot: -123_456_789_012, NetHotPlus: 98_765_432_109, NetRetail: -12_345_678_901, NetUnattributed: 1_234_567_890, Partial: true}
+	win := &model.TenMinute{InsCode: "46348559193224090", Class: "fixed_income", WindowStart: now, NetHot: -123_456_789_012,
+		PriceOpen: 123_456, PriceLastV: 123_999, Partial: true}
+	iss := model.QualityIssue{InsCode: "46348559193224090", Code: "DAY_START_MISSED", At: now,
+		Detail: "first accepted snapshot of 2026-09-23 at 09:05:00 already has day volume 987654321: trades before it are not counted; day totals and this 10-minute window are partial"}
+	storedPerMsg(t, j, StreamFlow, SubjGame("46348559193224090"), game, 100)
+	flowPer := storedPerMsg(t, j, StreamFlow, SubjWindow("46348559193224090"), win, 100) // mean over both kinds
+	qualPer := storedPerMsg(t, j, StreamQuality, SubjQuality("46348559193224090"), iss, 100)
+	t.Logf("measured stored bytes: flow output %.0f, quality issue %.0f", flowPer, qualPer)
+	const flowAssumed, qualAssumed = 400, 450
+	if flowPer > flowAssumed || qualPer > qualAssumed {
+		t.Fatalf("stored sizes exceed the sizing assumptions (%d / %d B): resize", flowAssumed, qualAssumed)
+	}
+	snaps := sizingSnapsPerDay(t)
+	for _, s := range DefaultStreams() {
+		var daily float64
+		switch s.Name {
+		case StreamFlow:
+			daily = snaps * 2 * flowAssumed
+		case StreamQuality:
+			daily = snaps * qualAssumed
+		default:
+			continue
+		}
+		if float64(s.MaxBytes) < 1.2*daily {
+			t.Errorf("%s MaxBytes %d < 1.2 x worst-case day (%.1f GB)", s.Name, s.MaxBytes, daily/1e9)
+		}
+	}
+}

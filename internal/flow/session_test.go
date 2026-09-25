@@ -82,6 +82,10 @@ func TestLateStartRule(t *testing.T) {
 func TestPartialWindowAndDayScope(t *testing.T) {
 	e := sessEngine()
 	dayOf(t, e, "IRSTOCK", tt("2026-09-26", "09:05:00"), tt("2026-09-26", "09:05:05"), 1_000_000)
+	// polled every 5 s: 09:05:10 … 09:09:55 carry no new trades (no polling gap)
+	for at := tt("2026-09-26", "09:05:10"); at.Before(tt("2026-09-26", "09:10:00")); at = at.Add(5 * time.Second) {
+		e.Process(sn("IRSTOCK", at, 10_000, 1_300_000, 900_000, 800_000, 51, 60))
+	}
 	r := e.Process(sn("IRSTOCK", tt("2026-09-26", "09:10:00"), 10_000, 1_400_000, 1_000_000, 900_000, 52, 61))
 	if r.Window == nil || r.Window.Partial || !r.Game.Partial {
 		t.Fatalf("09:10 window must be complete while the day stays partial: window %+v game %+v", r.Window, r.Game)
@@ -123,7 +127,7 @@ func TestStaleOnlyInSession(t *testing.T) {
 		t.Error("STALE on a Thursday (closed)")
 	}
 	cal, err := calendar.Parse([]byte(`{"classes": {"stock": {"rules": [{"effective_from": "2025-01-01",
-		"days": ["sat","sun","mon","tue","wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30"}]}},
+		"days": ["sat","sun","mon","tue","wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30", "verified": false}]}},
 		"instruments": {"IRSTOCK": "stock"}, "holidays": [{"date": "2026-09-26", "name": "test"}]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +144,7 @@ func TestStaleOnlyInSession(t *testing.T) {
 // open (09:05, 09:15, …), not the clock (09:00, 09:10, …).
 func TestWindowsFollowOffGridOpen(t *testing.T) {
 	cal, err := calendar.Parse([]byte(`{"classes": {"odd": {"rules": [{"effective_from": "2025-01-01",
-		"days": ["sat","sun","mon","tue","wed"], "pre_open": "08:50", "open": "09:05", "close": "12:30"}]}},
+		"days": ["sat","sun","mon","tue","wed"], "pre_open": "08:50", "open": "09:05", "close": "12:30", "verified": false}]}},
 		"instruments": {"IRODD": "odd"}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -151,5 +155,129 @@ func TestWindowsFollowOffGridOpen(t *testing.T) {
 	_, r := dayOf(t, e, "IRODD", tt("2026-09-26", "09:04:55"), tt("2026-09-26", "09:14:59"), 0)
 	if got := r.Window.WindowStart.In(tehran.Loc).Format("15:04"); got != "09:05" {
 		t.Fatalf("window %s, want 09:05", got)
+	}
+}
+
+func codes(r Result) map[string]bool {
+	m := map[string]bool{}
+	for _, i := range r.Issues {
+		m[i.Code] = true
+	}
+	return m
+}
+
+// A re-baseline (CUMULATIVE_DECREASE / SIDE_MISMATCH) drops an interval: the day and the window
+// it falls in become partial. (a) Owner's scenario: yesterday's totals at 08:59:55, then the
+// vendor resets after the open (09:00:10, 200,000 shares today): those 200,000 are swallowed.
+// (b) A complete day where a count glitch at 09:00:10 drops 300,000 shares.
+func TestRebaselineMarksPartial(t *testing.T) {
+	e := sessEngine()
+	e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900))
+	r := e.Process(sn("IRSTOCK", tt("2026-09-26", "09:00:10"), 10_000, 200_000, 120_000, 120_000, 20, 20))
+	if !codes(r)[quality.CumulativeDecrease] {
+		t.Fatalf("setup: %+v", r.Issues)
+	}
+	r = e.Process(sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 500_000, 420_000, 320_000, 21, 20))
+	if r.Game == nil || !r.Game.Partial || r.Window == nil || !r.Window.Partial {
+		t.Errorf("(a) after the reset: game %+v window %+v, want both partial", r.Game, r.Window)
+	}
+
+	e = sessEngine()
+	e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	r = e.Process(sn("IRSTOCK", tt("2026-09-26", "09:00:05"), 10_000, 100_000, 60_000, 60_000, 5, 5))
+	if r.Game.Partial || r.Window.Partial {
+		t.Fatalf("(b) setup: complete day expected: %+v %+v", r.Game, r.Window)
+	}
+	// Δvolume 300,000 but Δbuy = (300,000−60,000) + (150,000−40,000) = 350,000: SIDE_MISMATCH,
+	// the interval (300,000 shares) is dropped and the glitch becomes the new baseline.
+	glitch := sn("IRSTOCK", tt("2026-09-26", "09:00:10"), 10_000, 400_000, 300_000, 260_000, 6, 5)
+	glitch.InstBuyVol = 150_000
+	if r = e.Process(glitch); !codes(r)[quality.SideMismatch] {
+		t.Fatalf("(b) setup: %+v", r.Issues)
+	}
+	next := sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 500_000, 350_000, 360_000, 7, 5)
+	next.InstBuyVol, next.IndBuyVol = 200_000, 350_000 // Δbuy 50,000 + 50,000 = Δvolume 100,000
+	r = e.Process(next)
+	if r.Game == nil || !r.Game.Partial || !r.Window.Partial {
+		t.Errorf("(b) after the glitch: game %+v window %+v, want both partial", r.Game, r.Window)
+	}
+}
+
+// A polling gap while trading (09:05:05 → 09:12:00, nothing ingested for ~7 minutes) books the
+// earlier flow into the 09:10 window: that window is partial; the day totals are still complete
+// (cumulative values lose nothing) and the next window is complete.
+func TestPollingGapMarksLandingWindow(t *testing.T) {
+	e := sessEngine()
+	e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	e.Process(sn("IRSTOCK", tt("2026-09-26", "09:05:05"), 10_000, 100_000, 60_000, 60_000, 5, 5))
+	r := e.Process(sn("IRSTOCK", tt("2026-09-26", "09:12:00"), 10_000, 400_000, 360_000, 260_000, 6, 8))
+	if !r.Window.Partial || r.Game.Partial {
+		t.Fatalf("gap: window %+v game %+v", r.Window, r.Game)
+	}
+	for at := tt("2026-09-26", "09:12:05"); at.Before(tt("2026-09-26", "09:20:00")); at = at.Add(5 * time.Second) {
+		e.Process(sn("IRSTOCK", at, 10_000, 400_000, 360_000, 260_000, 6, 8)) // polled every 5 s
+	}
+	r = e.Process(sn("IRSTOCK", tt("2026-09-26", "09:20:00"), 10_000, 400_000, 360_000, 260_000, 6, 8))
+	if r.Window == nil || r.Window.Partial {
+		t.Fatalf("next window after a normal poll must be complete: %+v", r.Window)
+	}
+}
+
+// SOURCE_TIME_ESTIMATED describes the source: once per instrument per day.
+func TestTimeEstimatedOncePerDay(t *testing.T) {
+	e := sessEngine()
+	n := 0
+	for _, at := range []time.Time{tt("2026-09-26", "09:00:00"), tt("2026-09-26", "09:00:05"), tt("2026-09-26", "11:00:00"), tt("2026-09-27", "09:00:00")} {
+		s := sn("IRSTOCK", at, 10_000, 0, 0, 0, 0, 0)
+		s.SourceTimeEstimated = true
+		if codes(e.Process(s))[quality.TimeEstimated] {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("SOURCE_TIME_ESTIMATED %d times over two days, want 2", n)
+	}
+}
+
+// Baseline edge cases of the late-start rule.
+func TestLateStartEdgeCases(t *testing.T) {
+	// Closed day (Thursday): a zero-volume baseline is complete, one with volume is not.
+	for vol, want := range map[int64]bool{0: false, 1_000_000: true} {
+		e := sessEngine()
+		r := e.Process(sn("IRSTOCK", tt("2026-10-01", "10:00:00"), 10_000, vol, vol*6/10, vol*6/10, 5, 5))
+		if codes(r)[quality.DayStartMissed] != want {
+			t.Errorf("closed day, volume %d: DAY_START_MISSED=%v want %v", vol, !want, want)
+		}
+	}
+	// "First ACCEPTED": an incomplete pre-open snapshot is not a baseline; the first complete one
+	// (09:10, with volume) is, so the day is partial.
+	e := sessEngine()
+	inc := sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0)
+	inc.Missing = []string{model.FIndSellCount}
+	e.Process(inc)
+	if r := e.Process(sn("IRSTOCK", tt("2026-09-26", "09:10:00"), 10_000, 1_000_000, 600_000, 600_000, 5, 5)); !codes(r)[quality.DayStartMissed] {
+		t.Error("incomplete pre-open snapshot counted as the day baseline")
+	}
+	// Unmapped instrument: session = union, its open is 08:30.
+	for at, want := range map[string]bool{"08:29:55": false, "08:35:00": true} {
+		e := sessEngine()
+		if r := e.Process(sn("IRUNMAPPED", tt("2026-09-26", at), 10_000, 0, 0, 0, 0, 0)); codes(r)[quality.DayStartMissed] != want {
+			t.Errorf("unknown class zero baseline at %s: DAY_START_MISSED want %v", at, want)
+		}
+	}
+}
+
+// STALE is not evaluated in the pre-open (no continuous trading) nor for estimated source times.
+func TestStalePreOpenAndEstimated(t *testing.T) {
+	e := sessEngine()
+	s := sn("IRSTOCK", tt("2026-09-26", "08:50:00"), 10_000, 0, 0, 0, 0, 0)
+	s.IngestTime = tt("2026-09-26", "08:52:00")
+	if codes(e.Process(s))[quality.Stale] {
+		t.Error("STALE in pre-open")
+	}
+	s = sn("IRSTOCK", tt("2026-09-26", "10:00:00"), 10_000, 0, 0, 0, 0, 0)
+	s.IngestTime, s.SourceTimeEstimated = tt("2026-09-26", "10:05:00"), true
+	if c := codes(e.Process(s)); c[quality.Stale] || !c[quality.TimeEstimated] {
+		t.Errorf("estimated time: %v", c)
 	}
 }

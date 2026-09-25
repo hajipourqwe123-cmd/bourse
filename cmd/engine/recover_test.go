@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"bourse/internal/bus"
+	"bourse/internal/calendar"
 	"bourse/internal/flow"
 	"bourse/internal/model"
 	"bourse/internal/quality"
@@ -325,10 +326,9 @@ func TestTruncatedDayMarkedPartial(t *testing.T) {
 		t.Fatalf("err=%v loss=%+v", err, p.loss)
 	}
 	games, windows, issues := partialFlags(t, p, f, pub, 6, 11)
-	// A's late baseline (seq 5, A1) was replayed: its issue is re-emitted with ID eng:1:5:<idx>.
-	// B's late baseline (seq 6, B1) is live: its issue is published normally with that seq.
-	if len(issues["SYNTEST0000"]) != 1 || !strings.HasPrefix(issues["SYNTEST0000"][0], "eng:1:5:") ||
-		len(issues["SYNTEST0001"]) != 1 || !strings.HasPrefix(issues["SYNTEST0001"][0], "eng:1:6:") {
+	// A's late baseline (seq 5, A1) was replayed: its issue is published during recovery. B's
+	// (seq 6, B1) is live. Both under the stable per-(instrument, day) ID.
+	if fmt.Sprint(issues) != "map[SYNTEST0000:[eng:1:dsm:SYNTEST0000:2026-09-23] SYNTEST0001:[eng:1:dsm:SYNTEST0001:2026-09-23]]" {
 		t.Errorf("DAY_START_MISSED per instrument: %v", issues)
 	}
 	wantGames := map[string]bool{"SYNTEST0000 2026-09-23": true, "SYNTEST0001 2026-09-23": true, "SYNTEST0000 2026-09-24": false}
@@ -550,20 +550,22 @@ func TestPoisonRangeAndOperatorRelease(t *testing.T) {
 
 // AI-02 must not run on a partial window (its NetHot and PriceOpen are incomplete).
 func TestDivergenceSkippedOnPartialWindow(t *testing.T) {
-	at := tehranTime("2026-09-23", "10:00")
+	at := tehranTime("2026-09-23", "12:00") // a gold fund (opens 12:00): pre-open 11:59:55, no polling gap
 	mk := func(at time.Time, vol, indBuy, indSell, buyN, sellN int64) model.Snapshot {
 		return model.Snapshot{InsCode: "SYNTEST0000", Symbol: "SYN-D", Source: "synthetic", SourceTime: at, IngestTime: at,
 			PriceLast: 10_000, Volume: vol, Value: vol * 10_000, IndBuyVol: indBuy, InstBuyVol: vol - indBuy,
 			IndSellVol: indSell, InstSellVol: vol - indSell, IndBuyCount: buyN, IndSellCount: sellN}
 	}
-	pre := mk(tehranTime("2026-09-23", "08:29"), 0, 0, 0, 0, 0)
+	pre := mk(at.Add(-5*time.Second), 0, 0, 0, 0, 0)
 	s1 := mk(at, 1_000_000, 600_000, 600_000, 50, 60)
 	// +600,000 shares at a flat 10,000: one new buyer takes all (6,000,000,000 rial, hot), the
 	// sell side goes to 100 new sellers (60,000,000 each, retail). NetHot 6e9 >= 5e9, price
 	// change 0% <= 0.2%: an "absorption" divergence on a complete window.
 	s2 := mk(at.Add(5*time.Second), 1_600_000, 1_200_000, 1_200_000, 51, 160)
 	ai := func(snaps ...model.Snapshot) int {
-		p := newProcessor(flow.DefaultConfig(), &recPub{})
+		cfg := flow.DefaultConfig()
+		cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"SYNTEST0000": "gold"})
+		p := newProcessor(cfg, &recPub{})
 		n := 0
 		for _, s := range snaps {
 			for _, o := range p.compute(s) {
@@ -577,7 +579,7 @@ func TestDivergenceSkippedOnPartialWindow(t *testing.T) {
 	if n := ai(pre, s1, s2); n != 1 {
 		t.Fatalf("setup: complete day (pre-open zero baseline) produced %d AI-02 events, want 1", n)
 	}
-	if n := ai(s1, s2); n != 0 { // late start: the 10:00 window holds the baseline
+	if n := ai(s1, s2); n != 0 { // late start: the 12:00 window holds the baseline
 		t.Fatalf("partial window produced %d AI events", n)
 	}
 }
@@ -656,7 +658,9 @@ func TestPartialDecidedPerDay(t *testing.T) {
 		t.Fatalf("err=%v loss=%+v", err, p.loss)
 	}
 	games, _, issues := partialFlags(t, p, f, pub, 4, 4)
-	if !games["SYNTEST0000 2026-09-23"] || len(issues["SYNTEST0000"]) != 1 || !strings.HasPrefix(issues["SYNTEST0000"][0], "eng:1:3:") {
+	// Both replayed baselines are late: the previous day's (23:40 with volume) and the damaged
+	// day's; each is published once under its own (instrument, day) ID.
+	if !games["SYNTEST0000 2026-09-23"] || fmt.Sprint(issues["SYNTEST0000"]) != "[eng:1:dsm:SYNTEST0000:2026-09-22 eng:1:dsm:SYNTEST0000:2026-09-23]" {
 		t.Fatalf("games %v issues %v", games, issues)
 	}
 }
@@ -693,5 +697,32 @@ func TestPoisonReleaseIsOneShot(t *testing.T) {
 	_ = q.runNATS(ctx, f, engineConsumer(), false)
 	if q.retryPoisonSeq != 0 {
 		t.Fatal("used release honoured again after a restart")
+	}
+}
+
+// A complete replay (nothing lost) re-emits nothing: the previous process already published the
+// day's DAY_START_MISSED. After a lossy replay, the issue is published during recovery itself,
+// even if the instrument never trades again that day.
+func TestReplayIssuesOnlyAfterLossAndPublishedAtRecovery(t *testing.T) {
+	d := day("2026-09-23", 1, 3, 5) // late start: seq 1 (09:00 with volume) is a late baseline
+	f := &fakeBus{floor: 2}
+	for i, s := range d {
+		f.add(uint64(i+1), s.SourceTime, s)
+	}
+	pub := &recPub{}
+	p := newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss != nil || len(pub.ids) != 0 {
+		t.Fatalf("complete replay: err=%v loss=%+v published %v", err, p.loss, pub.ids)
+	}
+
+	f = &fakeBus{floor: 2, cp: &bus.Checkpoint{Seq: 1, Day: "2026-09-23", Epoch: 1}}
+	f.add(2, d[1].SourceTime, d[1]) // seq 1 discarded: seq 2 is a new late baseline; no later snapshot
+	pub = &recPub{}
+	p = newTestProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil || p.loss == nil {
+		t.Fatalf("lossy replay: err=%v loss=%+v", err, p.loss)
+	}
+	if fmt.Sprint(pub.ids) != "[eng:1:dsm:SYNTEST0000:2026-09-23]" || pub.subj[0] != "quality.SYNTEST0000" {
+		t.Fatalf("published %v on %v", pub.ids, pub.subj)
 	}
 }

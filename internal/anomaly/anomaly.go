@@ -94,7 +94,32 @@ type Radar struct {
 }
 
 // New returns a radar.
-func New(cfg Config) *Radar { return &Radar{cfg: cfg, state: map[string]*symState{}} }
+func New(cfg Config) *Radar {
+	if cfg.Sessions == nil {
+		cfg.Sessions = calendar.Default()
+	}
+	return &Radar{cfg: cfg, state: map[string]*symState{}}
+}
+
+// scoring reports whether an interval ending at t is scored: the market is open that day and t
+// is past the opening skip. An unmapped (unknown-class) instrument could be in any class, so it
+// is skipped after EVERY class's open that day.
+func (r *Radar) scoring(ins string, t time.Time) (scored, open bool) {
+	sess, open := r.cfg.Sessions.Session(ins, t)
+	if !open {
+		return false, false
+	}
+	opens := []time.Time{sess.Open}
+	if sess.Class == calendar.Unknown {
+		opens = r.cfg.Sessions.Opens(t)
+	}
+	for _, o := range opens {
+		if !t.Before(o) && t.Before(o.Add(r.cfg.OpeningSkip)) {
+			return false, true
+		}
+	}
+	return !t.Before(sess.Open.Add(r.cfg.OpeningSkip)), true
+}
 
 func (r *Radar) sym(ins string) *symState {
 	st := r.state[ins]
@@ -119,8 +144,10 @@ func (r *Radar) Observe(iv *flow.Interval) []Event {
 	if rate < r.cfg.MinValueRate {
 		return nil
 	}
-	sess, open := r.cfg.Sessions.Session(iv.InsCode, iv.To)
-	scoring := open && !iv.To.Before(sess.Open.Add(r.cfg.OpeningSkip))
+	scoring, open := r.scoring(iv.InsCode, iv.To)
+	if !open {
+		return nil // a closed day (e.g. an unlisted holiday) must not train the baseline either
+	}
 
 	st := r.sym(iv.InsCode)
 	var out []Event

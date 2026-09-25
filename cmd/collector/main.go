@@ -88,6 +88,14 @@ func run() int {
 	if n := cal.Unverified(); n > 0 {
 		log.Printf("collector: WARNING: session calendar has %d rules/holidays not verified against an official source (docs/sessions.md)", n)
 	}
+	if now := time.Now(); cal.HolidaysBetween(now, now.AddDate(1, 0, 0)) == 0 {
+		log.Printf("collector: WARNING: no official holiday listed in the session calendar for the next 12 months; " +
+			"on an unlisted holiday the vendor's previous-day data would be collected as today's (docs/sessions.md)")
+	}
+	if span := cal.MaxDailySpan(); span > bus.SizedSessionSpan {
+		log.Printf("collector: WARNING: calendar sessions span up to %s a day, more than the %s the bus streams are sized for (contracts/subjects.md)",
+			span, bus.SizedSessionSpan)
+	}
 	var filter *publishFilter
 	if !isReplay { // a recording is replayed as recorded, whatever the wall clock says
 		filter = newPublishFilter(cal)
@@ -207,7 +215,7 @@ func busGuard(s *model.Snapshot, allowSynthetic bool) error {
 type publishFilter struct {
 	cal      *calendar.Calendar
 	last     map[string]model.Snapshot // last published, per instrument
-	day      map[string]string         // trading day of last published, per instrument
+	day      map[string]string         // trading day (ingest time) of last published, per instrument
 	warnedOn string                    // day the unmapped-instrument warning was last logged
 }
 
@@ -216,13 +224,17 @@ func newPublishFilter(cal *calendar.Calendar) *publishFilter {
 }
 
 func (f *publishFilter) keep(s *model.Snapshot) bool {
-	if f.day[s.InsCode] != tehran.TradingDay(s.IngestTime) {
-		return true
+	last, seen := f.last[s.InsCode]
+	if !seen || f.day[s.InsCode] != tehran.TradingDay(s.IngestTime) {
+		return true // first of the (ingest) day
+	}
+	if tehran.TradingDay(s.SourceTime) != tehran.TradingDay(last.SourceTime) {
+		return true // the source moved to a new trading day: that is the day's baseline
 	}
 	if sess, ok := f.cal.Session(s.InsCode, s.IngestTime); ok && sess.Contains(s.IngestTime) {
 		return true
 	}
-	return marketChanged(f.last[s.InsCode], *s)
+	return marketChanged(last, *s)
 }
 
 func (f *publishFilter) published(s *model.Snapshot) {

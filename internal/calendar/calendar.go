@@ -128,8 +128,72 @@ func parseHM(v string) (time.Duration, error) {
 	return time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute, nil
 }
 
+// checkKeys rejects keys not in allowed (keys starting with "_" are free-form notes), so a
+// typo such as "instrument" or "verfied" fails loudly instead of being silently ignored.
+func checkKeys(where string, raw json.RawMessage, allowed ...string) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("calendar: %s: %w", where, err)
+	}
+	ok := map[string]bool{}
+	for _, a := range allowed {
+		ok[a] = true
+	}
+	for k := range m {
+		if !ok[k] && !strings.HasPrefix(k, "_") {
+			return fmt.Errorf("calendar: %s: unknown key %q", where, k)
+		}
+	}
+	return nil
+}
+
+func checkSchema(b []byte) error {
+	if err := checkKeys("top level", b, "default_class", "classes", "instruments", "holidays"); err != nil {
+		return err
+	}
+	var top struct {
+		Classes  map[string]json.RawMessage `json:"classes"`
+		Holidays []json.RawMessage          `json:"holidays"`
+	}
+	if err := json.Unmarshal(b, &top); err != nil {
+		return fmt.Errorf("calendar: %w", err)
+	}
+	for name, raw := range top.Classes {
+		if err := checkKeys("class "+name, raw, "label_fa", "rules"); err != nil {
+			return err
+		}
+		var c struct {
+			Rules []json.RawMessage `json:"rules"`
+		}
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return fmt.Errorf("calendar: class %s: %w", name, err)
+		}
+		for i, r := range c.Rules {
+			where := fmt.Sprintf("class %s rule %d", name, i+1)
+			if err := checkKeys(where, r, "effective_from", "days", "pre_open", "open", "close", "verified", "source"); err != nil {
+				return err
+			}
+			var v struct {
+				Verified *bool `json:"verified"`
+			}
+			if json.Unmarshal(r, &v) == nil && v.Verified == nil {
+				return fmt.Errorf("calendar: %s: \"verified\" is required (false until checked against an official source)", where)
+			}
+		}
+	}
+	for i, h := range top.Holidays {
+		if err := checkKeys(fmt.Sprintf("holiday %d", i+1), h, "date", "name", "verified"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Parse validates and builds a calendar from JSON.
 func Parse(b []byte) (*Calendar, error) {
+	if err := checkSchema(b); err != nil {
+		return nil, err
+	}
 	var f file
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("calendar: %w", err)
@@ -307,4 +371,55 @@ func (c *Calendar) Union(t time.Time) (Session, bool) {
 		return Session{}, false
 	}
 	return c.union(day, date)
+}
+
+// Opens returns the open time of every class trading on t's trading day (sorted; duplicates
+// removed). An Unknown instrument may belong to any of them.
+func (c *Calendar) Opens(t time.Time) []time.Time {
+	day := tehran.DayStart(t)
+	date := day.Format("2006-01-02")
+	if _, holiday := c.holidays[date]; holiday {
+		return nil
+	}
+	seen := map[time.Time]bool{}
+	var out []time.Time
+	for name := range c.classes {
+		if r, ok := c.ruleOn(name, date, day.Weekday()); ok && !seen[day.Add(r.open)] {
+			seen[day.Add(r.open)] = true
+			out = append(out, day.Add(r.open))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
+}
+
+// HolidaysBetween counts listed holidays in [from, to] (Tehran dates).
+func (c *Calendar) HolidaysBetween(from, to time.Time) int {
+	a, b := tehran.TradingDay(from), tehran.TradingDay(to)
+	n := 0
+	for d := range c.holidays {
+		if d >= a && d <= b {
+			n++
+		}
+	}
+	return n
+}
+
+// MaxDailySpan is an upper bound of the union session over every rule: earliest pre_open to
+// latest close across all classes and effective dates (used to check the bus sizing).
+func (c *Calendar) MaxDailySpan() time.Duration {
+	var from, to time.Duration
+	first := true
+	for _, rules := range c.classes {
+		for _, r := range rules {
+			if first || r.preOpen < from {
+				from = r.preOpen
+			}
+			if first || r.close > to {
+				to = r.close
+			}
+			first = false
+		}
+	}
+	return to - from
 }

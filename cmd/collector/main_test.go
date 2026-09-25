@@ -118,3 +118,29 @@ func TestYesterdaysTotalsPreOpenBaselineReachesLateStartRule(t *testing.T) {
 		t.Fatalf("engine did not flag the day: %+v", r.Issues)
 	}
 }
+
+// A source with real timestamps: at 08:26 it still reports yesterday's source time (first
+// ingest of the day, published); when its source time moves to today at 08:40 (before the
+// stock pre-open, values unchanged) that is today's baseline and is published too.
+func TestPublishFilterSourceDayChange(t *testing.T) {
+	f := newPublishFilter(calendar.Default().WithInstruments(map[string]string{"IRSTOCK": "stock"}))
+	step := func(src, ingest time.Time) bool {
+		s := snapAt("IRSTOCK", ingest, 5_000_000)
+		s.SourceTime, s.SourceTimeEstimated = src, false
+		k := f.keep(&s)
+		if k {
+			f.published(&s)
+		}
+		return k
+	}
+	y := at("2026-09-26", "12:29:59")
+	if !step(y, at("2026-09-27", "08:26:00")) {
+		t.Fatal("first ingest of the day not published")
+	}
+	if step(y, at("2026-09-27", "08:30:00")) {
+		t.Fatal("unchanged snapshot outside the session published")
+	}
+	if !step(at("2026-09-27", "08:40:00"), at("2026-09-27", "08:40:01")) {
+		t.Fatal("source moved to today (the day baseline) but was not published")
+	}
+}

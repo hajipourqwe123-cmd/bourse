@@ -53,7 +53,7 @@ func main() {
 		mk("SYNTHETIC0004", "SYN-MIXED", 8_000, 0.00001, 300, 300),
 		mk("SYNTHETICG001", "SYN-GOLDFUND", 45_000, 0.00002, 240, 360), // afternoon session (gold class)
 	}
-	for k := 4; len(insts) < *n; k++ { // load instruments: vary the four stock scenarios
+	for k := 4; len(insts) < *n; k++ { // load instruments (unmapped: class unknown, union session), varying the four stock scenarios
 		base := insts[k%4]
 		in := mk(fmt.Sprintf("SYNTHETIC%04d", k+1), fmt.Sprintf("%s-%d", base.s.Symbol, k+1),
 			base.price*(0.5+float64(k%7)/4), base.drift, base.bigBuyEvery, base.bigSellEvery)
@@ -86,7 +86,7 @@ func main() {
 				enc.Encode(map[string]any{"subject": "md.snap." + pre.InsCode, "data": pre})
 				continue
 			}
-			if t.Before(in.sess.Open) || t.After(in.sess.Close) {
+			if t.Before(in.sess.Open) || !t.Before(in.sess.Close) { // trading is [open, close)
 				continue
 			}
 			i := in.step

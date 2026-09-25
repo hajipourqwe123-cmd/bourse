@@ -60,11 +60,11 @@ func TestEmbeddedCalendar(t *testing.T) {
 const twoRules = `{
   "classes": {
     "gold": {"rules": [
-      {"effective_from": "2025-01-01", "days": ["sat","sun","mon","tue","wed"], "pre_open": "12:45", "open": "13:00", "close": "17:00"},
+      {"effective_from": "2025-01-01", "days": ["sat","sun","mon","tue","wed"], "pre_open": "12:45", "open": "13:00", "close": "17:00", "verified": false},
       {"effective_from": "2026-03-21", "days": ["sat","sun","mon","tue","wed"], "pre_open": "11:45", "open": "12:00", "close": "18:00", "verified": true}
     ]},
     "stock": {"rules": [
-      {"effective_from": "2025-01-01", "days": ["sat","sun","mon","tue","wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30"}
+      {"effective_from": "2025-01-01", "days": ["sat","sun","mon","tue","wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30", "verified": false}
     ]}
   },
   "instruments": {"IRXGOLD": "gold"},
@@ -141,20 +141,49 @@ func TestWindowStart(t *testing.T) {
 func TestParseRejects(t *testing.T) {
 	for name, js := range map[string]string{
 		"no classes":       `{"classes": {}}`,
-		"reserved name":    `{"classes": {"unknown": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}}`,
-		"open after close": `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "11:00", "close": "10:00"}]}}}`,
-		"pre after open":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "09:30", "open": "09:00", "close": "10:00"}]}}}`,
-		"bad day":          `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["saturday"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}}`,
-		"bad time":         `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "8", "open": "09:00", "close": "10:00"}]}}}`,
-		"duplicate date":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}, {"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}}`,
-		"unmapped class":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}, "instruments": {"A": "y"}}`,
-		"bad default":      `{"default_class": "y", "classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}}`,
-		"bad holiday":      `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}, "holidays": [{"date": "1405/01/01"}]}`,
+		"reserved name":    `{"classes": {"unknown": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"open after close": `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "11:00", "close": "10:00", "verified": false}]}}}`,
+		"pre after open":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "09:30", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"bad day":          `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["saturday"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"bad time":         `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "8", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"duplicate date":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}, {"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"unmapped class":   `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}, "instruments": {"A": "y"}}`,
+		"bad default":      `{"default_class": "y", "classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"typo top key":     `{"instrument": {}, "classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}}`,
+		"typo verified":    `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verfied": true}]}}}`,
+		"missing verified": `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00"}]}}}`,
+		"bad holiday":      `{"classes": {"x": {"rules": [{"effective_from": "2025-01-01", "days": ["sat"], "pre_open": "08:00", "open": "09:00", "close": "10:00", "verified": false}]}}, "holidays": [{"date": "1405/01/01"}]}`,
 	} {
 		if _, err := Parse([]byte(js)); err == nil {
 			t.Errorf("%s: accepted", name)
 		} else if !strings.HasPrefix(err.Error(), "calendar: ") {
 			t.Errorf("%s: error %q not prefixed", name, err)
 		}
+	}
+}
+
+func TestOpens(t *testing.T) {
+	var got []string
+	for _, o := range Default().Opens(at("2026-09-26", "10:00:00")) {
+		got = append(got, hm(o))
+	}
+	if strings.Join(got, ",") != "08:30,09:00,12:00" {
+		t.Fatalf("opens %v", got)
+	}
+	if len(Default().Opens(at("2026-10-01", "10:00:00"))) != 0 {
+		t.Fatal("opens on a Thursday")
+	}
+}
+
+func TestSpanAndHolidays(t *testing.T) {
+	if got := Default().MaxDailySpan(); got != 9*time.Hour+35*time.Minute {
+		t.Fatalf("max span %s, want 9h35m (08:25–18:00)", got)
+	}
+	c, _ := Parse([]byte(twoRules))
+	if n := c.HolidaysBetween(at("2026-09-01", "00:00:00"), at("2026-12-31", "00:00:00")); n != 1 {
+		t.Fatalf("holidays %d", n)
+	}
+	if Default().HolidaysBetween(at("2026-01-01", "00:00:00"), at("2027-12-31", "00:00:00")) != 0 {
+		t.Fatal("embedded calendar gained holidays: update docs/sessions.md")
 	}
 }

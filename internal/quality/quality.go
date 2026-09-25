@@ -54,8 +54,6 @@ type Delta struct {
 	IndBuyCount, IndSellCount                      int64
 }
 
-// Diff computes cur − prev and returns issues when the pair is not usable.
-// ok=false means the pair MUST NOT feed any metric.
 // DayStart reports that the day's first accepted baseline cannot prove the day complete.
 func DayStart(s *model.Snapshot, detail string) model.QualityIssue {
 	return issue(s, DayStartMissed, detail)
@@ -67,6 +65,8 @@ func EarlierDay(cur, prev *model.Snapshot) model.QualityIssue {
 		cur.SourceTime.Format(time.RFC3339), prev.SourceTime.Format(time.RFC3339)))
 }
 
+// Diff computes cur − prev and returns issues when the pair is not usable.
+// ok=false means the pair MUST NOT feed any metric.
 func Diff(prev, cur *model.Snapshot) (d Delta, issues []model.QualityIssue, ok bool) {
 	if !cur.SourceTime.After(prev.SourceTime) {
 		return d, []model.QualityIssue{issue(cur, OutOfOrder,

@@ -27,13 +27,14 @@ type Config struct {
 	HotThreshold  int64              // default 2_000_000_000 rial = 200M toman
 	PlusThreshold int64              // default 1_000_000_000 rial = 100M toman
 	StaleAfter    time.Duration      // default 30s
+	GapAfter      time.Duration      // ingest-time gap beyond which an interval is a polling gap; default 30s
 	Sessions      *calendar.Calendar // trading sessions per instrument (default: the embedded calendar)
 }
 
 // DefaultConfig mirrors the PRD defaults.
 func DefaultConfig() Config {
 	return Config{HotThreshold: 2_000_000_000, PlusThreshold: 1_000_000_000, StaleAfter: 30 * time.Second,
-		Sessions: calendar.Default()}
+		GapAfter: 30 * time.Second, Sessions: calendar.Default()}
 }
 
 // Interval summarises one accepted same-day interval; it feeds the AI layer (internal/anomaly).
@@ -66,12 +67,21 @@ type symState struct {
 
 // Engine is NOT safe for concurrent use; shard instruments across engines by InsCode.
 type Engine struct {
-	cfg   Config
-	state map[string]*symState
+	cfg    Config
+	state  map[string]*symState
+	estDay map[string]string // trading day SOURCE_TIME_ESTIMATED was last reported, per instrument
 }
 
-// New returns an engine with cfg.
-func New(cfg Config) *Engine { return &Engine{cfg: cfg, state: map[string]*symState{}} }
+// New returns an engine with cfg (a nil calendar means the embedded one).
+func New(cfg Config) *Engine {
+	if cfg.Sessions == nil {
+		cfg.Sessions = calendar.Default()
+	}
+	if cfg.GapAfter <= 0 {
+		cfg.GapAfter = 30 * time.Second
+	}
+	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}}
+}
 
 func (e *Engine) band(avg int64) model.Band {
 	switch {
@@ -94,6 +104,15 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		inSession = is.Trading(s.IngestTime)
 	}
 	r.Issues = quality.CheckSingle(&s, e.cfg.StaleAfter, inSession)
+	// SOURCE_TIME_ESTIMATED describes the source, not the snapshot: once per instrument per day
+	// (a source without timestamps would otherwise emit one issue per snapshot).
+	if estDay := tehran.TradingDay(s.IngestTime); s.SourceTimeEstimated {
+		if e.estDay[s.InsCode] == estDay {
+			r.Issues = dropCode(r.Issues, quality.TimeEstimated)
+		} else {
+			e.estDay[s.InsCode] = estDay
+		}
+	}
 	for _, f := range model.FlowFields {
 		if !s.Has(f) {
 			return r // incomplete: never a baseline, never a metric
@@ -119,13 +138,17 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		if !preOpenZero {
 			st.game.Partial = true
 			st.partialWin = windowStart(sess, open, s.SourceTime)
-			when := "no session that day"
-			if open {
-				when = "session opens " + sess.Open.In(tehran.Loc).Format("15:04")
+			at := s.SourceTime.In(tehran.Loc).Format("15:04:05")
+			var why string
+			switch {
+			case s.Volume > 0:
+				why = fmt.Sprintf("already has day volume %d: trades before it are not counted", s.Volume)
+			case open:
+				why = fmt.Sprintf("was taken after the %s session open (%s), so completeness cannot be proven",
+					class, sess.Open.In(tehran.Loc).Format("15:04"))
 			}
 			r.Issues = append(r.Issues, quality.DayStart(&s, fmt.Sprintf(
-				"first accepted snapshot of %s at %s (%s) already has day volume %d: earlier trades are not counted; day totals and this 10-minute window are partial",
-				day, s.SourceTime.In(tehran.Loc).Format("15:04:05"), when, s.Volume)))
+				"first accepted snapshot of %s at %s %s; day totals and this 10-minute window are partial", day, at, why)))
 		}
 		return r // first snapshot of the day: no interval yet
 	}
@@ -136,6 +159,15 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		if len(iss) > 0 && iss[0].Code != quality.OutOfOrder {
 			cp := s // re-baseline on inconsistent totals; the bad interval is dropped
 			st.prev = &cp
+			// The dropped interval's trades are missing from the day totals and from the window
+			// the re-baseline falls in: both are partial from now on (rule 1).
+			st.game.Partial = true
+			if w := windowStart(sess, open, s.SourceTime); st.partialWin.Before(w) {
+				st.partialWin = w
+			}
+			if st.win != nil && !st.win.WindowStart.After(st.partialWin) {
+				st.win.Partial = true
+			}
 		}
 		return r
 	}
@@ -194,8 +226,12 @@ func (e *Engine) Process(s model.Snapshot) Result {
 
 	ws := windowStart(sess, open, s.SourceTime)
 	if st.win == nil || !st.win.WindowStart.Equal(ws) {
+		// A polling gap (for longer than GapAfter WHILE the instrument was trading, we ingested
+		// nothing) whose interval started in an earlier window books that earlier flow into this
+		// window: its NetHot is not this window's. Outside the session silence is expected.
+		gap := st.prev.SourceTime.Before(ws) && tradingOverlap(sess, open, st.prev.IngestTime, s.IngestTime) > e.cfg.GapAfter
 		st.win = &model.TenMinute{InsCode: s.InsCode, Class: class, WindowStart: ws, PriceOpen: st.prev.PriceLast,
-			Partial: !st.partialWin.IsZero() && !ws.After(st.partialWin)}
+			Partial: gap || (!st.partialWin.IsZero() && !ws.After(st.partialWin))}
 	}
 	st.win.NetHot += netHot
 	st.win.PriceLastV = s.PriceLast
@@ -214,4 +250,31 @@ func windowStart(sess calendar.Session, open bool, t time.Time) time.Time {
 		return calendar.WindowStart(sess, t)
 	}
 	return tehran.Floor10m(t)
+}
+
+func dropCode(issues []model.QualityIssue, code string) []model.QualityIssue {
+	out := issues[:0]
+	for _, i := range issues {
+		if i.Code != code {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// tradingOverlap is how much of [from, to) falls inside the session's [Open, Close).
+func tradingOverlap(sess calendar.Session, open bool, from, to time.Time) time.Duration {
+	if !open {
+		return 0
+	}
+	if from.Before(sess.Open) {
+		from = sess.Open
+	}
+	if to.After(sess.Close) {
+		to = sess.Close
+	}
+	if !to.After(from) {
+		return 0
+	}
+	return to.Sub(from)
 }
