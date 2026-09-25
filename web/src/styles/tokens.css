@@ -1,0 +1,70 @@
+/* source: owner-approved design canvas v1
+   Design tokens: the only colour, radius, size and font source for every component.
+   Dark theme (light theme later, same role names). Values verbatim from the owner. */
+:root {
+  /* dark theme (light theme later, same role names) */
+  --bg: #0B1016;
+  --bg-sidebar: #0E141C;
+  --surface: #121922;
+  --surface-2: #161F2A;
+  --surface-3: #1A2430;
+  --border: #1E2A38;
+  --border-strong: #243041;
+  --divider: #1B2533;
+  --text: #E8EDF3;
+  --text-2: #C8D2DE;
+  --text-3: #B4C0CF;
+  --muted: #93A1B3;
+  --faint: #8492A4;
+  --brand: #5B9CFF;
+  --brand-bg: #16263D;
+  --brand-text: #8FB8FF;
+  --link: #8FB8FF;
+  --link-hover: #C2D8FF;
+  --up: #5BE3A1;
+  --up-text: #7EEDB6;
+  --up-bg: #10261C;
+  --down: #E5484D;
+  --down-text: #FF8A91;
+  --down-bg: #3A1F24;
+  --down-chip: #FF9AA2;
+  --warn-bg: #3A2E12;
+  --warn-text: #F2CC6B;
+  --cls-stock: #6FA8FF;
+  --cls-stock-bg: #16263D;
+  --cls-stock-text: #8FB8FF;
+  --cls-fixed: #3CC7C0;
+  --cls-fixed-bg: #11302F;
+  --cls-fixed-text: #7FE0DA;
+  --cls-gold: #E3B341;
+  --cls-gold-bg: #3A2E12;
+  --cls-gold-text: #F2CC6B;
+  --cls-silver: #B8C4D6;
+  --cls-silver-bg: #262D38;
+  --cls-silver-text: #D3DCE8;
+  --cls-unknown: #7D8896;
+  --cls-unknown-bg: #232B36;
+  --cls-unknown-text: #B4C0CF;
+  --map-5: #9B2F37;
+  --map-4: #6B2A30;
+  --map-3: #2A3442;
+  --map-2: #1B4D36;
+  --map-1: #1F7A4D;
+  /* -3%..+3% */
+  --breadth-1: #B8323A;
+  --breadth-2: #7A2D33;
+  --breadth-3: #1F5A40;
+  --breadth-4: #2FA36B;
+  --r-card: 14px;
+  --r-control: 10px;
+  --r-tile: 6px;
+  --r-chip: 999px;
+  --touch: 44px;
+  --font: Vazirmatn, Tahoma, sans-serif; /* weights 400–800 */
+  --fs-kpi: 26px/800;
+  --fs-title: 22px/800;
+  --fs-card: 15px/700;
+  --fs-body: 14px/400;
+  --fs-label: 12px (minimum for text);
+  --fs-meta: 11px (badges/meta only);
+}
