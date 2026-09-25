@@ -4,7 +4,10 @@ import (
 	"testing"
 	"time"
 
+	"bourse/internal/calendar"
+	"bourse/internal/flow"
 	"bourse/internal/model"
+	"bourse/internal/quality"
 	"bourse/internal/tehran"
 )
 
@@ -28,30 +31,90 @@ func TestBusGuardRefusesSynthetic(t *testing.T) {
 	}
 }
 
-func TestCollectWindow(t *testing.T) {
-	w, err := parseWindow("08:30-13:00")
-	if err != nil || w.String() != "08:30-13:00" {
-		t.Fatalf("parse: %v %v", w, err)
+func at(day, hms string) time.Time {
+	x, err := time.ParseInLocation("2006-01-02 15:04:05", day+" "+hms, tehran.Loc)
+	if err != nil {
+		panic(err)
 	}
-	at := func(hm string) time.Time {
-		x, _ := time.ParseInLocation("2006-01-02 15:04:05", "2026-09-23 "+hm, tehran.Loc)
-		return x
-	}
-	for hm, want := range map[string]bool{"08:29:59": false, "08:30:00": true, "12:59:59": true, "13:00:00": false, "23:00:00": false} {
-		if got := w.contains(at(hm)); got != want {
-			t.Errorf("%s: contains=%v, want %v", hm, got, want)
+	return x
+}
+
+// The polling window is the union of the classes' sessions: 08:25–18:00 on a Saturday
+// (2026-09-26), nothing on a Thursday (2026-10-01).
+func TestPollingWindowIsSessionUnion(t *testing.T) {
+	cal := calendar.Default()
+	u, open := cal.Union(at("2026-09-26", "10:00:00"))
+	for hms, want := range map[string]bool{"08:24:59": false, "08:25:00": true, "12:30:00": true, "17:59:59": true, "18:00:00": false} {
+		if got := open && u.Contains(at("2026-09-26", hms)); got != want {
+			t.Errorf("Saturday %s: polling=%v, want %v", hms, got, want)
 		}
 	}
-	// 05:00 UTC is 08:30 in Tehran (+03:30): the window follows Tehran time, not the host's.
-	if !w.contains(time.Date(2026, 9, 23, 5, 0, 0, 0, time.UTC)) {
-		t.Error("window not evaluated in Tehran time")
+	if _, open := cal.Union(at("2026-10-01", "10:00:00")); open {
+		t.Error("polling on a Thursday")
 	}
-	if a, _ := parseWindow("always"); !a.contains(at("03:00:00")) {
-		t.Error("always")
-	}
-	for _, bad := range []string{"", "13:00-08:30", "8-13", "08:30"} {
-		if _, err := parseWindow(bad); err == nil {
-			t.Errorf("%q accepted", bad)
+}
+
+func snapAt(ins string, ingest time.Time, vol int64) model.Snapshot {
+	return model.Snapshot{InsCode: ins, Symbol: "x", Source: "sourcearena", SourceTime: ingest, IngestTime: ingest,
+		SourceTimeEstimated: true, PriceLast: 10_000, Volume: vol, Value: vol * 10_000}
+}
+
+// Owner rule: the first snapshot of an instrument's day is ALWAYS published, even unchanged
+// (the vendor still shows yesterday's totals pre-open) so the engine's late-start rule judges it;
+// unchanged snapshots outside the instrument's own [pre_open, close) are skipped; changed ones
+// never are (a misclassified instrument trading out of "its" hours still flows).
+func TestPublishFilter(t *testing.T) {
+	f := newPublishFilter(calendar.Default().WithInstruments(map[string]string{"IRSTOCK": "stock"}))
+	step := func(s model.Snapshot) bool {
+		k := f.keep(&s)
+		if k {
+			f.published(&s)
 		}
+		return k
+	}
+	yesterday := snapAt("IRSTOCK", at("2026-09-26", "12:29:55"), 5_000_000)
+	for _, c := range []struct {
+		name string
+		s    model.Snapshot
+		want bool
+	}{
+		{"yesterday's last snapshot", yesterday, true},
+		{"after yesterday's close, unchanged", snapAt("IRSTOCK", at("2026-09-26", "13:00:00"), 5_000_000), false},
+		{"first of today at 08:26, still yesterday's totals", snapAt("IRSTOCK", at("2026-09-27", "08:26:00"), 5_000_000), true},
+		{"08:30 unchanged, before the stock pre-open (08:45)", snapAt("IRSTOCK", at("2026-09-27", "08:30:00"), 5_000_000), false},
+		{"08:45 unchanged, in its pre-open", snapAt("IRSTOCK", at("2026-09-27", "08:45:00"), 5_000_000), true},
+		{"10:00 unchanged, in session (STALE needs repeats)", snapAt("IRSTOCK", at("2026-09-27", "10:00:00"), 5_000_000), true},
+		{"14:00 changed although 'stock' hours ended", snapAt("IRSTOCK", at("2026-09-27", "14:00:00"), 5_100_000), true},
+		{"14:00:05 unchanged after hours", snapAt("IRSTOCK", at("2026-09-27", "14:00:05"), 5_100_000), false},
+		{"unmapped instrument at 17:00 (union session)", snapAt("IRX", at("2026-09-27", "17:00:00"), 0), true},
+		{"unmapped instrument at 17:00:05, unchanged, still in the union", snapAt("IRX", at("2026-09-27", "17:00:05"), 0), true},
+	} {
+		if got := step(c.s); got != c.want {
+			t.Errorf("%s: published=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// End to end with the engine rule: the pre-open baseline that still carries yesterday's totals
+// is published, and the engine marks that day partial instead of silently skipping it.
+func TestYesterdaysTotalsPreOpenBaselineReachesLateStartRule(t *testing.T) {
+	cal := calendar.Default().WithInstruments(map[string]string{"IRSTOCK": "stock"})
+	f := newPublishFilter(cal)
+	y := snapAt("IRSTOCK", at("2026-09-26", "12:29:55"), 5_000_000)
+	f.published(&y)
+	pre := snapAt("IRSTOCK", at("2026-09-27", "08:26:00"), 5_000_000)
+	if !f.keep(&pre) {
+		t.Fatal("pre-open baseline with yesterday's totals was not published")
+	}
+	pre.IndBuyVol, pre.IndSellVol, pre.InstBuyVol, pre.InstSellVol = 3_000_000, 3_000_000, 2_000_000, 2_000_000
+	cfg := flow.DefaultConfig()
+	cfg.Sessions = cal
+	r := flow.New(cfg).Process(pre)
+	found := false
+	for _, i := range r.Issues {
+		found = found || i.Code == quality.DayStartMissed
+	}
+	if !found {
+		t.Fatalf("engine did not flag the day: %+v", r.Issues)
 	}
 }

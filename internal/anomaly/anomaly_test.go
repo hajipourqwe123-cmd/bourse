@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"bourse/internal/calendar"
 	"bourse/internal/flow"
 	"bourse/internal/model"
 	"bourse/internal/tehran"
@@ -57,12 +58,28 @@ func TestSpikeDetectedAfterWarmUp(t *testing.T) {
 	}
 }
 
+// The opening skip is relative to the instrument's OWN open: a stock (09:00) is not scored at
+// 09:05; a gold fund (12:00) is not scored at 12:10 but is at 12:20.
 func TestOpeningWindowNotScored(t *testing.T) {
-	r := New(DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"X": "stock"})
+	r := New(cfg)
 	feed(r, 200)
 	open := day.Add(9*time.Hour + 5*time.Minute)
 	if evs := r.Observe(iv(open, 5_000_000_000, 4_000_000_000)); len(evs) != 0 {
 		t.Fatalf("opening window must not be scored: %+v", evs)
+	}
+	cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"X": "gold"})
+	for _, c := range []struct {
+		hm     time.Duration
+		scored bool
+	}{{12*time.Hour + 10*time.Minute, false}, {12*time.Hour + 20*time.Minute, true}} {
+		r := New(cfg)
+		feed(r, 200)
+		evs := r.Observe(iv(day.Add(c.hm), 5_000_000_000, 4_000_000_000))
+		if (len(evs) != 0) != c.scored {
+			t.Errorf("gold fund at %s: %d events, scored want %v", c.hm, len(evs), c.scored)
+		}
 	}
 }
 

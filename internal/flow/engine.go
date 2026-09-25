@@ -13,8 +13,10 @@
 package flow
 
 import (
+	"fmt"
 	"time"
 
+	"bourse/internal/calendar"
 	"bourse/internal/model"
 	"bourse/internal/quality"
 	"bourse/internal/tehran"
@@ -22,14 +24,16 @@ import (
 
 // Config holds the thresholds. Monetary values are in rial.
 type Config struct {
-	HotThreshold  int64         // default 2_000_000_000 rial = 200M toman
-	PlusThreshold int64         // default 1_000_000_000 rial = 100M toman
-	StaleAfter    time.Duration // default 30s
+	HotThreshold  int64              // default 2_000_000_000 rial = 200M toman
+	PlusThreshold int64              // default 1_000_000_000 rial = 100M toman
+	StaleAfter    time.Duration      // default 30s
+	Sessions      *calendar.Calendar // trading sessions per instrument (default: the embedded calendar)
 }
 
 // DefaultConfig mirrors the PRD defaults.
 func DefaultConfig() Config {
-	return Config{HotThreshold: 2_000_000_000, PlusThreshold: 1_000_000_000, StaleAfter: 30 * time.Second}
+	return Config{HotThreshold: 2_000_000_000, PlusThreshold: 1_000_000_000, StaleAfter: 30 * time.Second,
+		Sessions: calendar.Default()}
 }
 
 // Interval summarises one accepted same-day interval; it feeds the AI layer (internal/anomaly).
@@ -56,6 +60,8 @@ type symState struct {
 	day  string
 	game model.GameTotals
 	win  *model.TenMinute
+	// partialWin is the window holding a late day baseline (zero when the day is complete).
+	partialWin time.Time
 }
 
 // Engine is NOT safe for concurrent use; shard instruments across engines by InsCode.
@@ -81,7 +87,13 @@ func (e *Engine) band(avg int64) model.Band {
 // Process consumes one snapshot.
 func (e *Engine) Process(s model.Snapshot) Result {
 	var r Result
-	r.Issues = quality.CheckSingle(&s, e.cfg.StaleAfter)
+	class := e.cfg.Sessions.Class(s.InsCode)
+	sess, open := e.cfg.Sessions.Session(s.InsCode, s.SourceTime)
+	inSession := false
+	if is, ok := e.cfg.Sessions.Session(s.InsCode, s.IngestTime); ok {
+		inSession = is.Trading(s.IngestTime)
+	}
+	r.Issues = quality.CheckSingle(&s, e.cfg.StaleAfter, inSession)
 	for _, f := range model.FlowFields {
 		if !s.Has(f) {
 			return r // incomplete: never a baseline, never a metric
@@ -96,10 +108,25 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		return r
 	}
 	if st == nil || st.day != day || st.prev == nil {
-		st = &symState{day: day, game: model.GameTotals{InsCode: s.InsCode, Day: day}}
+		st = &symState{day: day, game: model.GameTotals{InsCode: s.InsCode, Class: class, Day: day}}
 		e.state[s.InsCode] = st
 		cp := s
 		st.prev = &cp
+		// Late-start rule: the day is complete only if this first accepted baseline was taken
+		// before the instrument's own open with zero day-to-date volume. Otherwise trades before
+		// it are missing from every total of the day (over-marking is accepted).
+		preOpenZero := s.Volume == 0 && (!open || s.SourceTime.Before(sess.Open))
+		if !preOpenZero {
+			st.game.Partial = true
+			st.partialWin = windowStart(sess, open, s.SourceTime)
+			when := "no session that day"
+			if open {
+				when = "session opens " + sess.Open.In(tehran.Loc).Format("15:04")
+			}
+			r.Issues = append(r.Issues, quality.DayStart(&s, fmt.Sprintf(
+				"first accepted snapshot of %s at %s (%s) already has day volume %d: earlier trades are not counted; day totals and this 10-minute window are partial",
+				day, s.SourceTime.In(tehran.Loc).Format("15:04:05"), when, s.Volume)))
+		}
 		return r // first snapshot of the day: no interval yet
 	}
 
@@ -128,7 +155,7 @@ func (e *Engine) Process(s model.Snapshot) Result {
 				continue
 			}
 			value := int64(float64(d.Value) * float64(sd.vol) / float64(d.Volume))
-			ev := model.FlowEvent{InsCode: s.InsCode, Symbol: s.Symbol, Side: sd.side,
+			ev := model.FlowEvent{InsCode: s.InsCode, Symbol: s.Symbol, Class: class, Side: sd.side,
 				IntervalFrom: from, IntervalTo: s.SourceTime, Volume: sd.vol, Value: value,
 				VWAP: vwap, PriceLast: s.PriceLast}
 			if sd.count > 0 {
@@ -165,9 +192,10 @@ func (e *Engine) Process(s model.Snapshot) Result {
 			NetIndValue: buyV - sellV, PriceFrom: st.prev.PriceLast, PriceTo: s.PriceLast}
 	}
 
-	ws := tehran.Floor10m(s.SourceTime)
+	ws := windowStart(sess, open, s.SourceTime)
 	if st.win == nil || !st.win.WindowStart.Equal(ws) {
-		st.win = &model.TenMinute{InsCode: s.InsCode, WindowStart: ws, PriceOpen: st.prev.PriceLast}
+		st.win = &model.TenMinute{InsCode: s.InsCode, Class: class, WindowStart: ws, PriceOpen: st.prev.PriceLast,
+			Partial: !st.partialWin.IsZero() && !ws.After(st.partialWin)}
 	}
 	st.win.NetHot += netHot
 	st.win.PriceLastV = s.PriceLast
@@ -177,4 +205,13 @@ func (e *Engine) Process(s model.Snapshot) Result {
 	cp := s
 	st.prev = &cp
 	return r
+}
+
+// windowStart is the session-relative 10-minute window of t (clock-aligned when the market is
+// closed that day).
+func windowStart(sess calendar.Session, open bool, t time.Time) time.Time {
+	if open {
+		return calendar.WindowStart(sess, t)
+	}
+	return tehran.Floor10m(t)
 }

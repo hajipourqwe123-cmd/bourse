@@ -30,8 +30,9 @@
 //     applied first, so state sees every stored snapshot exactly once, in order.
 //   - On restart it rebuilds its in-memory state by replaying, without publishing, the trading
 //     day of the snapshot at the durable's ack floor, up to that floor (AckFloor, Replay); if part
-//     of that day was already discarded, GameTotals and TenMinute from before the discard
-//     boundary carry partial=true and each instrument gets one RECOVERY_TRUNCATED issue.
+//     of that day was already discarded, the first retained snapshot is a late day baseline and
+//     the flow engine's late-start rule marks the day partial (DAY_START_MISSED, re-emitted once
+//     after the restart if it was produced during the replay).
 //   - Exactly one engine runs per durable, enforced by a JetStream KV lease (lease.go, P-02):
 //     a second engine refuses to start, and an engine that loses its lease stops. Two
 //     instances would each see only part of the snapshots.

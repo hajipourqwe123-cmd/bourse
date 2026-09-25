@@ -4,7 +4,7 @@
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
 //	                                         # (SYN* refused unless ALLOW_SYNTHETIC_ON_BUS=1)
-//	COLLECT_WINDOW=08:30-13:00               # live sources poll only in this Tehran-time span ("always")
+//	SESSIONS_FILE=path.json                  # session calendar; live sources poll only while a class is in session
 package main
 
 import (
@@ -14,11 +14,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
+	"reflect"
 	"syscall"
 	"time"
 
 	"bourse/internal/bus"
+	"bourse/internal/calendar"
 	"bourse/internal/config"
 	"bourse/internal/model"
 	"bourse/internal/source"
@@ -79,34 +80,39 @@ func run() int {
 	backoff := time.Second
 	log.Printf("collector: source=%s interval=%s bus=%s", src.Name(), interval, config.Str("BUS", "ndjson"))
 	_, isReplay := src.(*source.Replay)
-	win, err := parseWindow(config.Str("COLLECT_WINDOW", "08:30-13:00"))
+	cal, err := calendar.Load(config.Str("SESSIONS_FILE", ""))
 	if err != nil {
-		log.Printf("collector: COLLECT_WINDOW: %v", err)
+		log.Printf("collector: %v", err)
 		return 1
 	}
-	if isReplay {
-		win = window{always: true} // a recording is replayed whatever the wall clock says
-	} else if win.always || win.to-win.from > 4*time.Hour+30*time.Minute {
-		log.Printf("collector: WARNING: COLLECT_WINDOW=%s is longer than the 4.5h the bus stream sizing assumes (contracts/subjects.md)", win)
+	if n := cal.Unverified(); n > 0 {
+		log.Printf("collector: WARNING: session calendar has %d rules/holidays not verified against an official source (docs/sessions.md)", n)
+	}
+	var filter *publishFilter
+	if !isReplay { // a recording is replayed as recorded, whatever the wall clock says
+		filter = newPublishFilter(cal)
 	}
 	outside := false
 
 	for {
-		if !win.contains(time.Now()) {
-			if !outside {
-				log.Printf("collector: outside the collection window %s (Tehran); not polling", win)
-				outside = true
+		if !isReplay {
+			now := time.Now()
+			if u, open := cal.Union(now); !open || !u.Contains(now) {
+				if !outside {
+					log.Printf("collector: outside every instrument class's session today (Tehran); not polling")
+					outside = true
+				}
+				select {
+				case <-ctx.Done():
+					return 0
+				case <-time.After(interval):
+				}
+				continue
 			}
-			select {
-			case <-ctx.Done():
-				return 0
-			case <-time.After(interval):
+			if outside {
+				log.Printf("collector: a session is open; polling")
+				outside = false
 			}
-			continue
-		}
-		if outside {
-			log.Printf("collector: collection window %s open; polling", win)
-			outside = false
 		}
 		batch, err := src.Fetch(ctx)
 		if errors.Is(err, source.ErrDone) {
@@ -126,7 +132,13 @@ func run() int {
 			continue
 		}
 		backoff = time.Second
+		if filter != nil {
+			filter.warnUnmapped(batch)
+		}
 		for i := range batch {
+			if filter != nil && !filter.keep(&batch[i]) {
+				continue
+			}
 			if guard != nil {
 				if err := guard(&batch[i]); err != nil {
 					log.Printf("collector: %v", err)
@@ -137,6 +149,9 @@ func run() int {
 			if err := bus.Retry(ctx, retry, nil, func() error { return publishSnapshot(pub, subj, &batch[i]) }); err != nil {
 				log.Printf("collector: publish: %v", err)
 				return 1
+			}
+			if filter != nil {
+				filter.published(&batch[i])
 			}
 		}
 		wait := interval
@@ -180,46 +195,66 @@ func busGuard(s *model.Snapshot, allowSynthetic bool) error {
 	return nil
 }
 
-// window is the daily Tehran-time span in which the collector polls a live source
-// (COLLECT_WINDOW="HH:MM-HH:MM", or "always"). It bounds the bus volume that the stream sizing
-// in bus.DefaultStreams assumes (08:30-13:00 by default).
-type window struct {
-	from, to time.Duration // since Tehran midnight, [from, to)
-	always   bool
+// publishFilter decides which polled snapshots of a live source reach the bus. It keeps the bus
+// volume inside what the stream sizing assumes without ever hiding data:
+//   - an instrument's FIRST snapshot of a trading day is always published, even if unchanged
+//     (e.g. the vendor still shows yesterday's totals before the open): it is the day baseline the
+//     engine's late-start rule must judge;
+//   - inside the instrument's own session [pre_open, close) every snapshot is published (STALE
+//     detection needs the repeats);
+//   - outside it, a snapshot is published only if its market data changed, so a misclassified
+//     instrument that trades out of "its" hours still flows.
+type publishFilter struct {
+	cal      *calendar.Calendar
+	last     map[string]model.Snapshot // last published, per instrument
+	day      map[string]string         // trading day of last published, per instrument
+	warnedOn string                    // day the unmapped-instrument warning was last logged
 }
 
-func parseWindow(v string) (window, error) {
-	if v == "always" {
-		return window{always: true}, nil
-	}
-	a, b, ok := strings.Cut(v, "-")
-	parse := func(x string) (time.Duration, error) {
-		t, err := time.Parse("15:04", strings.TrimSpace(x))
-		if err != nil {
-			return 0, err
-		}
-		return time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute, nil
-	}
-	from, err1 := parse(a)
-	to, err2 := parse(b)
-	if !ok || err1 != nil || err2 != nil || to <= from {
-		return window{}, fmt.Errorf("%q: want HH:MM-HH:MM (Tehran, start before end) or always", v)
-	}
-	return window{from: from, to: to}, nil
+func newPublishFilter(cal *calendar.Calendar) *publishFilter {
+	return &publishFilter{cal: cal, last: map[string]model.Snapshot{}, day: map[string]string{}}
 }
 
-func (w window) contains(t time.Time) bool {
-	if w.always {
+func (f *publishFilter) keep(s *model.Snapshot) bool {
+	if f.day[s.InsCode] != tehran.TradingDay(s.IngestTime) {
 		return true
 	}
-	since := t.Sub(tehran.DayStart(t))
-	return since >= w.from && since < w.to
+	if sess, ok := f.cal.Session(s.InsCode, s.IngestTime); ok && sess.Contains(s.IngestTime) {
+		return true
+	}
+	return marketChanged(f.last[s.InsCode], *s)
 }
 
-func (w window) String() string {
-	if w.always {
-		return "always"
+func (f *publishFilter) published(s *model.Snapshot) {
+	f.last[s.InsCode] = *s
+	f.day[s.InsCode] = tehran.TradingDay(s.IngestTime)
+}
+
+// marketChanged compares everything but the timestamps.
+func marketChanged(a, b model.Snapshot) bool {
+	a.SourceTime, a.IngestTime, a.SourceTimeEstimated = time.Time{}, time.Time{}, false
+	b.SourceTime, b.IngestTime, b.SourceTimeEstimated = time.Time{}, time.Time{}, false
+	return !reflect.DeepEqual(a, b)
+}
+
+// warnUnmapped logs, once per trading day, how many instruments have no class in the calendar
+// (class "unknown": session = union of all classes, excluded from per-class aggregates).
+func (f *publishFilter) warnUnmapped(batch []model.Snapshot) {
+	if len(batch) == 0 {
+		return
 	}
-	f := func(d time.Duration) string { return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60) }
-	return f(w.from) + "-" + f(w.to)
+	day := tehran.TradingDay(batch[0].IngestTime)
+	if day == f.warnedOn {
+		return
+	}
+	f.warnedOn = day
+	n := 0
+	for i := range batch {
+		if !f.cal.Mapped(batch[i].InsCode) {
+			n++
+		}
+	}
+	if n > 0 {
+		log.Printf("collector: WARNING: %d of %d instruments have no class in the session calendar (class %q; see docs/sessions.md)", n, len(batch), calendar.Unknown)
+	}
 }

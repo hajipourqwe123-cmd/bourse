@@ -26,6 +26,7 @@ import (
 type output struct {
 	subject string
 	v       any
+	id      string // explicit message ID (re-emitted outputs keep their original one); "" = prefix:index
 }
 
 // processor owns the engine state. Not safe for concurrent use (see flow.Engine).
@@ -42,11 +43,12 @@ type processor struct {
 	cpDay   string // trading day recorded in the checkpoint (for this MD epoch)
 
 	// loss is set by recovery when snapshots were discarded from MD before this engine applied
-	// them (or before it could replay them). Each instrument's first complete snapshot after
-	// recovery is its new baseline; first records whether data of that day before it was lost.
-	loss    *lossInfo
-	first   map[string]firstSeen // by instrument and trading day (dayKey)
-	flagged map[string]bool      // (instrument, day) already given a RECOVERY_TRUNCATED issue
+	// them (or before it could replay them); logged only: the affected days are marked partial by
+	// the flow engine's late-start rule (their first retained snapshot is a late baseline).
+	loss *lossInfo
+	// pending holds, per instrument, a DAY_START_MISSED produced while replaying (outputs are
+	// discarded there); it is published once at the instrument's first live snapshot of that day.
+	pending map[string]pendingIssue
 
 	guard          func() error // e.g. lease validity; checked before every publish (nil = none)
 	allowSynthetic bool         // accept SYN* snapshots (ALLOW_SYNTHETIC_ON_BUS=1, local demos only)
@@ -54,10 +56,21 @@ type processor struct {
 }
 
 func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
-	return &processor{eng: flow.New(cfg), radar: anomaly.New(anomaly.DefaultConfig()), pub: pub,
+	rc := anomaly.DefaultConfig()
+	rc.Sessions = cfg.Sessions // one calendar for every time rule
+	return &processor{eng: flow.New(cfg), radar: anomaly.New(rc), pub: pub,
 		retry:   []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second},
-		first:   map[string]firstSeen{},
-		flagged: map[string]bool{}}
+		pending: map[string]pendingIssue{}}
+}
+
+// pendingIssue is a replay-time DAY_START_MISSED with the MD sequence and output index it was
+// computed at, so re-publishing it reuses the original message ID (de-duplicated if the previous
+// process already published it).
+type pendingIssue struct {
+	issue model.QualityIssue
+	day   string
+	seq   uint64
+	idx   int
 }
 
 // lossInfo describes snapshots discarded from MD that the current state never saw.
@@ -67,87 +80,30 @@ type lossInfo struct {
 	replayBefore      time.Time // as replayDay when the day is unknown: those stored before this
 }
 
-func dayKey(ins, day string) string { return ins + "|" + day }
-
-// firstSeen is an instrument's first complete snapshot of a trading day after recovery (its
-// baseline for that day).
-type firstSeen struct {
-	day     string    // its trading day
-	window  time.Time // its 10-minute window
-	partial bool      // trades of that day before it were lost: day totals and that window are partial
-}
-
-func (l *lossInfo) decide(s model.Snapshot) firstSeen {
-	day, ds := tehran.TradingDay(s.SourceTime), tehran.DayStart(s.SourceTime)
-	lost := (!l.unprocessedBefore.IsZero() && ds.Before(l.unprocessedBefore)) ||
-		(l.replayDay != "" && day == l.replayDay) ||
-		(!l.replayBefore.IsZero() && ds.Before(l.replayBefore))
-	// Volume is day-to-date: zero means nothing traded that day before this baseline.
-	return firstSeen{day: day, window: tehran.Floor10m(s.SourceTime), partial: lost && s.Volume > 0}
-}
-
-func hasFlowFields(s *model.Snapshot) bool {
-	for _, f := range model.FlowFields {
-		if !s.Has(f) {
-			return false
-		}
-	}
-	return true
-}
-
-// markPartial flags the day totals and the 10-minute window that contain an instrument's lost
-// data. The flow engine re-baselines each instrument on its first complete snapshot after
-// recovery, so what is missing is that day's activity up to that snapshot: the day totals of
-// that day and the window containing the snapshot (later windows are complete).
-func (p *processor) markPartial(s *model.Snapshot, r *flow.Result) {
-	if p.loss == nil {
-		return
-	}
-	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
-	fs, ok := p.first[key]
-	if !ok {
-		if !hasFlowFields(s) {
-			return // incomplete snapshots never become baselines
-		}
-		fs = p.loss.decide(*s)
-		p.first[key] = fs
-	}
-	if !fs.partial {
-		return
-	}
-	if r.Game != nil && r.Game.Day == fs.day {
-		r.Game.Partial = true
-	}
-	if r.Window != nil && !r.Window.WindowStart.After(fs.window) {
-		r.Window.Partial = true
-	}
-}
-
 // compute runs one snapshot through the engine and radar. It mutates state exactly once per
 // snapshot, whether or not the outputs are published afterwards (recovery discards them).
 func (p *processor) compute(s model.Snapshot) []output {
 	var outs []output
 	r := p.eng.Process(s)
-	p.markPartial(&s, &r) // before the radar: AI-02 must not run on a partial window
 	for _, i := range r.Issues {
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), i})
+		outs = append(outs, output{subject: bus.SubjQuality(s.InsCode), v: i})
 	}
 	for _, e := range r.Events {
-		outs = append(outs, output{bus.SubjFlow(s.InsCode), e})
+		outs = append(outs, output{subject: bus.SubjFlow(s.InsCode), v: e})
 	}
 	if r.Game != nil {
-		outs = append(outs, output{bus.SubjGame(s.InsCode), r.Game})
+		outs = append(outs, output{subject: bus.SubjGame(s.InsCode), v: r.Game})
 	}
 	if r.Window != nil {
-		outs = append(outs, output{bus.SubjWindow(s.InsCode), r.Window})
-		if !r.Window.Partial {
+		outs = append(outs, output{subject: bus.SubjWindow(s.InsCode), v: r.Window})
+		if !r.Window.Partial { // AI-02 must not run on a partial window
 			if ev := p.radar.Divergence(r.Window); ev != nil {
-				outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+				outs = append(outs, output{subject: bus.SubjAI(s.InsCode), v: ev})
 			}
 		}
 	}
 	for _, ev := range p.radar.Observe(r.Interval) {
-		outs = append(outs, output{bus.SubjAI(s.InsCode), ev})
+		outs = append(outs, output{subject: bus.SubjAI(s.InsCode), v: ev})
 	}
 	return outs
 }
@@ -163,7 +119,6 @@ type idPublisher interface {
 // progressing publish never outlives the consumer's AckWait.
 func (p *processor) publish(ctx context.Context, outs []output, idPrefix string, keepAlive func()) error {
 	idp, useID := p.pub.(idPublisher)
-	useID = useID && idPrefix != ""
 	last := time.Now()
 	alive := func() {
 		if keepAlive != nil && time.Since(last) >= time.Second {
@@ -174,14 +129,18 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 	var guardErr error
 	for i, o := range outs {
 		alive()
+		id := o.id
+		if id == "" && idPrefix != "" {
+			id = fmt.Sprintf("%s:%d", idPrefix, i)
+		}
 		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if p.guard != nil { // before EVERY attempt, retries included
 				if guardErr = p.guard(); guardErr != nil {
 					return bus.Permanent(guardErr) // no point retrying without the lease
 				}
 			}
-			if useID {
-				return idp.PublishID(o.subject, fmt.Sprintf("%s:%d", idPrefix, i), o.v)
+			if useID && id != "" {
+				return idp.PublishID(o.subject, id, o.v)
 			}
 			return p.pub.Publish(o.subject, o.v)
 		})
@@ -340,7 +299,7 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 	}
 	if loss != (lossInfo{}) {
 		p.loss = &loss
-		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: affected day totals and windows will be published partial=true with RECOVERY_TRUNCATED",
+		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: snapshots were lost; affected days are marked partial by the late-start rule (DAY_START_MISSED)",
 			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339), floor, floorDay)
 	}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
@@ -348,7 +307,11 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		if err != nil || (model.IsSynthetic(&s) && !p.allowSynthetic) {
 			return nil // was terminated (and reported) when first consumed
 		}
-		p.compute(s)
+		for i, o := range p.compute(s) {
+			if iss, ok := o.v.(model.QualityIssue); ok && iss.Code == quality.DayStartMissed {
+				p.pending[s.InsCode] = pendingIssue{issue: iss, day: tehran.TradingDay(s.SourceTime), seq: m.StreamSeq, idx: i}
+			}
+		}
 		replayed++
 		return nil
 	})
@@ -410,7 +373,7 @@ func (p *processor) poison(ctx context.Context, m bus.Msg) error {
 	err := fmt.Errorf("POISON_SUSPECT: MD %s (%s) delivered %d times without success; not processing it. "+
 		"Inspect it (stream MD), fix the cause, then restart with ENGINE_RETRY_POISON_SEQ=%d to process it once more; "+
 		"the engine never skips it on its own", seqs, m.Subject, m.NumDelivered, m.StreamSeq)
-	if perr := p.publish(ctx, []output{{bus.SubjQuality(ins), iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
+	if perr := p.publish(ctx, []output{{subject: bus.SubjQuality(ins), v: iss}}, fmt.Sprintf("eng:%d:%d:poison", p.epoch, m.StreamSeq), m.InProgress); perr != nil {
 		err = fmt.Errorf("%w (reporting it also failed: %v)", err, perr)
 	}
 	return bus.Abort(err)
@@ -446,7 +409,7 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	if derr != nil {
 		iss := model.QualityIssue{InsCode: strings.TrimPrefix(m.Subject, "md.snap."), Code: quality.Undecodable,
 			Detail: fmt.Sprintf("stream seq %d: payload is not a valid snapshot: %v", m.StreamSeq, derr), At: m.Stored}
-		if err := p.publish(ctx, []output{{bus.SubjQuality(iss.InsCode), iss}}, id, keepAlive); err != nil {
+		if err := p.publish(ctx, []output{{subject: bus.SubjQuality(iss.InsCode), v: iss}}, id, keepAlive); err != nil {
 			return bus.Abort(err)
 		}
 		p.lastSeq = m.StreamSeq
@@ -460,12 +423,14 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
-	key := dayKey(s.InsCode, tehran.TradingDay(s.SourceTime))
-	if fs, ok := p.first[key]; ok && fs.partial && !p.flagged[key] {
-		p.flagged[key] = true
-		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
-			Detail: fmt.Sprintf("engine restarted after snapshots of %s before %s were discarded from the bus; day totals and that 10-minute window are partial",
-				fs.day, fs.window.In(tehran.Loc).Format("15:04")), At: s.IngestTime}})
+	if pend, ok := p.pending[s.InsCode]; ok {
+		delete(p.pending, s.InsCode)
+		if pend.day == tehran.TradingDay(s.SourceTime) {
+			// Appended, never prepended: this snapshot's own outputs keep their indices and so
+			// their message IDs (a republish after a restart must de-duplicate).
+			outs = append(outs, output{subject: bus.SubjQuality(s.InsCode), v: pend.issue,
+				id: fmt.Sprintf("eng:%d:%d:%d", p.epoch, pend.seq, pend.idx)})
+		}
 	}
 	if err := p.publish(ctx, outs, id, keepAlive); err != nil {
 		return bus.Abort(err)

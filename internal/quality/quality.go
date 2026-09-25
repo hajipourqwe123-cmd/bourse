@@ -16,21 +16,23 @@ const (
 	CumulativeDecrease = "CUMULATIVE_DECREASE" // a day-to-date total went down within the same day
 	SideMismatch       = "SIDE_MISMATCH"       // buy-side (or sell-side) volume ≠ total volume delta
 	TimeEstimated      = "SOURCE_TIME_ESTIMATED"
-	Undecodable        = "UNDECODABLE"        // a bus message is not a valid snapshot; dropped, never retried
-	RecoveryTruncated  = "RECOVERY_TRUNCATED" // engine restart could not replay the whole trading day
-	PoisonSuspect      = "POISON_SUSPECT"     // an MD message was delivered 5 times unprocessed; engine stopped
+	Undecodable        = "UNDECODABLE"      // a bus message is not a valid snapshot; dropped, never retried
+	PoisonSuspect      = "POISON_SUSPECT"   // an MD message was delivered 5 times unprocessed; engine stopped
+	DayStartMissed     = "DAY_START_MISSED" // the day's first baseline is not a pre-open zero-volume snapshot: day totals partial
 )
 
 func issue(s *model.Snapshot, code, detail string) model.QualityIssue {
 	return model.QualityIssue{InsCode: s.InsCode, Code: code, Detail: detail, At: s.IngestTime}
 }
 
-// CheckSingle applies rules that need only the current snapshot.
-func CheckSingle(s *model.Snapshot, staleAfter time.Duration) []model.QualityIssue {
+// CheckSingle applies rules that need only the current snapshot. STALE is only meaningful while
+// the instrument trades (inSession, from the session calendar): outside its session the source
+// time legitimately stops moving.
+func CheckSingle(s *model.Snapshot, staleAfter time.Duration, inSession bool) []model.QualityIssue {
 	var out []model.QualityIssue
 	if s.SourceTimeEstimated {
 		out = append(out, issue(s, TimeEstimated, "source provided no timestamp; ingest time used"))
-	} else if lag := s.IngestTime.Sub(s.SourceTime); lag > staleAfter {
+	} else if lag := s.IngestTime.Sub(s.SourceTime); inSession && lag > staleAfter {
 		out = append(out, issue(s, Stale, fmt.Sprintf("lag %s > %s", lag.Round(time.Second), staleAfter)))
 	}
 	var miss []string
@@ -54,6 +56,11 @@ type Delta struct {
 
 // Diff computes cur − prev and returns issues when the pair is not usable.
 // ok=false means the pair MUST NOT feed any metric.
+// DayStart reports that the day's first accepted baseline cannot prove the day complete.
+func DayStart(s *model.Snapshot, detail string) model.QualityIssue {
+	return issue(s, DayStartMissed, detail)
+}
+
 // EarlierDay reports cur as OUT_OF_ORDER because its trading day precedes prev's.
 func EarlierDay(cur, prev *model.Snapshot) model.QualityIssue {
 	return issue(cur, OutOfOrder, fmt.Sprintf("source time %s is on an earlier trading day than %s",

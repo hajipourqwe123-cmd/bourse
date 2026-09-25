@@ -1,0 +1,57 @@
+{
+  "_note": "Trading-session calendar (DL-01). Tehran local times. EVERY rule and holiday is UNVERIFIED: owner-provided on 2026-09-25, to be checked against official exchange notices. Add a new dated rule (effective_from) instead of editing an old one, so replays/backtests keep the historical calendar. Instruments not listed are class 'unknown' (session = union of all classes). docs/sessions.md explains the format.",
+  "default_class": "unknown",
+  "classes": {
+    "stock": {
+      "label_fa": "سهام و حق تقدم",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30",
+         "verified": false, "source": "owner-provided 2026-09-25; unverified; history before this date unknown"}
+      ]
+    },
+    "equity_etf": {
+      "label_fa": "صندوق‌های سهامی و مختلط",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30",
+         "verified": false, "source": "owner-provided 2026-09-25; unverified"}
+      ]
+    },
+    "fixed_income": {
+      "label_fa": "اوراق و صندوق‌های درآمد ثابت",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "08:25", "open": "08:30", "close": "15:00",
+         "verified": false, "source": "owner-provided 2026-09-25; unverified"}
+      ]
+    },
+    "gold": {
+      "label_fa": "گواهی سکه و شمش طلا و صندوق‌های طلا",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "11:45", "open": "12:00", "close": "18:00",
+         "verified": false, "source": "owner-provided 2026-09-25; unverified; no morning session"}
+      ]
+    },
+    "silver": {
+      "label_fa": "گواهی نقره و صندوق‌های نقره",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "11:45", "open": "12:00", "close": "18:00",
+         "verified": false, "source": "owner-provided 2026-09-25; unverified"}
+      ]
+    },
+    "other_fund": {
+      "label_fa": "صندوق‌های اهرمی، بخشی، شاخصی، کالایی و املاک",
+      "rules": [
+        {"effective_from": "2000-01-01", "days": ["sat", "sun", "mon", "tue", "wed"], "pre_open": "08:45", "open": "09:00", "close": "12:30",
+         "verified": false, "source": "UNKNOWN: provisional copy of equity_etf hours"}
+      ]
+    }
+  },
+  "instruments": {
+    "SYNTHETIC0001": "stock",
+    "SYNTHETIC0002": "stock",
+    "SYNTHETIC0003": "stock",
+    "SYNTHETIC0004": "stock",
+    "SYNTHETICG001": "gold"
+  },
+  "_instruments_note": "SYN* entries map the synthetic demo day (cmd/syngen) only; synthetic data never reaches users (rule 5). Real ins_code mappings come from D-03.",
+  "holidays": []
+}

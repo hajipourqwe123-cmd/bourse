@@ -14,6 +14,7 @@
 | آداپتور سورس‌آرنا | **موقت**: نگاشت ۴ فیلد تأیید نشده؛ بدون توکن زنده آزمون نشده (وظیفه D-03) |
 | گذرگاه NATS JetStream (`BUS=nats`، `internal/bus`) | آماده (P-01)؛ بازیابی حالت پس از راه‌اندازی دوباره، آزمون با سرور NATS درون‌فرایندی |
 | اجاره تک‌نمونه engine (JetStream KV) | آماده (P-02)؛ engine دوم از شروع سر باز می‌زند |
+| تقویم جلسه‌های معاملاتی هر نماد (`internal/calendar`) | آماده (DL-01)؛ همه ساعت‌ها و تعطیلات **تأییدنشده**؛ `docs/sessions.md` |
 | نویسنده ClickHouse، دروازه Centrifugo | اسپرینت ۱ و ۲ |
 | `infra/docker-compose.yml` و DDL کلیک‌هاوس | اجرا و آزموده شده (I-01): هر ۵ سرویس سالم، ۴ جدول ساخته می‌شود |
 | رابط کاربری | اسپرینت ۲ |
@@ -41,7 +42,7 @@ make down
 make demo-nats     # روز ساختگی → یک NATS دورریختنی جدا (نه پشته مشترک)؛ engine تا انتها اجرا و خارج می‌شود
 make build
 BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (اجاره تک‌نمونه)
-SOURCE=sourcearena BUS=nats bin/collector                             # فقط در COLLECT_WINDOW (پیش‌فرض ۰۸:۳۰–۱۳:۰۰)
+SOURCE=sourcearena BUS=nats bin/collector                             # فقط وقتی جلسه معاملاتی یکی از گروه‌ها باز است (docs/sessions.md)
 go run ./cmd/syngen -n 300 > /tmp/syn300.ndjson                        # بار آزمایشی ۳۰۰ نماد
 ```
 
