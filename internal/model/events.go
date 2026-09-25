@@ -79,12 +79,16 @@ func (t TenMinute) ChangePct() float64 {
 
 // GameTotals accumulates the "market game" split for one instrument for the day (rial, net = buy − sell).
 type GameTotals struct {
-	InsCode    string `json:"ins_code"`
-	Class      string `json:"class"` // instrument class ("unknown" if unmapped); per-class aggregates exclude unknown
-	Day        string `json:"day"`
-	NetHot     int64  `json:"net_hot"`
-	NetHotPlus int64  `json:"net_hot_plus"`
-	NetRetail  int64  `json:"net_retail"`
+	InsCode string `json:"ins_code"`
+	Class   string `json:"class"` // instrument class ("unknown" if unmapped); per-class aggregates exclude unknown
+	Day     string `json:"day"`
+	// AsOf is the source_time, and Volume the cumulative day volume, of the latest snapshot
+	// included in these totals: data age, and whether they cover a newer snapshot's trading.
+	AsOf       time.Time `json:"as_of"`
+	Volume     int64     `json:"volume"`
+	NetHot     int64     `json:"net_hot"`
+	NetHotPlus int64     `json:"net_hot_plus"`
+	NetRetail  int64     `json:"net_retail"`
 	// NetUnattributed holds flow that cannot be banded (existing participants trading again).
 	NetUnattributed int64 `json:"net_unattributed"`
 	// Partial is true unless the day's first accepted baseline was taken before the instrument's

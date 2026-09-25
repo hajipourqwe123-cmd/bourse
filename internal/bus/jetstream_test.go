@@ -480,3 +480,112 @@ func TestDialDoesNotTouchStreams(t *testing.T) {
 		t.Fatal("DialJetStream created streams")
 	}
 }
+
+func TestTailCatchesUpThenFollows(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, `{"n":1}`, `{"n":2}`)
+	ctx, cancel := context.WithCancel(ctxT(t))
+	defer cancel()
+	var mu sync.Mutex
+	var got []string
+	caught := make(chan int, 1)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- j.Tail(ctx, StreamMD, "md.snap.>", time.Time{}, func(m Msg) error {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, string(m.Data))
+			return nil
+		}, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			caught <- len(got)
+		})
+	}()
+	select {
+	case n := <-caught:
+		if n != 2 {
+			t.Fatalf("caught up after %d messages, want 2", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("never caught up")
+	}
+	publishN(t, j, `{"n":3}`)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live message not followed: %v", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Tail = %v, want context.Canceled", err)
+	}
+	if strings.Join(got, ",") != `{"n":1},{"n":2},{"n":3}` {
+		t.Errorf("order = %v", got)
+	}
+}
+
+func TestTailEmptyStreamIsCaughtUp(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	ctx, cancel := context.WithCancel(ctxT(t))
+	defer cancel()
+	caught := make(chan struct{})
+	go func() {
+		_ = j.Tail(ctx, StreamAI, "ai.signal.>", time.Now(), func(Msg) error { return nil }, func() { close(caught) })
+	}()
+	select {
+	case <-caught:
+	case <-time.After(10 * time.Second):
+		t.Fatal("empty stream never reported caught up")
+	}
+}
+
+func TestPublishBatchOrderDedupAndErrors(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	errs := j.PublishBatch([]BatchItem{
+		{Subject: SubjGame("A"), ID: "b:1", V: map[string]int{"n": 1}},
+		{Subject: "nowhere.x", ID: "b:2", V: 1}, // no stream: error for this item only
+		{Subject: SubjWindow("A"), ID: "b:3", V: map[string]int{"n": 3}},
+		{Subject: SubjGame("A"), ID: "b:1", V: map[string]int{"n": 9}}, // duplicate ID: acked, not stored
+	})
+	if errs[0] != nil || errs[1] == nil || errs[2] != nil || errs[3] != nil {
+		t.Fatalf("errs = %v", errs)
+	}
+	var got []string
+	if _, err := j.Replay(ctxT(t), StreamFlow, "flow.>", time.Time{}, 10, func(m Msg) error {
+		got = append(got, m.Subject+" "+string(m.Data))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != `flow.game.A {"n":1}|flow.10m.A {"n":3}` {
+		t.Errorf("stored = %v, want both in order and the duplicate dropped", got)
+	}
+}
+
+func TestRefBucketRoundTripLargeRecord(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	big := bytes.Repeat([]byte("x"), 600_000) // a ~5,000-instrument record
+	for i := 0; i < 4; i++ {                  // four records, overwritten repeatedly
+		for _, k := range []string{"a", "b", "c", "d"} {
+			if err := j.RefPut(ctxT(t), k, big); err != nil {
+				t.Fatalf("put %s #%d: %v", k, i, err)
+			}
+		}
+	}
+	got, ok, err := j.RefGet(ctxT(t), "c")
+	if err != nil || !ok || len(got) != len(big) {
+		t.Fatalf("get: %d bytes ok=%v err=%v", len(got), ok, err)
+	}
+	if _, ok, err := j.RefGet(ctxT(t), "missing"); ok || err != nil {
+		t.Errorf("missing key: ok=%v err=%v", ok, err)
+	}
+}

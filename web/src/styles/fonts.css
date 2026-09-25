@@ -1,0 +1,11 @@
+/* Vazirmatn, self-hosted from the npm package (no CDN: rule 7, ADR-0005). Weights 400–800. */
+@font-face { font-family: Vazirmatn; font-weight: 400; font-style: normal; font-display: swap;
+  src: url("../../node_modules/vazirmatn/fonts/webfonts/Vazirmatn-Regular.woff2") format("woff2"); }
+@font-face { font-family: Vazirmatn; font-weight: 500; font-style: normal; font-display: swap;
+  src: url("../../node_modules/vazirmatn/fonts/webfonts/Vazirmatn-Medium.woff2") format("woff2"); }
+@font-face { font-family: Vazirmatn; font-weight: 600; font-style: normal; font-display: swap;
+  src: url("../../node_modules/vazirmatn/fonts/webfonts/Vazirmatn-SemiBold.woff2") format("woff2"); }
+@font-face { font-family: Vazirmatn; font-weight: 700; font-style: normal; font-display: swap;
+  src: url("../../node_modules/vazirmatn/fonts/webfonts/Vazirmatn-Bold.woff2") format("woff2"); }
+@font-face { font-family: Vazirmatn; font-weight: 800; font-style: normal; font-display: swap;
+  src: url("../../node_modules/vazirmatn/fonts/webfonts/Vazirmatn-ExtraBold.woff2") format("woff2"); }
