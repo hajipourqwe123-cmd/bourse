@@ -3,10 +3,15 @@
 //	collector | engine                      # BUS=ndjson (default): NDJSON stdin → stdout
 //	BUS=nats NATS_URL=nats://… engine       # durable JetStream consumer on md.snap.> → JetStream
 //	ENGINE_EXIT_WHEN_IDLE=1                 # (nats) exit 0 once every stored snapshot is acknowledged
+//	ENGINE_LEASE_TTL=15s                    # (nats) single-engine lease; a second engine refuses to start
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -44,12 +49,25 @@ func main() {
 		go js.WatchLimits(ctx, 30*time.Second)
 		log.Printf("engine: bus=nats consumer=%s", engineDurable)
 		p := newProcessor(cfg, js)
-		err = p.runNATS(ctx, js, engineConsumer(), config.Str("ENGINE_EXIT_WHEN_IDLE", "") == "1")
+		err = runLeased(ctx, js, p, engineConsumer(), config.Str("ENGINE_EXIT_WHEN_IDLE", "") == "1",
+			leaseHolder(), config.Dur("ENGINE_LEASE_TTL", 15*time.Second))
 		js.Close()
-		if err != nil {
+		switch {
+		case errors.Is(err, bus.ErrLeaseHeld):
+			log.Fatalf("engine: refusing to start: %v", err)
+		case err != nil:
 			log.Fatalf("engine: %v (unacked snapshot is redelivered to the next start)", err)
 		}
 	default:
 		log.Fatalf("engine: unknown BUS %q (want ndjson or nats)", kind)
 	}
+}
+
+// leaseHolder identifies this process in the lease: host, pid and a random suffix (in a
+// container every engine is pid 1).
+func leaseHolder() string {
+	host, _ := os.Hostname()
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s/pid-%d/%s", host, os.Getpid(), hex.EncodeToString(b))
 }

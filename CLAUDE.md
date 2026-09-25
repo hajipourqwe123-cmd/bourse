@@ -33,5 +33,6 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - Do not Read testdata/*.ndjson or recordings/ (large); use `head -c` or jq summaries instead.
 
 ## Current state
-Sprint 0 done. Sprint 1: I-01 (compose up + DDL) and P-01 (JetStream bus) done. Next: D-03 verify
-sourcearena fields with live token, W-01 ClickHouse writer, R-01 daily recording, Q-01 Grafana, Q-02 hot-money accuracy.
+Sprint 0 done. Sprint 1: I-01 (compose + DDL), P-01 (JetStream bus), P-02 (single-engine KV lease) done.
+Next, in order: W-01 ClickHouse writer (idempotent: dedup key / ReplacingMergeTree for flow_events;
+store `partial`), R-01 daily recording, Q-01 Grafana. D-03 waits for the live token.

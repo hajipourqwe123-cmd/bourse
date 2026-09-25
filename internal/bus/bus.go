@@ -32,8 +32,9 @@
 //     day of the snapshot at the durable's ack floor, up to that floor (AckFloor, Replay); if part
 //     of that day was already discarded, GameTotals and TenMinute from before the discard
 //     boundary carry partial=true and each instrument gets one RECOVERY_TRUNCATED issue.
-//   - Run exactly one engine per durable (stop the old process before starting a new one):
-//     two instances would each see only part of the snapshots.
+//   - Exactly one engine runs per durable, enforced by a JetStream KV lease (lease.go, P-02):
+//     a second engine refuses to start, and an engine that loses its lease stops. Two
+//     instances would each see only part of the snapshots.
 package bus
 
 import (

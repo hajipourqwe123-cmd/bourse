@@ -18,6 +18,7 @@ import (
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"bourse/internal/bus"
 	"bourse/internal/flow"
@@ -415,5 +416,107 @@ func TestPoisonSuspectAcrossRestarts(t *testing.T) {
 	m, err := jsc.GetLastMsg(bus.StreamQuality, "quality.SYNTEST0000")
 	if err != nil || info.State.Msgs != 1 || !strings.Contains(string(m.Data), quality.PoisonSuspect) {
 		t.Fatalf("want exactly one POISON_SUSPECT issue (deduplicated across runs 5 and 6): msgs=%d err=%v", info.State.Msgs, err)
+	}
+}
+
+// startLeased runs an engine under the single-engine lease in the background.
+func startLeased(t *testing.T, js *bus.JetStream, holder string) (stop func() error) {
+	t.Helper()
+	p := newProcessor(flow.DefaultConfig(), js)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	spec := engineConsumer()
+	spec.AckWait = 300 * time.Millisecond
+	go func() { done <- runLeased(ctx, js, p, spec, false, holder, time.Second) }()
+	return func() error {
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatal("engine did not stop")
+			return nil
+		}
+	}
+}
+
+func waitFloor(t *testing.T, js *bus.JetStream, n uint64) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("engine did not catch up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// P-02: while one engine runs, a second refuses to start and touches nothing; once the first
+// stops (and releases), a new one starts at once.
+func TestSecondEngineRefusesToStart(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	var in []any
+	for _, s := range day("2026-09-23", 2, 20, 7) {
+		in = append(in, s)
+	}
+	feed(t, url, js, in)
+	stopA := startLeased(t, js, "engine-a")
+	waitFloor(t, js, uint64(len(in)))
+
+	pub := &recPub{}
+	b := newProcessor(flow.DefaultConfig(), pub)
+	err := runLeased(context.Background(), js, b, engineConsumer(), true, "engine-b", time.Second)
+	if !errors.Is(err, bus.ErrLeaseHeld) || !strings.Contains(err.Error(), "engine-a") {
+		t.Fatalf("second engine: want ErrLeaseHeld naming engine-a, got %v", err)
+	}
+	if len(pub.ids) != 0 || b.lastSeq != 0 {
+		t.Fatalf("refused engine did work: %d publishes, lastSeq %d", len(pub.ids), b.lastSeq)
+	}
+
+	if err := stopA(); err != nil {
+		t.Fatalf("first engine: %v", err)
+	}
+	c := newProcessor(flow.DefaultConfig(), js)
+	if err := runLeased(context.Background(), js, c, engineConsumer(), true, "engine-c", time.Second); err != nil {
+		t.Fatalf("engine after a clean stop: %v", err)
+	}
+	if c.lastSeq != uint64(len(in)) {
+		t.Fatalf("successor recovered lastSeq %d, want %d", c.lastSeq, len(in))
+	}
+}
+
+// A running engine whose lease disappears (operator action, or it was partitioned long enough
+// to expire and be taken) stops with ErrLeaseLost instead of carrying on beside a successor.
+func TestEngineStopsWhenLeaseLost(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	stop := startLeased(t, js, "engine-a")
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	var kv jetstream.KeyValue
+	deadline := time.Now().Add(5 * time.Second)
+	for { // wait until the lease exists
+		var err error
+		if kv, err = jsc.KeyValue(context.Background(), leaseBucket); err == nil {
+			if _, err = kv.Get(context.Background(), engineDurable); err == nil {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease never acquired")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second) // > one renewal period (ttl/3) plus slack
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
 	}
 }

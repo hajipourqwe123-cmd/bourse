@@ -24,6 +24,7 @@
 | I-01 | راه‌اندازی docker-compose و اجرای DDL |
 | D-03 | اجرای آداپتور با توکن زنده؛ تأیید ۴ فیلد تأییدنشده؛ آزمون قرارداد با پاسخ واقعی ضبط‌شده |
 | P-01 | ناشر NATS JetStream با همان رابط `bus.Publisher` |
+| P-02 | اجاره تک‌نمونه engine با JetStream KV (TTL و تمدید)؛ engine دوم از شروع سر باز می‌زند |
 | W-01 | نویسنده ClickHouse برای snapshots، flow_events، flow_10m، quality_issues |
 | R-01 | ضبط روزانه خروجی collector (مبنای بازپخش و بک‌تست آینده) |
 | Q-01 | داشبورد Grafana: تأخیر، نرخ رخدادهای کیفیت، سن داده |

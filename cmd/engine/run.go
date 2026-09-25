@@ -387,3 +387,49 @@ func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec
 	}
 	return err
 }
+
+// leaseBucket holds the single-engine lease (P-02); the key is the durable's name.
+const leaseBucket = "engine_lease"
+
+// leaser is what runLeased needs from *bus.JetStream.
+type leaser interface {
+	AcquireLease(ctx context.Context, bucket, key, holder string, ttl time.Duration) (*bus.Lease, error)
+}
+
+// runLeased runs the NATS engine only while it holds the single-engine lease: it refuses to
+// start (bus.ErrLeaseHeld) when another engine holds it, and stops with bus.ErrLeaseLost when
+// the lease is lost while running (it may have been taken over). Two engines on one durable
+// would each see only part of the snapshots.
+func runLeased(ctx context.Context, js interface {
+	jsBus
+	leaser
+}, p *processor, spec bus.ConsumerSpec, exitWhenIdle bool, holder string, ttl time.Duration) error {
+	lease, err := js.AcquireLease(ctx, leaseBucket, spec.Durable, holder, ttl)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := lease.Release(rctx); err != nil {
+			log.Printf("engine: release lease: %v", err)
+		}
+	}()
+	log.Printf("engine: holding lease %s/%s as %s (ttl %s)", leaseBucket, spec.Durable, holder, ttl)
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-lease.Lost():
+			cancel()
+		case <-lctx.Done():
+		}
+	}()
+	err = p.runNATS(lctx, js, spec, exitWhenIdle)
+	select {
+	case <-lease.Lost():
+		return fmt.Errorf("stopping: %w (another engine may have taken over)", bus.ErrLeaseLost)
+	default:
+	}
+	return err
+}
