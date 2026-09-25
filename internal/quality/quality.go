@@ -16,9 +16,10 @@ const (
 	CumulativeDecrease = "CUMULATIVE_DECREASE" // a day-to-date total went down within the same day
 	SideMismatch       = "SIDE_MISMATCH"       // buy-side (or sell-side) volume ≠ total volume delta
 	TimeEstimated      = "SOURCE_TIME_ESTIMATED"
-	Undecodable        = "UNDECODABLE"      // a bus message is not a valid snapshot; dropped, never retried
-	PoisonSuspect      = "POISON_SUSPECT"   // an MD message was delivered 5 times unprocessed; engine stopped
-	DayStartMissed     = "DAY_START_MISSED" // the day's first baseline is not a pre-open zero-volume snapshot: day totals partial
+	Undecodable        = "UNDECODABLE"        // a bus message is not a valid snapshot; dropped, never retried
+	PoisonSuspect      = "POISON_SUSPECT"     // an MD message was delivered 5 times unprocessed; engine stopped
+	DayStartMissed     = "DAY_START_MISSED"   // the day's first baseline is not a pre-open zero-volume snapshot: day totals partial
+	PrevDayCarryover   = "PREV_DAY_CARRYOVER" // a pre-open snapshot shows day activity: the source's previous-day totals, never a baseline
 )
 
 func issue(s *model.Snapshot, code, detail string) model.QualityIssue {
@@ -57,6 +58,11 @@ type Delta struct {
 // DayStart reports that the day's first accepted baseline cannot prove the day complete.
 func DayStart(s *model.Snapshot, detail string) model.QualityIssue {
 	return issue(s, DayStartMissed, detail)
+}
+
+// Carryover reports a pre-open snapshot showing the previous day's totals (never a baseline).
+func Carryover(s *model.Snapshot, detail string) model.QualityIssue {
+	return issue(s, PrevDayCarryover, detail)
 }
 
 // EarlierDay reports cur as OUT_OF_ORDER because its trading day precedes prev's.

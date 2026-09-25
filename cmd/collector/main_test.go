@@ -97,8 +97,9 @@ func TestPublishFilter(t *testing.T) {
 	}
 }
 
-// End to end with the engine rule: the pre-open baseline that still carries yesterday's totals
-// is published, and the engine marks that day partial instead of silently skipping it.
+// End to end with the engine rule: the pre-open snapshot that still carries yesterday's totals
+// is published, and the engine reports it as PREV_DAY_CARRYOVER (never a baseline; owner
+// decision on PR #3) instead of silently skipping it.
 func TestYesterdaysTotalsPreOpenBaselineReachesLateStartRule(t *testing.T) {
 	cal := calendar.Default().WithInstruments(map[string]string{"IRSTOCK": "stock"})
 	f := newPublishFilter(cal)
@@ -114,10 +115,10 @@ func TestYesterdaysTotalsPreOpenBaselineReachesLateStartRule(t *testing.T) {
 	r := flow.New(cfg).Process(pre)
 	found := false
 	for _, i := range r.Issues {
-		found = found || i.Code == quality.DayStartMissed
+		found = found || i.Code == quality.PrevDayCarryover
 	}
-	if !found {
-		t.Fatalf("engine did not flag the day: %+v", r.Issues)
+	if !found || r.Game != nil {
+		t.Fatalf("engine did not report the carryover: %+v", r.Issues)
 	}
 }
 

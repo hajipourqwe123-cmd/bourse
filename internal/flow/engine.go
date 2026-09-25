@@ -67,9 +67,10 @@ type symState struct {
 
 // Engine is NOT safe for concurrent use; shard instruments across engines by InsCode.
 type Engine struct {
-	cfg    Config
-	state  map[string]*symState
-	estDay map[string]string // trading day SOURCE_TIME_ESTIMATED was last reported, per instrument
+	cfg      Config
+	state    map[string]*symState
+	estDay   map[string]string // trading day SOURCE_TIME_ESTIMATED was last reported, per instrument
+	carryDay map[string]string // trading day PREV_DAY_CARRYOVER was last reported, per instrument
 }
 
 // New returns an engine with cfg (a nil calendar means the embedded one).
@@ -80,7 +81,7 @@ func New(cfg Config) *Engine {
 	if cfg.GapAfter <= 0 {
 		cfg.GapAfter = 30 * time.Second
 	}
-	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}}
+	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}, carryDay: map[string]string{}}
 }
 
 func (e *Engine) band(avg int64) model.Band {
@@ -126,23 +127,39 @@ func (e *Engine) Process(s model.Snapshot) Result {
 		r.Issues = append(r.Issues, quality.EarlierDay(&s, st.prev))
 		return r
 	}
+	// Before the instrument's own open nothing trades: a snapshot showing day activity (volume,
+	// value or trade count ≠ 0) is the source's previous-day carryover, never a baseline nor an
+	// interval, reported once per instrument and day (owner decision on DL-01, PR #3). A zero one
+	// is a valid day baseline even after carryover polls.
+	zero := s.Volume == 0 && s.Value == 0 && s.TradeCount == 0
+	if open && s.SourceTime.Before(sess.Open) && !zero {
+		if e.carryDay[s.InsCode] != day {
+			e.carryDay[s.InsCode] = day
+			r.Issues = append(r.Issues, quality.Carryover(&s, fmt.Sprintf(
+				"pre-open snapshot at %s shows day volume %d, value %d, trades %d before the %s open (%s): previous-day totals, not a baseline",
+				s.SourceTime.In(tehran.Loc).Format("15:04:05"), s.Volume, s.Value, s.TradeCount, class,
+				sess.Open.In(tehran.Loc).Format("15:04"))))
+		}
+		return r
+	}
 	if st == nil || st.day != day || st.prev == nil {
 		st = &symState{day: day, game: model.GameTotals{InsCode: s.InsCode, Class: class, Day: day}}
 		e.state[s.InsCode] = st
 		cp := s
 		st.prev = &cp
 		// Late-start rule: the day is complete only if this first accepted baseline was taken
-		// before the instrument's own open with zero day-to-date volume. Otherwise trades before
-		// it are missing from every total of the day (over-marking is accepted).
-		preOpenZero := s.Volume == 0 && (!open || s.SourceTime.Before(sess.Open))
+		// before the instrument's own open with zero day-to-date volume, value and trade count.
+		// Otherwise trades before it are missing from every total of the day (over-marking is
+		// accepted). Pre-open carryover never gets here (above).
+		preOpenZero := zero && (!open || s.SourceTime.Before(sess.Open))
 		if !preOpenZero {
 			st.game.Partial = true
 			st.partialWin = windowStart(sess, open, s.SourceTime)
 			at := s.SourceTime.In(tehran.Loc).Format("15:04:05")
 			var why string
 			switch {
-			case s.Volume > 0:
-				why = fmt.Sprintf("already has day volume %d: trades before it are not counted", s.Volume)
+			case !zero:
+				why = fmt.Sprintf("already has day volume %d, value %d, trades %d: trades before it are not counted", s.Volume, s.Value, s.TradeCount)
 			case open:
 				why = fmt.Sprintf("was taken after the %s session open (%s), so completeness cannot be proven",
 					class, sess.Open.In(tehran.Loc).Format("15:04"))

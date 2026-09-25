@@ -661,3 +661,15 @@ func TestSyntheticPredicateCoversEarlyData(t *testing.T) {
 		t.Errorf("shown: radar %+v issues %d syn %v, want labelled", r, st.Summary().Issues, st.Summary().Syn)
 	}
 }
+
+// Trade count alone is day activity: a pre-open snapshot with only trades ≠ 0 is carryover
+// (the engine's PREV_DAY_CARRYOVER definition).
+func TestPreOpenCarryoverTradeCountOnly(t *testing.T) {
+	st := testState()
+	sn := snap("S1", "08:50:00", 1, 1, 0, 0)
+	sn.TradeCount = 3
+	st.ApplySnapshot(sn)
+	if s := st.Summary(); s.Carryover != 1 || s.Instruments != 0 {
+		t.Errorf("carryover %d instruments %d, want 1/0", s.Carryover, s.Instruments)
+	}
+}

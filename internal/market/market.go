@@ -316,10 +316,11 @@ func (s *State) get(ins string) *inst {
 	return in
 }
 
-// showsTrading reports whether a snapshot shows trading today; an unknown volume counts as
-// trading (its flow cannot be assumed zero).
+// showsTrading reports whether a snapshot shows day activity (volume, value or trade count ≠ 0,
+// as the engine's carryover rule); an unknown volume counts as activity (its flow cannot be
+// assumed zero).
 func showsTrading(sn *model.Snapshot) bool {
-	return !sn.Has(model.FVolume) || sn.Volume > 0 || (sn.Has(model.FValue) && sn.Value > 0)
+	return !sn.Has(model.FVolume) || sn.Volume > 0 || (sn.Has(model.FValue) && sn.Value > 0) || sn.TradeCount > 0
 }
 
 // carryover reports a snapshot taken before the instrument's own open that already shows

@@ -58,7 +58,6 @@ func TestLateStartRule(t *testing.T) {
 		{"late start: first baseline 09:05 with volume", "IRSTOCK", tt("2026-09-26", "09:05:00"), tt("2026-09-26", "09:05:05"), 1_000_000, true, true},
 		{"pre-open zero baseline 08:59:55", "IRSTOCK", tt("2026-09-26", "08:59:55"), tt("2026-09-26", "09:00:05"), 0, false, false},
 		// The missing activity lies before the 08:50 window holding the baseline: 09:00 is complete.
-		{"pre-open non-zero baseline 08:59:55 (yesterday's totals)", "IRSTOCK", tt("2026-09-26", "08:59:55"), tt("2026-09-26", "09:00:05"), 1_000_000, true, false},
 		{"zero-volume baseline after the open", "IRSTOCK", tt("2026-09-26", "09:10:00"), tt("2026-09-26", "09:10:05"), 0, true, true},
 		{"gold fund: 11:59:55 zero baseline (its own open is 12:00)", "IRGOLD", tt("2026-09-26", "11:59:55"), tt("2026-09-26", "12:00:05"), 0, false, false},
 		{"gold fund: first baseline 12:05 with volume", "IRGOLD", tt("2026-09-26", "12:05:00"), tt("2026-09-26", "12:05:05"), 1_000_000, true, true},
@@ -172,9 +171,13 @@ func codes(r Result) map[string]bool {
 // (b) A complete day where a count glitch at 09:00:10 drops 300,000 shares.
 func TestRebaselineMarksPartial(t *testing.T) {
 	e := sessEngine()
-	e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900))
+	// Since the owner's decision on PR #3 the 08:59:55 carryover is never a baseline: the
+	// 09:00:10 snapshot is the first accepted one, a late baseline (DAY_START_MISSED).
+	if r := e.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900)); !codes(r)[quality.PrevDayCarryover] {
+		t.Fatalf("setup: %+v", r.Issues)
+	}
 	r := e.Process(sn("IRSTOCK", tt("2026-09-26", "09:00:10"), 10_000, 200_000, 120_000, 120_000, 20, 20))
-	if !codes(r)[quality.CumulativeDecrease] {
+	if !codes(r)[quality.DayStartMissed] || codes(r)[quality.CumulativeDecrease] {
 		t.Fatalf("setup: %+v", r.Issues)
 	}
 	r = e.Process(sn("IRSTOCK", tt("2026-09-26", "09:00:15"), 10_000, 500_000, 420_000, 320_000, 21, 20))
@@ -290,5 +293,88 @@ func TestStalePreOpenAndEstimated(t *testing.T) {
 	s.IngestTime, s.SourceTimeEstimated = tt("2026-09-26", "10:05:00"), true
 	if c := codes(e.Process(s)); c[quality.Stale] || !c[quality.TimeEstimated] {
 		t.Errorf("estimated time: %v", c)
+	}
+}
+
+// Owner decision on PR #3 (DL-01): before the instrument's own open, a snapshot with volume,
+// value and trade count all zero is a valid day baseline even after carryover polls; non-zero
+// pre-open snapshots are previous-day carryover (one PREV_DAY_CARRYOVER per instrument and day,
+// never a baseline); no zero before the open leaves the day partial.
+func TestPreOpenCarryover(t *testing.T) {
+	carry := func(at string, vol, trades int64) model.Snapshot {
+		n := int64(0)
+		if vol > 0 {
+			n = 900
+		}
+		s := sn("IRSTOCK", tt("2026-09-26", at), 10_000, vol, vol*6/10, vol*6/10, n, n)
+		s.TradeCount = trades
+		return s
+	}
+	count := func(rs []Result, code string) (n int) {
+		for _, r := range rs {
+			for _, i := range r.Issues {
+				if i.Code == code {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	trade := sn("IRSTOCK", tt("2026-09-26", "09:00:05"), 10_000, 300_000, 300_000, 200_000, 1, 0)
+	trade.TradeCount = 12
+
+	// (1) Carryover polls, then a zero pre-open snapshot: complete day.
+	e := sessEngine()
+	rs := []Result{e.Process(carry("08:50:00", 5_000_000, 3_000)), e.Process(carry("08:55:00", 5_000_000, 3_000)),
+		e.Process(carry("08:58:00", 0, 0)), e.Process(trade)}
+	if n := count(rs, quality.PrevDayCarryover); n != 1 {
+		t.Errorf("(1) PREV_DAY_CARRYOVER x%d, want once per instrument and day", n)
+	}
+	if count(rs, quality.DayStartMissed) != 0 || count(rs, quality.CumulativeDecrease) != 0 || rs[0].Game != nil || rs[1].Game != nil {
+		t.Errorf("(1) carryover must be neither a baseline nor an interval: %+v", rs)
+	}
+	if g := rs[3].Game; g == nil || g.Partial || g.NetHot != 3_000_000_000 {
+		t.Errorf("(1) game %+v, want complete (zero pre-open baseline after carryover)", g)
+	}
+
+	// (2) Zero pre-open snapshot directly: complete, no carryover issue.
+	e = sessEngine()
+	rs = []Result{e.Process(carry("08:58:00", 0, 0)), e.Process(trade)}
+	if count(rs, quality.PrevDayCarryover) != 0 || rs[1].Game == nil || rs[1].Game.Partial {
+		t.Errorf("(2) zero baseline: %+v", rs)
+	}
+
+	// (3) Carryover only, no zero before the open: the first snapshot after the open is a late
+	// baseline, the day partial.
+	e = sessEngine()
+	rs = []Result{e.Process(carry("08:50:00", 5_000_000, 3_000)), e.Process(trade)}
+	next := sn("IRSTOCK", tt("2026-09-26", "09:00:10"), 10_000, 600_000, 600_000, 200_000, 2, 0)
+	rs = append(rs, e.Process(next))
+	if count(rs, quality.PrevDayCarryover) != 1 || !hasIssue(rs[1], quality.DayStartMissed) || rs[2].Game == nil || !rs[2].Game.Partial {
+		t.Errorf("(3) no zero before the open: %+v", rs)
+	}
+
+	// Any non-zero field is activity: value only, or trade count only.
+	for name, s := range map[string]model.Snapshot{"trades only": carry("08:55:00", 0, 7), "value only": func() model.Snapshot {
+		c := carry("08:55:00", 0, 0)
+		c.Value = 1
+		return c
+	}()} {
+		e = sessEngine()
+		if r := e.Process(s); !hasIssue(r, quality.PrevDayCarryover) {
+			t.Errorf("%s: not treated as carryover: %+v", name, r.Issues)
+		}
+		if r := e.Process(trade); !hasIssue(r, quality.DayStartMissed) {
+			t.Errorf("%s: carryover used as the baseline", name)
+		}
+	}
+
+	// Reported again on the next trading day.
+	e = sessEngine()
+	e.Process(carry("08:50:00", 5_000_000, 3_000))
+	c2 := carry("08:50:00", 5_000_000, 3_000)
+	c2.SourceTime, c2.IngestTime = tt("2026-09-27", "08:50:00"), tt("2026-09-27", "08:50:01")
+	if r := e.Process(c2); !hasIssue(r, quality.PrevDayCarryover) {
+		t.Error("carryover of the next day not reported")
 	}
 }
