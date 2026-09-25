@@ -38,8 +38,9 @@ make down
 
 ```bash
 make build
-BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine
-BUS=nats SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector
+BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (فقط یک نمونه)
+# داده ساختگی فقط روی پشته محلی دورریختنی و با اجازه صریح (قاعده ۵):
+ALLOW_SYNTHETIC_ON_BUS=1 BUS=nats SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector
 go run ./cmd/syngen -n 300 > /tmp/syn300.ndjson                        # بار آزمایشی ۳۰۰ نماد
 ```
 

@@ -147,6 +147,28 @@ func TestOutOfOrderIgnored(t *testing.T) {
 	}
 }
 
+// A late snapshot from the previous day must not wipe today's totals (it used to reset state).
+func TestEarlierDaySnapshotIgnored(t *testing.T) {
+	e := New(DefaultConfig())
+	e.Process(snap(t0, 10_000, 1_000_000, 600_000, 600_000, 50, 60))
+	// +300,000 shares; one new real buyer takes all of them: 300,000 × 10,000 = 3,000,000,000 rial (hot).
+	r1 := e.Process(snap(t0.Add(5*time.Second), 10_000, 1_300_000, 900_000, 700_000, 51, 60))
+	if r1.Game == nil || r1.Game.NetHot != 3_000_000_000 {
+		t.Fatalf("setup: game %+v", r1.Game)
+	}
+	late := e.Process(snap(t0.Add(-24*time.Hour), 9_000, 5_000_000, 2_000_000, 2_000_000, 400, 400))
+	if !hasIssue(late, quality.OutOfOrder) || late.Game != nil || len(late.Events) != 0 {
+		t.Fatalf("earlier-day snapshot must be OUT_OF_ORDER with no metric: %+v", late)
+	}
+	// Today continues from the last accepted snapshot: +100,000 shares; buy side has no new buyer
+	// (unattributed), sell side one new seller at 100,000 × 10,000 = 1,000,000,000 rial (hot-plus),
+	// so today's NetHot stays 3,000,000,000.
+	r2 := e.Process(snap(t0.Add(10*time.Second), 10_000, 1_400_000, 1_000_000, 800_000, 51, 61))
+	if r2.Game == nil || r2.Game.Day != "2026-09-23" || r2.Game.NetHot != 3_000_000_000 || r2.Game.NetHotPlus != -1_000_000_000 {
+		t.Fatalf("today's totals were reset by the late snapshot: %+v", r2.Game)
+	}
+}
+
 func TestNewTradingDayResets(t *testing.T) {
 	e := New(DefaultConfig())
 	e.Process(snap(t0, 10_000, 1_000_000, 600_000, 600_000, 50, 60))

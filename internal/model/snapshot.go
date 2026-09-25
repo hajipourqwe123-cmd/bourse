@@ -4,7 +4,12 @@
 // Cumulative fields (Volume, Value, Ind*/Inst*) are day-to-date totals as published by the source.
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
 
 // Level is one level of the order book.
 type Level struct {
@@ -81,3 +86,33 @@ const (
 
 // FlowFields are required for any real-person money-flow metric.
 var FlowFields = []string{FPriceLast, FVolume, FValue, FIndBuyVol, FIndSellVol, FIndBuyCount, FIndSellCount}
+
+// DecodeSnapshot parses one canonical snapshot and rejects payloads that would otherwise be
+// silently zero-filled by encoding/json (rule 1): null or non-object JSON, an empty ins_code,
+// a missing source_time, or a flow field (FlowFields) that is absent or null without being
+// listed in "missing".
+func DecodeSnapshot(data []byte) (Snapshot, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return Snapshot{}, fmt.Errorf("not a JSON object: %w", err)
+	}
+	if raw == nil {
+		return Snapshot{}, errors.New("null snapshot")
+	}
+	var s Snapshot
+	if err := json.Unmarshal(data, &s); err != nil {
+		return Snapshot{}, err
+	}
+	if s.InsCode == "" {
+		return Snapshot{}, errors.New("empty ins_code")
+	}
+	if s.SourceTime.IsZero() {
+		return Snapshot{}, errors.New("missing source_time")
+	}
+	for _, f := range FlowFields {
+		if v, ok := raw[f]; (!ok || string(v) == "null") && s.Has(f) {
+			return Snapshot{}, fmt.Errorf("field %s absent but not listed in missing", f)
+		}
+	}
+	return s, nil
+}

@@ -131,8 +131,8 @@ func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64) 
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-	spec := bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter,
-		AckWait: 300 * time.Millisecond, MaxDeliver: 3, Backoff: []time.Duration{10 * time.Millisecond}}
+	spec := engineConsumer()
+	spec.AckWait, spec.Backoff = 300*time.Millisecond, []time.Duration{10 * time.Millisecond}
 	err := p.runNATS(ctx, js, spec)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatal("processor did not reach the ack floor in time")
@@ -230,7 +230,9 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 			t.Fatalf("baseline game totals look wrong: %+v", g)
 		}
 	}
-	for _, cut := range []uint64{121, 400, 580} { // prev day; today mid-morning; after the malformed msg
+	// Seqs 1..120 are the previous day, 121.. today; the malformed message is seq 372.
+	// Cuts are approximate (the first process may run a few messages past them).
+	for _, cut := range []uint64{60, 300, 580} {
 		gotLines, gotGame := scenario(t, in, func(js *bus.JetStream, n uint64) {
 			if err := runUntil(t, js, js, cut); err != nil {
 				t.Fatal(err)
@@ -250,14 +252,17 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 	}
 }
 
-// failingPub fails every publish once armed and the countdown of successful publishes is spent.
+// failingPub starts failing, permanently, at the first output with index > 0 (so part of that
+// snapshot's outputs are already stored) once okLeft publishes have succeeded.
 type failingPub struct {
 	*bus.JetStream
-	okLeft atomic.Int64
+	okLeft   atomic.Int64
+	failedID atomic.Value
 }
 
 func (f *failingPub) PublishID(subject, id string, v any) error {
-	if f.okLeft.Add(-1) < 0 {
+	if f.failedID.Load() != nil || f.okLeft.Add(-1) < 0 && !strings.HasSuffix(id, ":0") {
+		f.failedID.CompareAndSwap(nil, id)
 		return errors.New("nats down")
 	}
 	return f.JetStream.PublishID(subject, id, v)
@@ -280,6 +285,9 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "nats down") {
 			t.Fatalf("want abort with publish error, got %v", err)
 		}
+		if id, _ := fp.failedID.Load().(string); id == "" || strings.HasSuffix(id, ":0") {
+			t.Fatalf("failure must hit a later output of a snapshot, failed at %q", id)
+		}
 		floor, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable)
 		if floor == 0 || floor >= n {
 			t.Fatalf("ack floor %d: the failed snapshot must stay unacked", floor)
@@ -298,33 +306,62 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 	}
 }
 
-// A malformed snapshot is terminated with one UNDECODABLE quality issue and does not block
-// the next valid snapshot.
-func TestMalformedSnapshotReportedAndSkipped(t *testing.T) {
+// Malformed snapshots are terminated with exactly one UNDECODABLE quality issue each and do
+// not block, or leak zero-filled values into, the next valid snapshot.
+func TestMalformedSnapshotsReportedAndSkipped(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)
 	snaps := day("2026-09-23", 1, 3, 3)
-	feed(t, url, js, []any{snaps[0], rawMsg{"SYNTEST0000", `not json`}, snaps[1], snaps[2]})
-	if err := runUntil(t, js, js, 4); err != nil {
+	other, _ := json.Marshal(day("2026-09-23", 2, 1, 3)[1]) // SYNTEST0001 published on SYNTEST0000's subject
+	bad := []string{`not json`, `{}`, `null`, `{"ins_code":"SYNTEST0000"}`, string(other)}
+	in := []any{snaps[0]}
+	for _, b := range bad {
+		in = append(in, rawMsg{"SYNTEST0000", b})
+	}
+	in = append(in, snaps[1], snaps[2])
+	feed(t, url, js, in)
+	if err := runUntil(t, js, js, uint64(len(in))); err != nil {
 		t.Fatal(err)
 	}
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
 	jsc, _ := nc.JetStream()
-	m, err := jsc.GetLastMsg(bus.StreamQuality, "quality.SYNTEST0000")
+	sub, err := jsc.SubscribeSync("quality.>", nats.OrderedConsumer())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var iss model.QualityIssue
-	json.Unmarshal(m.Data, &iss)
-	if iss.Code != quality.Undecodable || !strings.Contains(iss.Detail, "stream seq 2") || iss.At.IsZero() {
-		t.Fatalf("issue %+v", iss)
+	var undecodable []string
+	for {
+		m, err := sub.NextMsg(300 * time.Millisecond)
+		if err != nil {
+			break
+		}
+		var iss model.QualityIssue
+		json.Unmarshal(m.Data, &iss)
+		if iss.Code == quality.Undecodable {
+			if m.Subject != "quality.SYNTEST0000" || iss.At.IsZero() {
+				t.Errorf("bad issue on %s: %+v", m.Subject, iss)
+			}
+			undecodable = append(undecodable, iss.Detail)
+		} else if iss.Code != quality.Stale {
+			t.Errorf("unexpected issue (zero-filled snapshot reached the engine?): %+v", iss)
+		}
+	}
+	if len(undecodable) != len(bad) {
+		t.Fatalf("%d UNDECODABLE issues, want %d: %q", len(undecodable), len(bad), undecodable)
+	}
+	for i, d := range undecodable {
+		if !strings.Contains(d, fmt.Sprintf("stream seq %d:", i+2)) {
+			t.Errorf("issue %d detail %q", i, d)
+		}
 	}
 	g, err := jsc.GetLastMsg(bus.StreamFlow, "flow.game.SYNTEST0000")
 	if err != nil {
-		t.Fatalf("no game totals after the malformed message: %v", err)
+		t.Fatalf("no game totals after the malformed messages: %v", err)
 	}
-	if g.Sequence == 0 {
-		t.Fatal("game totals missing")
+	var gt model.GameTotals
+	json.Unmarshal(g.Data, &gt)
+	if gt.Day != "2026-09-23" {
+		t.Fatalf("game totals %+v", gt)
 	}
 }

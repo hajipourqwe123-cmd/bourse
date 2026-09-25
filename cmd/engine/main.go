@@ -43,7 +43,7 @@ func main() {
 		go js.WatchLimits(ctx, 30*time.Second)
 		log.Printf("engine: bus=nats consumer=%s", engineDurable)
 		p := newProcessor(cfg, js)
-		err = p.runNATS(ctx, js, bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter})
+		err = p.runNATS(ctx, js, engineConsumer())
 		js.Close()
 		if err != nil {
 			log.Fatalf("engine: %v (unacked snapshot is redelivered to the next start)", err)

@@ -266,25 +266,29 @@ func TestReplayUpToAndFromStart(t *testing.T) {
 	publishN(t, j, "4", "5", "6")
 	collect := func(start time.Time, upTo uint64) string {
 		var s []string
-		if err := j.Replay(ctxT(t), StreamMD, "md.snap.>", start, upTo, func(m Msg) error {
+		last, err := j.Replay(ctxT(t), StreamMD, "md.snap.>", start, upTo, func(m Msg) error {
 			s = append(s, string(m.Data))
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.Join(s, "")
+		return fmt.Sprintf("%s@%d", strings.Join(s, ""), last)
 	}
-	if got := collect(time.Time{}, 4); got != "1234" {
+	if got := collect(time.Time{}, 4); got != "1234@4" {
 		t.Errorf("whole stream to 4: %q", got)
 	}
-	if got := collect(mid, 5); got != "45" {
+	if got := collect(mid, 5); got != "45@5" {
 		t.Errorf("from mid to 5: %q", got)
 	}
-	if got := collect(time.Time{}, 0); got != "" {
+	if got := collect(time.Time{}, 0); got != "@0" {
 		t.Errorf("upTo 0: %q", got)
 	}
-	if got := collect(time.Time{}, 99); got != "123456" {
+	if got := collect(time.Time{}, 99); got != "123456@6" {
 		t.Errorf("upTo beyond end: %q", got)
+	}
+	if got := collect(time.Now().Add(time.Hour), 6); got != "@0" {
+		t.Errorf("start after every message: %q", got)
 	}
 }
 
@@ -310,9 +314,19 @@ func TestStreamLimitsDiscardOldAndAreReported(t *testing.T) {
 	if n := strings.Count(logs.String(), "stream MD at"); n != 1 {
 		t.Errorf("limit logged %d times, want 1: %s", n, logs.String())
 	}
+	defer func() {
+		st, _ := j.js.Stream(ctxT(t), StreamMD)
+		if err := st.Purge(ctxT(t)); err != nil {
+			t.Fatal(err)
+		}
+		j.checkLimits(full)
+		if !strings.Contains(logs.String(), "stream MD back below MaxBytes") {
+			t.Errorf("recovery below the limit not logged: %s", logs.String())
+		}
+	}()
 	consumeUntil(t, j, mdSpec(), func(m Msg) error { got = append(got, m.StreamSeq); return nil },
 		func() bool { return true })
-	if want := fmt.Sprintf("stream sequences 2..%d were discarded", info.State.FirstSeq-1); !strings.Contains(logs.String(), want) {
+	if want := fmt.Sprintf("stream sequences 2..%d were not delivered", info.State.FirstSeq-1); !strings.Contains(logs.String(), want) {
 		t.Errorf("gap not logged (want %q): %s", want, logs.String())
 	}
 }
@@ -323,19 +337,25 @@ func TestConnectErrorHidesURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected connect error")
 	}
-	for _, leak := range []string{"s3cret", "alice", u} {
+	for _, leak := range []string{"s3cret", "alice:", u} {
 		if strings.Contains(err.Error(), leak) {
 			t.Fatalf("error leaks %q: %v", leak, err)
 		}
 	}
-	if got := redactURL("dial "+u+" failed for s3cret", u); strings.Contains(got, "s3cret") || strings.Contains(got, "alice") {
+	if got := redactURL("dial "+u+" failed for alice:s3cret@x", u); strings.Contains(got, "s3cret") || strings.Contains(got, "alice") {
 		t.Fatalf("redactURL: %s", got)
+	}
+	list := "nats://a:p1@h1:4222, nats://b:p2@h2:4222"
+	if got := redactURL("dial nats://b:p2@h2:4222: refused (pass p2, also p1)", list); strings.Contains(got, "p1") ||
+		strings.Contains(got, "p2") || strings.Contains(got, "@h2") || !strings.Contains(got, "dial <NATS_URL>: refused") {
+		t.Fatalf("redactURL server list: %s", got)
 	}
 }
 
 func TestRetry(t *testing.T) {
 	n, before := 0, 0
-	err := Retry([]time.Duration{0, 0, 0}, func() { before++ }, func() error {
+	ctx := context.Background()
+	err := Retry(ctx, []time.Duration{0, 0, 0}, func() { before++ }, func() error {
 		n++
 		if n < 3 {
 			return errors.New("x")
@@ -346,7 +366,50 @@ func TestRetry(t *testing.T) {
 		t.Fatalf("err=%v n=%d before=%d", err, n, before)
 	}
 	n = 0
-	if err := Retry([]time.Duration{0, 0}, nil, func() error { n++; return errors.New("x") }); err == nil || n != 3 {
+	if err := Retry(ctx, []time.Duration{0, 0}, nil, func() error { n++; return errors.New("x") }); err == nil || n != 3 {
 		t.Fatalf("exhausted: err=%v n=%d", err, n)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	n = 0
+	start := time.Now()
+	err = Retry(cctx, []time.Duration{time.Hour}, nil, func() error { n++; return errors.New("x") })
+	if !errors.Is(err, context.Canceled) || n != 1 || time.Since(start) > time.Second {
+		t.Fatalf("cancelled: err=%v n=%d", err, n)
+	}
+}
+
+// MaxDeliver < 0: a message keeps being redelivered until it succeeds (never terminated).
+func TestConsumeUnlimitedMaxDeliver(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, "x", "y")
+	spec := mdSpec()
+	spec.MaxDeliver = -1
+	calls := 0
+	var got []string
+	consumeUntil(t, j, spec, func(m Msg) error {
+		if string(m.Data) == "x" {
+			if calls++; calls < 7 {
+				return errors.New("transient")
+			}
+		}
+		got = append(got, string(m.Data))
+		return nil
+	}, func() bool { return len(got) == 2 })
+	if strings.Join(got, "") != "xy" || calls != 7 {
+		t.Fatalf("got %v after %d calls", got, calls)
+	}
+}
+
+func TestConsumerDefaults(t *testing.T) {
+	var c ConsumerSpec
+	c.defaults()
+	if c.AckWait != 10*time.Second || c.MaxDeliver != 5 || fmt.Sprint(c.Backoff) != "[1s 2s 4s 8s]" {
+		t.Fatalf("defaults %+v", c)
+	}
+	c = ConsumerSpec{MaxDeliver: -1}
+	c.defaults()
+	if c.MaxDeliver != -1 {
+		t.Fatalf("unlimited MaxDeliver overwritten: %d", c.MaxDeliver)
 	}
 }

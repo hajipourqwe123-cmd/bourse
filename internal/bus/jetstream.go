@@ -44,8 +44,10 @@ func DefaultStreams() []StreamSpec {
 	}
 }
 
-// DupWindow is how long JetStream remembers message IDs for de-duplication.
-const DupWindow = 5 * time.Minute
+// DupWindow is how long JetStream remembers message IDs for de-duplication. It must exceed the
+// worst case between a failed engine publish and the republish by the next process: publish
+// retries (~8s per output) + restart + state replay of one trading day + AckWait (minutes).
+const DupWindow = 30 * time.Minute
 
 // JetStream publishes to and consumes from NATS JetStream. Safe for concurrent Publish.
 type JetStream struct {
@@ -85,18 +87,27 @@ func ConnectJetStream(ctx context.Context, rawURL, name string, streams []Stream
 	return j, nil
 }
 
-// redactURL removes the URL, and any password inside it, from msg.
+// redactURL removes the URL (or comma-separated server list) from msg, then any credentials
+// of each server URL (userinfo and bare password) that still appear.
 func redactURL(msg, rawURL string) string {
 	if rawURL == "" {
 		return msg
 	}
+	servers := strings.Split(rawURL, ",")
 	msg = strings.ReplaceAll(msg, rawURL, "<NATS_URL>")
-	if u, err := url.Parse(rawURL); err == nil && u.User != nil {
+	for _, one := range servers {
+		if one = strings.TrimSpace(one); one != "" {
+			msg = strings.ReplaceAll(msg, one, "<NATS_URL>")
+		}
+	}
+	for _, one := range servers {
+		u, err := url.Parse(strings.TrimSpace(one))
+		if err != nil || u.User == nil {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, u.User.String()+"@", "***@")
 		if p, ok := u.User.Password(); ok && p != "" {
 			msg = strings.ReplaceAll(msg, p, "***")
-		}
-		if n := u.User.Username(); n != "" {
-			msg = strings.ReplaceAll(msg, n, "***")
 		}
 	}
 	return msg
@@ -151,6 +162,20 @@ func (j *JetStream) PublishID(subject, id string, v any) error {
 		return fmt.Errorf("jetstream: publish %s: %w", subject, err)
 	}
 	return nil
+}
+
+// StreamState returns the first sequence still stored in a stream and when it was stored
+// (sequences below it were discarded by limits or deleted).
+func (j *JetStream) StreamState(ctx context.Context, stream string) (firstSeq uint64, firstStored time.Time, err error) {
+	s, err := j.js.Stream(ctx, stream)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("jetstream: stream %s: %w", stream, err)
+	}
+	info, err := s.Info(ctx)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("jetstream: stream %s info: %w", stream, err)
+	}
+	return info.State.FirstSeq, info.State.FirstTime, nil
 }
 
 // StreamCreated returns the creation time of a stream (distinguishes re-created streams whose
@@ -236,6 +261,12 @@ func (e permanentError) Unwrap() error { return e.error }
 // Permanent marks a handler error as not retryable: the message is terminated.
 func Permanent(err error) error { return permanentError{err} }
 
+// IsPermanent reports whether err was marked with Permanent.
+func IsPermanent(err error) bool {
+	var p permanentError
+	return errors.As(err, &p)
+}
+
 type abortError struct{ error }
 
 func (e abortError) Unwrap() error { return e.error }
@@ -248,7 +279,7 @@ func Abort(err error) error { return abortError{err} }
 type ConsumerSpec struct {
 	Stream, Durable, Filter string
 	AckWait                 time.Duration   // default 10s; must exceed the handler's worst case (or use InProgress)
-	MaxDeliver              int             // default 5
+	MaxDeliver              int             // default 5; < 0 = unlimited (crash redeliveries also count)
 	Backoff                 []time.Duration // redelivery delay after the n-th failed attempt; default 1s,2s,4s,8s
 }
 
@@ -256,7 +287,7 @@ func (c *ConsumerSpec) defaults() {
 	if c.AckWait <= 0 {
 		c.AckWait = 10 * time.Second
 	}
-	if c.MaxDeliver <= 0 {
+	if c.MaxDeliver == 0 {
 		c.MaxDeliver = 5
 	}
 	if len(c.Backoff) == 0 {
@@ -296,10 +327,12 @@ func (j *JetStream) GetMsg(ctx context.Context, stream string, seq uint64) (subj
 
 // Replay calls fn, in stream order, for every message matching filter that was stored at or
 // after start (zero start = the whole stream) and whose sequence is <= upTo. Nothing is acked;
-// no durable consumer is touched. A fn error stops the replay and is returned.
-func (j *JetStream) Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(Msg) error) error {
+// no durable consumer is touched. It returns the last sequence passed to fn (0 if none); a fn
+// error stops the replay and is returned. The end of the stream is detected from the server's
+// pending count, not from a quiet fetch.
+func (j *JetStream) Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(Msg) error) (last uint64, err error) {
 	if upTo == 0 {
-		return nil
+		return 0, nil
 	}
 	cfg := jetstream.OrderedConsumerConfig{FilterSubjects: []string{filter}, DeliverPolicy: jetstream.DeliverAllPolicy}
 	if !start.IsZero() {
@@ -308,40 +341,46 @@ func (j *JetStream) Replay(ctx context.Context, stream, filter string, start tim
 	}
 	c, err := j.js.OrderedConsumer(ctx, stream, cfg)
 	if err != nil {
-		return fmt.Errorf("jetstream: replay %s: %w", stream, err)
+		return 0, fmt.Errorf("jetstream: replay %s: %w", stream, err)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return last, err
 		}
 		batch, err := c.Fetch(512, jetstream.FetchMaxWait(time.Second))
 		if err != nil {
-			return fmt.Errorf("jetstream: replay %s: fetch: %w", stream, err)
+			return last, fmt.Errorf("jetstream: replay %s: fetch: %w", stream, err)
 		}
 		got := 0
 		for m := range batch.Messages() {
 			got++
 			meta, err := m.Metadata()
 			if err != nil {
-				return fmt.Errorf("jetstream: replay %s: metadata: %w", stream, err)
+				return last, fmt.Errorf("jetstream: replay %s: metadata: %w", stream, err)
 			}
 			if meta.Sequence.Stream > upTo {
-				return nil
+				return last, nil
 			}
 			if err := fn(Msg{Subject: m.Subject(), Data: m.Data(), StreamSeq: meta.Sequence.Stream,
 				NumDelivered: meta.NumDelivered, Stored: meta.Timestamp}); err != nil {
-				return err
+				return last, err
 			}
-			if meta.Sequence.Stream == upTo {
-				return nil
+			last = meta.Sequence.Stream
+			if last == upTo || meta.NumPending == 0 {
+				return last, nil
 			}
 		}
 		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-			return fmt.Errorf("jetstream: replay %s: %w", stream, err)
+			return last, fmt.Errorf("jetstream: replay %s: %w", stream, err)
 		}
 		if got == 0 {
-			// Nothing left before upTo (the message at upTo was deleted or discarded).
-			return nil
+			info, err := c.Info(ctx)
+			if err != nil {
+				return last, fmt.Errorf("jetstream: replay %s: info: %w", stream, err)
+			}
+			if info.NumPending == 0 {
+				return last, nil // nothing (left) at or after start
+			}
 		}
 	}
 }
@@ -411,7 +450,7 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 		}
 		seq := meta.Sequence.Stream
 		if detectGaps && last != 0 && seq > last+1 && meta.NumDelivered == 1 {
-			log.Printf("jetstream: %s/%s: stream sequences %d..%d were discarded before delivery (stream limits); those messages are lost to this consumer",
+			log.Printf("jetstream: %s/%s: stream sequences %d..%d were not delivered to this consumer (discarded by stream limits, terminated after MaxDeliver, or taken by another instance)",
 				spec.Stream, spec.Durable, last+1, seq-1)
 		}
 		if seq > last {
@@ -433,7 +472,7 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 		case errors.As(herr, &perm):
 			log.Printf("jetstream: %s seq %d: permanent error, terminated: %v", m.Subject(), seq, herr)
 			_ = m.Term()
-		case meta.NumDelivered >= uint64(spec.MaxDeliver):
+		case spec.MaxDeliver > 0 && meta.NumDelivered >= uint64(spec.MaxDeliver):
 			log.Printf("jetstream: %s seq %d: failed %d deliveries, terminated: %v", m.Subject(), seq, meta.NumDelivered, herr)
 			_ = m.Term()
 		default:
@@ -454,8 +493,9 @@ func (j *JetStream) filterIsWholeStream(stream, filter string) bool {
 }
 
 // Retry calls f until it succeeds, sleeping backoff[i] between attempts (len(backoff)+1 attempts
-// in total) and calling beforeSleep (may be nil) before each sleep. It returns f's last error.
-func Retry(backoff []time.Duration, beforeSleep func(), f func() error) error {
+// in total) and calling beforeSleep (may be nil) before each sleep. It returns f's last error,
+// or, if ctx ends during a sleep, that error joined with ctx's.
+func Retry(ctx context.Context, backoff []time.Duration, beforeSleep func(), f func() error) error {
 	err := f()
 	for _, d := range backoff {
 		if err == nil {
@@ -464,7 +504,13 @@ func Retry(backoff []time.Duration, beforeSleep func(), f func() error) error {
 		if beforeSleep != nil {
 			beforeSleep()
 		}
-		time.Sleep(d)
+		t := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-t.C:
+		}
 		err = f()
 	}
 	return err

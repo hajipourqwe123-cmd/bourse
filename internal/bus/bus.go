@@ -10,16 +10,27 @@
 //     (MaxAckPending=1) because the flow engine is order-sensitive per instrument.
 //   - A handler error wrapped with Permanent (e.g. an undecodable payload) terminates the message
 //     (Term): it is logged and reported, never retried and never blocks the next message.
-//     Other handler errors are redelivered with backoff, at most MaxDeliver times, then terminated.
+//     Other handler errors are redelivered with backoff, at most MaxDeliver times (default 5),
+//     then terminated. Redeliveries after a crash or Abort count toward MaxDeliver too.
 //   - A handler error wrapped with Abort leaves the message unacked and stops the consumer;
 //     the process must exit non-zero. It is redelivered after AckWait to the next process.
+//
+// Engine specifics (cmd/engine):
+//   - Its durable has unlimited MaxDeliver: it has no transient errors (only Permanent or
+//     Abort), so a limit would only count crash redeliveries and silently drop a snapshot.
 //   - Once the engine has run Process() on a snapshot it must never Nak it: a redelivery would be
 //     rejected by the engine as OUT_OF_ORDER and the outputs not yet published would be lost.
 //     Instead it retries publishing the SAME computed outputs with bounded backoff (Retry), then
-//     aborts. Outputs carry deterministic message IDs (input stream + sequence + index), so a
-//     republish after a restart is de-duplicated by JetStream within the duplicate window.
-//   - On restart the engine rebuilds its in-memory state by replaying, without publishing, the
-//     current trading day up to the durable's ack floor (AckFloor, Replay), then resumes.
+//     aborts. Outputs carry deterministic message IDs (MD stream creation + sequence + index), so
+//     a republish after a restart is de-duplicated by JetStream within DupWindow (30 min).
+//   - It remembers the last MD sequence applied and published: a redelivered, already-applied
+//     sequence is acked without recomputing; sequences the consumer skipped are fetched and
+//     applied first, so state sees every stored snapshot exactly once, in order.
+//   - On restart it rebuilds its in-memory state by replaying, without publishing, the trading
+//     day of the snapshot at the durable's ack floor, up to that floor (AckFloor, Replay); if part
+//     of that day was already discarded, each instrument gets one RECOVERY_TRUNCATED issue.
+//   - Run exactly one engine per durable (stop the old process before starting a new one):
+//     two instances would each see only part of the snapshots.
 package bus
 
 import (

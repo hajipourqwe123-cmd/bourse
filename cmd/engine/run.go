@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
 
 	"bourse/internal/anomaly"
 	"bourse/internal/bus"
@@ -30,11 +33,19 @@ type processor struct {
 	radar *anomaly.Radar
 	pub   bus.Publisher
 	retry []time.Duration // publish backoff; len+1 attempts per output
+
+	// NATS path only.
+	js        jsBus
+	epoch     int64           // MD stream creation time: makes output IDs unique per stream lifetime
+	lastSeq   uint64          // highest MD sequence applied to state AND fully published (or reported undecodable)
+	truncated bool            // recovery found part of the day already discarded from MD
+	flagged   map[string]bool // instruments already given a RECOVERY_TRUNCATED issue
 }
 
 func newProcessor(cfg flow.Config, pub bus.Publisher) *processor {
 	return &processor{eng: flow.New(cfg), radar: anomaly.New(anomaly.DefaultConfig()), pub: pub,
-		retry: []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}}
+		retry:   []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second},
+		flagged: map[string]bool{}}
 }
 
 // compute runs one snapshot through the engine and radar. It mutates state exactly once per
@@ -70,11 +81,21 @@ type idPublisher interface {
 // publish sends outs in order. A failed output is retried (the SAME value, same message ID)
 // with bounded backoff, then the error is returned; outputs already sent are not resent.
 // idPrefix != "" gives output i the message ID idPrefix:i (JetStream de-duplication).
-func (p *processor) publish(outs []output, idPrefix string, beforeRetry func()) error {
+// keepAlive (may be nil) is called at least every second while publishing, so a slow but
+// progressing publish never outlives the consumer's AckWait.
+func (p *processor) publish(ctx context.Context, outs []output, idPrefix string, keepAlive func()) error {
 	idp, useID := p.pub.(idPublisher)
 	useID = useID && idPrefix != ""
+	last := time.Now()
+	alive := func() {
+		if keepAlive != nil && time.Since(last) >= time.Second {
+			keepAlive()
+			last = time.Now()
+		}
+	}
 	for i, o := range outs {
-		err := bus.Retry(p.retry, beforeRetry, func() error {
+		alive()
+		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if useID {
 				return idp.PublishID(o.subject, fmt.Sprintf("%s:%d", idPrefix, i), o.v)
 			}
@@ -85,6 +106,18 @@ func (p *processor) publish(outs []output, idPrefix string, beforeRetry func()) 
 		}
 	}
 	return nil
+}
+
+// decode parses a snapshot delivered on subject and checks that it belongs to that subject.
+func decode(subject string, data []byte) (model.Snapshot, error) {
+	s, err := model.DecodeSnapshot(data)
+	if err != nil {
+		return s, err
+	}
+	if want := strings.TrimPrefix(subject, "md.snap."); s.InsCode != want {
+		return s, fmt.Errorf("ins_code %q does not match subject %s", s.InsCode, subject)
+	}
+	return s, nil
 }
 
 // runNDJSON reads snapshot envelopes from r until EOF (BUS=ndjson).
@@ -100,13 +133,13 @@ func (p *processor) runNDJSON(r io.Reader) (n, bad int, err error) {
 			bad++
 			continue
 		}
-		var s model.Snapshot
-		if err := json.Unmarshal(env.Data, &s); err != nil {
+		s, err := decode(env.Subject, env.Data)
+		if err != nil {
 			bad++
 			continue
 		}
 		n++
-		if err := p.publish(p.compute(s), "", nil); err != nil {
+		if err := p.publish(context.Background(), p.compute(s), "", nil); err != nil {
 			return n, bad, fmt.Errorf("publish: %w", err)
 		}
 	}
@@ -118,37 +151,71 @@ const (
 	snapFilter    = "md.snap.>"
 )
 
-// jsBus is what the NATS path needs from *bus.JetStream (narrowed for tests).
+// engineConsumer is the durable consumer spec. MaxDeliver is unlimited on purpose: every
+// engine handler error is either Permanent (terminated at once) or Abort (process exits), so
+// the only redeliveries are after crashes/aborts, and counting those would silently drop a
+// snapshot whose outputs were never published. A crash loop is visible; a drop is not.
+func engineConsumer() bus.ConsumerSpec {
+	return bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter, MaxDeliver: -1}
+}
+
+// jsBus is what the NATS path needs from *bus.JetStream (narrowed so tests can fake it).
 type jsBus interface {
 	AckFloor(ctx context.Context, stream, durable string) (uint64, error)
 	GetMsg(ctx context.Context, stream string, seq uint64) (string, []byte, time.Time, error)
-	Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(bus.Msg) error) error
+	StreamState(ctx context.Context, stream string) (uint64, time.Time, error)
+	Replay(ctx context.Context, stream, filter string, start time.Time, upTo uint64, fn func(bus.Msg) error) (uint64, error)
 	StreamCreated(ctx context.Context, stream string) (time.Time, error)
 	Consume(ctx context.Context, spec bus.ConsumerSpec, fn func(bus.Msg) error) error
 }
 
+// recoveryStart picks where replay begins: 1h before the Tehran day start of the snapshot at
+// the ack floor, compared against stream STORE time (the margin keeps snapshots stored a little
+// before their source time), and never after the floor message's own store time (a source
+// clock running ahead must not skip the floor itself).
+func recoveryStart(floorSource, floorStored time.Time) time.Time {
+	start := tehran.DayStart(floorSource).Add(-time.Hour)
+	if floorStored.Before(start) {
+		start = floorStored
+	}
+	return start
+}
+
 // recoverState rebuilds engine and radar state after a restart: it replays, WITHOUT publishing,
 // md.snap.> from the start of the Tehran trading day of the last acknowledged snapshot up to the
-// durable's ack floor. Everything after the floor is still owned by the durable consumer.
-// The radar only re-warms on that day (its longer history is not restored).
-func (p *processor) recoverState(ctx context.Context, js jsBus) (replayed int, err error) {
-	floor, err := js.AckFloor(ctx, bus.StreamMD, engineDurable)
+// durable's ack floor. Everything after the floor is still owned by the durable consumer. The
+// radar only re-warms on that window (its longer history is not restored). Snapshots of the
+// previous day inside the 1h margin only rebuild that day's state; a later snapshot of today
+// resets the instrument, and an earlier-day snapshot after today's is OUT_OF_ORDER (flow).
+func (p *processor) recoverState(ctx context.Context) (replayed int, err error) {
+	floor, err := p.js.AckFloor(ctx, bus.StreamMD, engineDurable)
 	if err != nil || floor == 0 {
 		return 0, err
 	}
-	var start time.Time // zero = whole retained stream
-	if _, data, _, err := js.GetMsg(ctx, bus.StreamMD, floor); err != nil {
-		log.Printf("engine: recovery: message at ack floor %d unavailable (%v); replaying the whole stream", floor, err)
-	} else if s, err := decodeSnapshot(data); err != nil {
-		log.Printf("engine: recovery: message at ack floor %d undecodable; replaying the whole stream", floor)
-	} else {
-		// Stream store time is compared with a source-time day boundary: a 1h margin keeps
-		// snapshots stored slightly before their source time. Earlier-day snapshots that slip in
-		// are harmless: the engine resets each instrument on its first snapshot of a new day.
-		start = tehran.DayStart(s.SourceTime).Add(-time.Hour)
+	firstSeq, firstStored, err := p.js.StreamState(ctx, bus.StreamMD)
+	if err != nil {
+		return 0, err
 	}
-	err = js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
-		s, err := decodeSnapshot(m.Data)
+	var start time.Time // zero = whole retained stream
+	subj, data, stored, gerr := p.js.GetMsg(ctx, bus.StreamMD, floor)
+	switch {
+	case gerr != nil:
+		log.Printf("engine: recovery: message at ack floor %d unavailable (%v); replaying the whole stream", floor, gerr)
+	default:
+		if s, err := decode(subj, data); err == nil {
+			start = recoveryStart(s.SourceTime, stored)
+		} else { // it was terminated as UNDECODABLE: fall back to its store day
+			start = recoveryStart(stored, stored)
+		}
+	}
+	// Part of the window already gone (limits/age): state for today would be understated.
+	p.truncated = firstSeq > 1 && (start.IsZero() || firstStored.After(start))
+	if p.truncated {
+		log.Printf("engine: recovery: MD starts at seq %d stored %s, after the replay start; today's totals are incomplete and will be flagged RECOVERY_TRUNCATED",
+			firstSeq, firstStored.UTC().Format(time.RFC3339))
+	}
+	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
+		s, err := decode(m.Subject, m.Data)
 		if err != nil {
 			return nil // was terminated (and reported) when first consumed
 		}
@@ -156,46 +223,99 @@ func (p *processor) recoverState(ctx context.Context, js jsBus) (replayed int, e
 		replayed++
 		return nil
 	})
-	return replayed, err
-}
-
-func decodeSnapshot(data []byte) (model.Snapshot, error) {
-	var s model.Snapshot
-	err := json.Unmarshal(data, &s)
-	return s, err
-}
-
-// runNATS consumes md.snap.> through the durable "engine" consumer (BUS=nats). It returns on
-// ctx cancellation (nil) or when outputs cannot be published after retries (non-nil: exit 1).
-func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec) error {
-	n, err := p.recoverState(ctx, js)
 	if err != nil {
-		return fmt.Errorf("recover: %w", err)
+		return replayed, err
 	}
-	log.Printf("engine: recovered state from %d snapshots", n)
+	if gerr == nil && last != floor {
+		return replayed, fmt.Errorf("recovery replay stopped at seq %d before the ack floor %d", last, floor)
+	}
+	p.lastSeq = floor
+	return replayed, nil
+}
+
+// handle is the durable consumer's handler. It applies each MD sequence to state at most once
+// and in order: already-applied sequences (redelivery after a lost ack or a slow publish) are
+// acked without recomputing; sequences the consumer skipped (terminated elsewhere, a late ack
+// from a previous process) are fetched and applied first.
+func (p *processor) handle(ctx context.Context, m bus.Msg) error {
+	if m.StreamSeq <= p.lastSeq {
+		return nil // applied and fully published before: just ack again
+	}
+	if m.StreamSeq > p.lastSeq+1 {
+		if err := p.fillGap(ctx, m.StreamSeq); err != nil {
+			return err
+		}
+	}
+	return p.apply(ctx, m, m.InProgress)
+}
+
+func (p *processor) fillGap(ctx context.Context, upTo uint64) error {
+	from := p.lastSeq + 1
+	if first, _, err := p.js.StreamState(ctx, bus.StreamMD); err == nil && first > from {
+		log.Printf("engine: MD sequences %d..%d were discarded before this engine applied them", from, first-1)
+		from = first
+	}
+	for seq := from; seq < upTo; seq++ {
+		subj, data, stored, err := p.js.GetMsg(ctx, bus.StreamMD, seq)
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			log.Printf("engine: MD sequence %d is gone before this engine applied it", seq)
+			continue
+		}
+		if err != nil {
+			return bus.Abort(err)
+		}
+		log.Printf("engine: applying MD sequence %d that the consumer did not deliver", seq)
+		if err := p.apply(ctx, bus.Msg{Subject: subj, Data: data, StreamSeq: seq, Stored: stored}, nil); err != nil && !bus.IsPermanent(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// apply decodes, computes and publishes one MD message and records it in lastSeq.
+func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) error {
+	id := fmt.Sprintf("eng:%d:%d", p.epoch, m.StreamSeq)
+	s, derr := decode(m.Subject, m.Data)
+	if derr != nil {
+		iss := model.QualityIssue{InsCode: strings.TrimPrefix(m.Subject, "md.snap."), Code: quality.Undecodable,
+			Detail: fmt.Sprintf("stream seq %d: payload is not a valid snapshot: %v", m.StreamSeq, derr), At: m.Stored}
+		if err := p.publish(ctx, []output{{bus.SubjQuality(iss.InsCode), iss}}, id, keepAlive); err != nil {
+			return bus.Abort(err)
+		}
+		p.lastSeq = m.StreamSeq
+		return bus.Permanent(derr)
+	}
+	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
+	outs := p.compute(s)
+	if p.truncated && !p.flagged[s.InsCode] {
+		p.flagged[s.InsCode] = true
+		outs = append(outs, output{bus.SubjQuality(s.InsCode), model.QualityIssue{InsCode: s.InsCode, Code: quality.RecoveryTruncated,
+			Detail: "engine restarted after part of this trading day was discarded from the bus; day totals are incomplete", At: s.IngestTime}})
+	}
+	if err := p.publish(ctx, outs, id, keepAlive); err != nil {
+		return bus.Abort(err)
+	}
+	p.lastSeq = m.StreamSeq
+	return nil
+}
+
+// runNATS consumes md.snap.> through the durable "engine" consumer (BUS=nats). It returns nil
+// on ctx cancellation, or an error (exit non-zero) when outputs cannot be published.
+func (p *processor) runNATS(ctx context.Context, js jsBus, spec bus.ConsumerSpec) error {
+	p.js = js
 	created, err := js.StreamCreated(ctx, bus.StreamMD)
 	if err != nil {
 		return err
 	}
-	epoch := created.UnixNano()
-	err = js.Consume(ctx, spec, func(m bus.Msg) error {
-		s, derr := decodeSnapshot(m.Data)
-		if derr != nil {
-			iss := model.QualityIssue{InsCode: strings.TrimPrefix(m.Subject, "md.snap."), Code: quality.Undecodable,
-				Detail: fmt.Sprintf("stream seq %d: payload is not a snapshot: %v", m.StreamSeq, derr), At: m.Stored}
-			if err := p.publish([]output{{bus.SubjQuality(iss.InsCode), iss}}, fmt.Sprintf("eng:%d:%d", epoch, m.StreamSeq), m.InProgress); err != nil {
-				return bus.Abort(err)
-			}
-			return bus.Permanent(derr)
-		}
-		// From here on Process() has run: never Nak. Retry the same outputs, else abort.
-		if err := p.publish(p.compute(s), fmt.Sprintf("eng:%d:%d", epoch, m.StreamSeq), m.InProgress); err != nil {
-			return bus.Abort(err)
-		}
-		return nil
-	})
-	if ctx.Err() != nil {
-		return nil
+	p.epoch = created.UnixNano()
+	n, err := p.recoverState(ctx)
+	if err != nil {
+		return fmt.Errorf("recover: %w", err)
+	}
+	log.Printf("engine: recovered state from %d snapshots (ack floor %d)", n, p.lastSeq)
+	err = js.Consume(ctx, spec, func(m bus.Msg) error { return p.handle(ctx, m) })
+	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return nil // shutdown requested; an Abort error is still returned even during shutdown
 	}
 	return err
 }

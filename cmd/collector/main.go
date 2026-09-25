@@ -3,19 +3,23 @@
 //	SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson collector > snaps.ndjson
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
+//	                                         # (SYN* refused unless ALLOW_SYNTHETIC_ON_BUS=1)
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"bourse/internal/bus"
 	"bourse/internal/config"
+	"bourse/internal/model"
 	"bourse/internal/source"
 )
 
@@ -46,10 +50,13 @@ func run() int {
 
 	var pub bus.Publisher
 	var retry []time.Duration // NDJSON: a failed stdout write is not retried (it could tear a line)
+	var guard func(*model.Snapshot) error
 	switch kind := config.Str("BUS", "ndjson"); kind {
 	case "ndjson":
 		pub = bus.NewNDJSON(os.Stdout)
 	case "nats":
+		allow := config.Str("ALLOW_SYNTHETIC_ON_BUS", "") == "1"
+		guard = func(s *model.Snapshot) error { return busGuard(s, allow) }
 		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", bus.DefaultStreams())
 		if err != nil {
 			log.Fatalf("collector: %v", err)
@@ -86,8 +93,14 @@ func run() int {
 		}
 		backoff = time.Second
 		for i := range batch {
+			if guard != nil {
+				if err := guard(&batch[i]); err != nil {
+					log.Printf("collector: %v", err)
+					return 1
+				}
+			}
 			subj := bus.SubjSnapshot(batch[i].InsCode)
-			if err := bus.Retry(retry, nil, func() error { return pub.Publish(subj, batch[i]) }); err != nil {
+			if err := bus.Retry(ctx, retry, nil, func() error { return publishSnapshot(pub, subj, &batch[i]) }); err != nil {
 				log.Printf("collector: publish: %v", err)
 				return 1
 			}
@@ -106,4 +119,29 @@ func run() int {
 			return 0
 		}
 	}
+}
+
+// publishSnapshot publishes s; on JetStream with a message ID built from the instrument, source
+// time and ingest time, so a retried publish that was in fact stored is not stored twice, while
+// a re-poll of an unchanged snapshot (new ingest time) still reaches the engine.
+func publishSnapshot(pub bus.Publisher, subj string, s *model.Snapshot) error {
+	if idp, ok := pub.(interface {
+		PublishID(subject, id string, v any) error
+	}); ok {
+		return idp.PublishID(subj, fmt.Sprintf("snap:%s:%d:%d", s.InsCode, s.SourceTime.UnixNano(), s.IngestTime.UnixNano()), s)
+	}
+	return pub.Publish(subj, s)
+}
+
+// busGuard keeps SYNTHETIC data off the shared bus (rule 5: SYN* never reaches users, and the
+// bus feeds the gateway and the ClickHouse writer). Local experiments opt in explicitly with
+// ALLOW_SYNTHETIC_ON_BUS=1, on a disposable local stack only.
+func busGuard(s *model.Snapshot, allowSynthetic bool) error {
+	if allowSynthetic {
+		return nil
+	}
+	if s.Source == "synthetic" || strings.HasPrefix(s.InsCode, "SYN") || strings.HasPrefix(s.Symbol, "SYN") {
+		return fmt.Errorf("refusing to publish synthetic instrument %s to the bus (set ALLOW_SYNTHETIC_ON_BUS=1 only on a disposable local stack)", s.InsCode)
+	}
+	return nil
 }

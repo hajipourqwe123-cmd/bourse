@@ -16,7 +16,8 @@ const (
 	CumulativeDecrease = "CUMULATIVE_DECREASE" // a day-to-date total went down within the same day
 	SideMismatch       = "SIDE_MISMATCH"       // buy-side (or sell-side) volume ≠ total volume delta
 	TimeEstimated      = "SOURCE_TIME_ESTIMATED"
-	Undecodable        = "UNDECODABLE" // a bus message is not a valid snapshot; dropped, never retried
+	Undecodable        = "UNDECODABLE"        // a bus message is not a valid snapshot; dropped, never retried
+	RecoveryTruncated  = "RECOVERY_TRUNCATED" // engine restart could not replay the whole trading day
 )
 
 func issue(s *model.Snapshot, code, detail string) model.QualityIssue {
@@ -52,6 +53,12 @@ type Delta struct {
 
 // Diff computes cur − prev and returns issues when the pair is not usable.
 // ok=false means the pair MUST NOT feed any metric.
+// EarlierDay reports cur as OUT_OF_ORDER because its trading day precedes prev's.
+func EarlierDay(cur, prev *model.Snapshot) model.QualityIssue {
+	return issue(cur, OutOfOrder, fmt.Sprintf("source time %s is on an earlier trading day than %s",
+		cur.SourceTime.Format(time.RFC3339), prev.SourceTime.Format(time.RFC3339)))
+}
+
 func Diff(prev, cur *model.Snapshot) (d Delta, issues []model.QualityIssue, ok bool) {
 	if !cur.SourceTime.After(prev.SourceTime) {
 		return d, []model.QualityIssue{issue(cur, OutOfOrder,

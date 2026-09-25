@@ -90,6 +90,11 @@ func (e *Engine) Process(s model.Snapshot) Result {
 
 	st := e.state[s.InsCode]
 	day := tehran.TradingDay(s.SourceTime)
+	if st != nil && st.prev != nil && day < st.day { // YYYY-MM-DD compares chronologically
+		// A late snapshot of an earlier day must not reset today's state.
+		r.Issues = append(r.Issues, quality.EarlierDay(&s, st.prev))
+		return r
+	}
 	if st == nil || st.day != day || st.prev == nil {
 		st = &symState{day: day, game: model.GameTotals{InsCode: s.InsCode, Day: day}}
 		e.state[s.InsCode] = st
