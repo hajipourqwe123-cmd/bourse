@@ -2,6 +2,7 @@
 //
 //	SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson collector > snaps.ndjson
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
+//	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
 package main
 
 import (
@@ -10,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"bourse/internal/bus"
@@ -17,9 +19,12 @@ import (
 	"bourse/internal/source"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+// run returns the exit code; deferred cleanup (bus drain) runs before the process exits.
+func run() int {
 	log.SetOutput(os.Stderr)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var src source.Source
@@ -39,23 +44,39 @@ func main() {
 		log.Fatalf("unknown SOURCE %q", kind)
 	}
 
-	pub := bus.NewNDJSON(os.Stdout)
+	var pub bus.Publisher
+	var retry []time.Duration // NDJSON: a failed stdout write is not retried (it could tear a line)
+	switch kind := config.Str("BUS", "ndjson"); kind {
+	case "ndjson":
+		pub = bus.NewNDJSON(os.Stdout)
+	case "nats":
+		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", bus.DefaultStreams())
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		defer js.Close()
+		go js.WatchLimits(ctx, 30*time.Second)
+		pub = js
+		retry = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}
+	default:
+		log.Fatalf("collector: unknown BUS %q (want ndjson or nats)", kind)
+	}
 	interval := config.Dur("POLL_INTERVAL", 5*time.Second)
 	replayDelay := config.Dur("REPLAY_DELAY", 0)
 	backoff := time.Second
-	log.Printf("collector: source=%s interval=%s", src.Name(), interval)
+	log.Printf("collector: source=%s interval=%s bus=%s", src.Name(), interval, config.Str("BUS", "ndjson"))
 
 	for {
 		batch, err := src.Fetch(ctx)
 		if errors.Is(err, source.ErrDone) {
 			log.Printf("collector: source exhausted")
-			return
+			return 0
 		}
 		if err != nil {
 			log.Printf("collector: fetch error: %v (retry in %s)", err, backoff)
 			select {
 			case <-ctx.Done():
-				return
+				return 0
 			case <-time.After(backoff):
 			}
 			if backoff < time.Minute {
@@ -65,8 +86,10 @@ func main() {
 		}
 		backoff = time.Second
 		for i := range batch {
-			if err := pub.Publish(bus.SubjSnapshot(batch[i].InsCode), batch[i]); err != nil {
-				log.Fatalf("publish: %v", err)
+			subj := bus.SubjSnapshot(batch[i].InsCode)
+			if err := bus.Retry(retry, nil, func() error { return pub.Publish(subj, batch[i]) }); err != nil {
+				log.Printf("collector: publish: %v", err)
+				return 1
 			}
 		}
 		wait := interval
@@ -76,11 +99,11 @@ func main() {
 		if wait > 0 {
 			select {
 			case <-ctx.Done():
-				return
+				return 0
 			case <-time.After(wait):
 			}
 		} else if ctx.Err() != nil {
-			return
+			return 0
 		}
 	}
 }

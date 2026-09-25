@@ -12,7 +12,8 @@
 | ردیف ۱ هوش مصنوعی: رادار ناهنجاری و واگرایی (`internal/anomaly`) | آماده، ۵ آزمون |
 | آداپتور بازپخش (`replay`) | آماده، آزمون شده |
 | آداپتور سورس‌آرنا | **موقت**: نگاشت ۴ فیلد تأیید نشده؛ بدون توکن زنده آزمون نشده (وظیفه D-03) |
-| گذرگاه NATS، نویسنده ClickHouse، دروازه Centrifugo | اسپرینت ۱ و ۲ |
+| گذرگاه NATS JetStream (`BUS=nats`، `internal/bus`) | آماده (P-01)؛ بازیابی حالت پس از راه‌اندازی دوباره، آزمون با سرور NATS درون‌فرایندی |
+| نویسنده ClickHouse، دروازه Centrifugo | اسپرینت ۱ و ۲ |
 | `infra/docker-compose.yml` و DDL کلیک‌هاوس | اجرا و آزموده شده (I-01): هر ۵ سرویس سالم، ۴ جدول ساخته می‌شود |
 | رابط کاربری | اسپرینت ۲ |
 
@@ -31,6 +32,15 @@ make env           # یک بار: ساخت .env از .env.example با رمزه�
 make up            # بالا آوردن و صبر تا سالم شدن همه سرویس‌ها
 make ddl           # اعمال (دوباره) DDL کلیک‌هاوس؛ تکرارپذیر
 make down
+```
+
+اجرا روی NATS (پس از `make up`؛ پیش‌فرض همچنان NDJSON است):
+
+```bash
+make build
+BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine
+BUS=nats SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector
+go run ./cmd/syngen -n 300 > /tmp/syn300.ndjson                        # بار آزمایشی ۳۰۰ نماد
 ```
 
 اگر dockerd سقف فایل باز کمتر از 262144 دارد (خطای `error setting rlimit type 7`)، در `.env` مقدار `CLICKHOUSE_NOFILE` را برابر `ulimit -Hn` بگذارید.

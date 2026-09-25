@@ -16,6 +16,7 @@ const (
 	CumulativeDecrease = "CUMULATIVE_DECREASE" // a day-to-date total went down within the same day
 	SideMismatch       = "SIDE_MISMATCH"       // buy-side (or sell-side) volume ≠ total volume delta
 	TimeEstimated      = "SOURCE_TIME_ESTIMATED"
+	Undecodable        = "UNDECODABLE" // a bus message is not a valid snapshot; dropped, never retried
 )
 
 func issue(s *model.Snapshot, code, detail string) model.QualityIssue {

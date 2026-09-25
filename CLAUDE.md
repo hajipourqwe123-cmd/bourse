@@ -14,7 +14,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - internal/flow      hot money / hot-plus / market game / 10-min matrix (ADR-0004)
 - internal/anomaly   AI tier 1: per-symbol EWMA anomaly radar (AI-01), flow–price divergence (AI-02)
 - internal/source    adapters: replay (done), sourcearena (PROVISIONAL, docs/source-mapping.md)
-- internal/bus       Publisher interface + NDJSON; subjects in contracts/subjects.md
+- internal/bus       Publisher: NDJSON | JetStream (BUS=ndjson|nats); streams+ack rules in contracts/subjects.md
 - cmd/{collector,engine,syngen}; infra/ (compose, ClickHouse DDL, Centrifugo)
 
 ## Non-negotiable rules
@@ -33,5 +33,5 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - Do not Read testdata/*.ndjson or recordings/ (large); use `head -c` or jq summaries instead.
 
 ## Current state
-Sprint 0 done. Next: Sprint 1 (I-01 compose up, D-03 verify sourcearena fields with live token,
-P-01 NATS publisher, W-01 ClickHouse writer, R-01 daily recording, Q-01 Grafana, Q-02 hot-money accuracy).
+Sprint 0 done. Sprint 1: I-01 (compose up + DDL) and P-01 (JetStream bus) done. Next: D-03 verify
+sourcearena fields with live token, W-01 ClickHouse writer, R-01 daily recording, Q-01 Grafana, Q-02 hot-money accuracy.

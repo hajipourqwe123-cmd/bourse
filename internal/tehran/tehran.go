@@ -20,6 +20,12 @@ func mustLoad() *time.Location {
 // TradingDay returns the Tehran calendar date (YYYY-MM-DD) of t.
 func TradingDay(t time.Time) string { return t.In(Loc).Format("2006-01-02") }
 
+// DayStart returns 00:00 Tehran time of the Tehran calendar day containing t.
+func DayStart(t time.Time) time.Time {
+	lt := t.In(Loc)
+	return time.Date(lt.Year(), lt.Month(), lt.Day(), 0, 0, 0, 0, Loc)
+}
+
 // Floor10m returns the start of the 10-minute window containing t, in Tehran time.
 func Floor10m(t time.Time) time.Time {
 	lt := t.In(Loc)

@@ -1,20 +1,20 @@
-// engine consumes snapshot envelopes (NDJSON on stdin) and publishes flow metrics (NDJSON on stdout).
+// engine consumes snapshots and publishes flow metrics, quality issues and AI signals.
 //
-//	collector | engine
+//	collector | engine                      # BUS=ndjson (default): NDJSON stdin → stdout
+//	BUS=nats NATS_URL=nats://… engine       # durable JetStream consumer on md.snap.> → JetStream
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
 	"log"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"bourse/internal/anomaly"
 	"bourse/internal/bus"
 	"bourse/internal/config"
 	"bourse/internal/flow"
-	"bourse/internal/model"
 )
 
 func main() {
@@ -23,50 +23,32 @@ func main() {
 	cfg.HotThreshold = config.Int("HOT_THRESHOLD_RIAL", cfg.HotThreshold)
 	cfg.PlusThreshold = config.Int("PLUS_THRESHOLD_RIAL", cfg.PlusThreshold)
 	cfg.StaleAfter = config.Dur("STALE_AFTER", cfg.StaleAfter)
-	eng := flow.New(cfg)
-	radar := anomaly.New(anomaly.DefaultConfig())
-	pub := bus.NewNDJSON(os.Stdout)
 
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
-	var n, bad int
-	for sc.Scan() {
-		var env struct {
-			Subject string          `json:"subject"`
-			Data    json.RawMessage `json:"data"`
+	switch kind := config.Str("BUS", "ndjson"); kind {
+	case "ndjson":
+		p := newProcessor(cfg, bus.NewNDJSON(os.Stdout))
+		p.retry = nil // a failed stdout write is not retried (it could tear a line)
+		n, bad, err := p.runNDJSON(os.Stdin)
+		if err != nil {
+			log.Fatalf("engine: %v", err)
 		}
-		if err := json.Unmarshal(sc.Bytes(), &env); err != nil || !strings.HasPrefix(env.Subject, "md.snap.") {
-			bad++
-			continue
+		log.Printf("engine: processed %d snapshots, %d unreadable lines", n, bad)
+	case "nats":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "engine", bus.DefaultStreams())
+		if err != nil {
+			log.Fatalf("engine: %v", err)
 		}
-		var s model.Snapshot
-		if err := json.Unmarshal(env.Data, &s); err != nil {
-			bad++
-			continue
+		go js.WatchLimits(ctx, 30*time.Second)
+		log.Printf("engine: bus=nats consumer=%s", engineDurable)
+		p := newProcessor(cfg, js)
+		err = p.runNATS(ctx, js, bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter})
+		js.Close()
+		if err != nil {
+			log.Fatalf("engine: %v (unacked snapshot is redelivered to the next start)", err)
 		}
-		n++
-		r := eng.Process(s)
-		for _, i := range r.Issues {
-			pub.Publish(bus.SubjQuality(s.InsCode), i)
-		}
-		for _, e := range r.Events {
-			pub.Publish(bus.SubjFlow(s.InsCode), e)
-		}
-		if r.Game != nil {
-			pub.Publish(bus.SubjGame(s.InsCode), r.Game)
-		}
-		if r.Window != nil {
-			pub.Publish(bus.SubjWindow(s.InsCode), r.Window)
-			if ev := radar.Divergence(r.Window); ev != nil {
-				pub.Publish(bus.SubjAI(s.InsCode), ev)
-			}
-		}
-		for _, ev := range radar.Observe(r.Interval) {
-			pub.Publish(bus.SubjAI(s.InsCode), ev)
-		}
+	default:
+		log.Fatalf("engine: unknown BUS %q (want ndjson or nats)", kind)
 	}
-	if err := sc.Err(); err != nil {
-		log.Fatalf("engine: read: %v", err)
-	}
-	log.Printf("engine: processed %d snapshots, %d unreadable lines", n, bad)
 }

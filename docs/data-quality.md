@@ -7,6 +7,7 @@
 | `INCOMPLETE` | یکی از فیلدهای لازم جریان پول در `missing` است | بدون شاخص؛ snapshot مبنا نمی‌شود |
 | `OUT_OF_ORDER` | زمان منبع بعد از snapshot قبلی نیست | snapshot نادیده گرفته می‌شود |
 | `CUMULATIVE_DECREASE` | یکی از مقادیر تجمعی در همان روز کم شده | بازه حذف؛ snapshot فعلی مبنای جدید |
+| `UNDECODABLE` | پیام `md.snap.*` روی گذرگاه NATS قابل رمزگشایی به snapshot نیست | پیام کنار گذاشته می‌شود (`Term`)؛ بدون شاخص؛ `at` زمان ذخیره پیام در جریان |
 | `SIDE_MISMATCH` | مجموع خرید حقیقی+حقوقی (یا فروش) با Δحجم برابر نیست | بازه حذف؛ snapshot فعلی مبنای جدید |
 
 فیلدهای لازم جریان پول: `price_last`، `volume`، `value`، `ind_buy_vol`، `ind_sell_vol`، `ind_buy_count`، `ind_sell_count`.

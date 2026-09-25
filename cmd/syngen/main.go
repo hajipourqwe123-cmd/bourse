@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"math/rand"
 	"os"
 	"time"
@@ -26,6 +27,7 @@ func main() {
 	day := flag.String("day", "2026-09-23", "Tehran trading day (YYYY-MM-DD)")
 	step := flag.Duration("step", 5*time.Second, "snapshot interval")
 	seed := flag.Int64("seed", 1405, "random seed (deterministic output)")
+	n := flag.Int("n", 4, "number of instruments (>= 4; the first 4 are the fixed scenarios, more are load)")
 	flag.Parse()
 	d, err := time.ParseInLocation("2006-01-02", *day, tehran.Loc)
 	if err != nil {
@@ -44,6 +46,12 @@ func main() {
 		mk("SYNTHETIC0002", "SYN-RETAIL", 5_000, 0.0, 0, 0),       // retail noise only
 		mk("SYNTHETIC0003", "SYN-DISTRIB", 30_000, -0.00003, 0, 150),
 		mk("SYNTHETIC0004", "SYN-MIXED", 8_000, 0.00001, 300, 300),
+	}
+	for k := len(insts); k < *n; k++ { // load instruments: vary the four scenarios
+		base := insts[k%4]
+		in := mk(fmt.Sprintf("SYNTHETIC%04d", k+1), fmt.Sprintf("%s-%d", base.s.Symbol, k+1),
+			base.price*(0.5+float64(k%7)/4), base.drift, base.bigBuyEvery, base.bigSellEvery)
+		insts = append(insts, in)
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
