@@ -8,6 +8,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - `make synth` then `make demo` → replays a SYNTHETIC day through collector | engine → out.ndjson
 - `make env` (once) → `make up` → `make ddl`: local stack (infra/, ports on 127.0.0.1 only)
 - `make web` (npm ci, tsc, vitest, next build → web/out); `make gate2` (Chromium, throwaway NATS+Centrifugo)
+- `make demo-day` / `make demo-day-stop`: synthetic day on a DEMO_CLOCK (dev only; docs/demo-clock.md)
 
 ## Map
 - internal/model     canonical Snapshot + event types (rial int64, source_time vs ingest_time, Missing[])

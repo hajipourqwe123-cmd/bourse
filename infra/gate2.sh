@@ -7,6 +7,10 @@
 # Run from the repo root via `make gate2`. GATE_SECONDS (default 300) sets the measured window.
 set -eu
 cd "$(dirname "$0")/.."
+# Git Bash (Windows): keep MSYS from rewriting /container/paths in docker arguments; native
+# programs get Windows paths (D:/...).
+export MSYS_NO_PATHCONV=1
+root=$(pwd -W 2>/dev/null || pwd)
 out=gate2-out
 rm -rf "$out" && mkdir -p "$out"
 go build -o bin/ ./cmd/...
@@ -28,15 +32,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 docker rm -f "$nats" "$cent" >/dev/null 2>&1 || true
 docker run -d --rm --name "$nats" -p 127.0.0.1:4223:4222 -p 127.0.0.1:8223:8222 \
-	-v "$PWD/infra/nats:/etc/nats:ro" nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
+	-v "$root/infra/nats:/etc/nats:ro" nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
 docker run -d --rm --name "$cent" -p 127.0.0.1:8001:8000 -e CENTRIFUGO_API_KEY="$api_key" \
-	-e CENTRIFUGO_TOKEN_HMAC_SECRET_KEY="$secret" -v "$PWD/$out/centrifugo.json:/centrifugo/config.json:ro" \
+	-e CENTRIFUGO_TOKEN_HMAC_SECRET_KEY="$secret" -v "$root/$out/centrifugo.json:/centrifugo/config.json:ro" \
 	centrifugo/centrifugo:v5 centrifugo -c /centrifugo/config.json >/dev/null
 wait_url() { i=0; until curl -fs "$1" >/dev/null 2>&1; do i=$((i + 1)); [ "$i" -lt 150 ] || { echo "timeout: $1" >&2; exit 1; }; sleep 0.2; done; }
 wait_url "http://127.0.0.1:8223/healthz?js-enabled-only=true"
 wait_url "http://127.0.0.1:8001/health"
 
-export NATS_URL=nats://127.0.0.1:4223 BUS=nats ALLOW_SYNTHETIC_ON_BUS=1 SESSIONS_FILE="$PWD/$out/sessions.json"
+export NATS_URL=nats://127.0.0.1:4223 BUS=nats ALLOW_SYNTHETIC_ON_BUS=1 SESSIONS_FILE="$root/$out/sessions.json"
 bin/engine 2>"$out/engine.log" & pids="$pids $!"
 sleep 2 # the engine creates the streams
 GATEWAY_ADDR=127.0.0.1:8090 CENTRIFUGO_API_URL=http://127.0.0.1:8001/api CENTRIFUGO_API_KEY="$api_key" \

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"bourse/internal/calendar"
+	"bourse/internal/democlock"
 	"bourse/internal/model"
 	"bourse/internal/tehran"
 )
@@ -27,7 +28,7 @@ type inst struct {
 }
 
 func main() {
-	day := flag.String("day", "2026-09-23", "Tehran trading day (YYYY-MM-DD)")
+	day := flag.String("day", "2026-09-23", "Tehran trading day (YYYY-MM-DD, or last = the most recent trading day of the session calendar)")
 	step := flag.Duration("step", 5*time.Second, "snapshot interval")
 	seed := flag.Int64("seed", 1405, "random seed (deterministic output)")
 	n := flag.Int("n", 5, "number of instruments (>= 5; the first 5 are the fixed scenarios, more are load)")
@@ -35,12 +36,17 @@ func main() {
 	to := flag.String("to", "", "emit nothing after this Tehran time (HH:MM)")
 	mapOut := flag.String("map", "", "write a session calendar mapping the load instruments to a realistic class mix to this path (use it as SESSIONS_FILE everywhere)")
 	flag.Parse()
-	d, err := time.ParseInLocation("2006-01-02", *day, tehran.Loc)
+	cal, err := calendar.Load(os.Getenv("SESSIONS_FILE"))
 	if err != nil {
 		panic(err)
 	}
-	cal, err := calendar.Load(os.Getenv("SESSIONS_FILE"))
-	if err != nil {
+	d, err := time.ParseInLocation("2006-01-02", *day, tehran.Loc)
+	if *day == "last" {
+		var ok bool
+		if d, ok = democlock.LastTradingDay(cal, time.Now()); !ok {
+			panic("syngen: no trading day in the last 30 days of the session calendar")
+		}
+	} else if err != nil {
 		panic(err)
 	}
 	rng := rand.New(rand.NewSource(*seed))

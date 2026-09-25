@@ -7,4 +7,5 @@ out.ndjson
 /engine
 /syngen
 /gate2-out/
+/demo-out/
 /gateway

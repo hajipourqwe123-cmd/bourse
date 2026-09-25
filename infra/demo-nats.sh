@@ -4,10 +4,13 @@
 # engine durable/checkpoint state is left behind. Run from the repo root via `make demo-nats`.
 set -eu
 cd "$(dirname "$0")/.."
+# Git Bash (Windows): keep MSYS from rewriting /container/paths in docker arguments.
+export MSYS_NO_PATHCONV=1
+root=$(pwd -W 2>/dev/null || pwd)
 name=bourse-demo-nats
 docker rm -f "$name" >/dev/null 2>&1 || true
 docker run -d --rm --name "$name" -p 127.0.0.1:4223:4222 -p 127.0.0.1:8223:8222 \
-	-v "$PWD/infra/nats:/etc/nats:ro" nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
+	-v "$root/infra/nats:/etc/nats:ro" nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
 trap 'docker stop "$name" >/dev/null 2>&1 || true' EXIT
 i=0
 until curl -fs "http://127.0.0.1:8223/healthz?js-enabled-only=true" >/dev/null 2>&1; do
