@@ -40,3 +40,11 @@ export const IconPie = ({ size = 20 }: P) => (
 export const IconUser = ({ size = 20 }: P) => (
   <svg {...base(size)}><circle cx="12" cy="8" r="4" /><path d="M4 20c1.5-4 5-5 8-5s6.5 1 8 5" /></svg>
 );
+export const IconTheme = ({ size = 20, mode }: P & { mode: "auto" | "light" | "dark" }) =>
+  mode === "light" ? (
+    <svg {...base(size)}><circle cx="12" cy="12" r="4" /><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" /></svg>
+  ) : mode === "dark" ? (
+    <svg {...base(size)}><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" /></svg>
+  ) : (
+    <svg {...base(size)}><circle cx="12" cy="12" r="8" /><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" /></svg>
+  );

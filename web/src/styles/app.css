@@ -729,7 +729,7 @@ a:hover {
   font-size: 12px;
   font-weight: 700;
   line-height: 1.3;
-  color: var(--text);
+  color: var(--map-text);
 }
 
 .map-1 {

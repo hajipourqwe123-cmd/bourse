@@ -55,7 +55,7 @@ export function Unavailable({ title, reason }: { title?: string; reason: string 
   return (
     <div className="unavailable" role="note">
       <strong>{title ?? UNAVAILABLE}</strong>
-      <span>{reason}</span>
+      <span>{reason.replace(/([A-Z]+)-(\d+)/g, "$1\u2011$2") /* task IDs never break at the hyphen */}</span>
     </div>
   );
 }

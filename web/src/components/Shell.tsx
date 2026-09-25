@@ -1,8 +1,32 @@
 "use client";
+import { useEffect, useState } from "react";
 import { BASIS_LABEL } from "../lib/latency";
+import { applyMode, nextMode, readMode, THEME_LABEL, type ThemeMode } from "../lib/theme";
 import { clock, jalaliDate, num } from "../lib/format";
 import { useMarket, useNow } from "./hooks";
-import { IconBell, IconBriefcase, IconBuilding, IconFilter, IconGrid, IconPie, IconTarget, IconTrend, IconUser, Logo } from "./icons";
+import { IconBell, IconBriefcase, IconBuilding, IconFilter, IconGrid, IconPie, IconTarget, IconTheme, IconTrend, IconUser, Logo } from "./icons";
+
+/** Theme toggle: auto (system) → light → dark. */
+export function ThemeToggle() {
+  const [mode, setMode] = useState<ThemeMode>("auto");
+  useEffect(() => setMode(readMode()), []);
+  const label = `پوسته: ${THEME_LABEL[mode]}`;
+  return (
+    <button
+      className="icon-btn"
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={() => {
+        const m = nextMode(mode);
+        applyMode(m);
+        setMode(m);
+      }}
+    >
+      <IconTheme mode={mode} />
+    </button>
+  );
+}
 
 const NAV = [
   { label: "داشبورد بازار", icon: IconGrid, live: true },
@@ -146,6 +170,7 @@ export function Header({ query, onQuery }: { query: string; onQuery: (q: string)
         <span className="clock num desktop-only" aria-label="ساعت تهران">
           {clock(d)}
         </span>
+        <ThemeToggle />
         <button className="icon-btn" type="button" aria-label="اعلان‌ها (به‌زودی)" title="به‌زودی">
           <IconBell />
         </button>

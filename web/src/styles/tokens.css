@@ -1,7 +1,8 @@
 /* source: owner-approved design canvas v1
    Design tokens: the only colour, radius, size and font source for every component.
-   Dark theme (light theme later, same role names). Values verbatim from the owner. */
+   Dark theme (default) verbatim from the owner; light theme below (owner decision on PR #3). */
 :root {
+  color-scheme: dark;
   /* dark theme (light theme later, same role names) */
   --bg: #0B1016;
   --bg-sidebar: #0E141C;
@@ -67,4 +68,106 @@
   --fs-body: 14px/400;
   --fs-label: 12px (minimum for text);
   --fs-meta: 11px (badges/meta only);
+  /* derived: map tiles keep their dark colours in both themes, so their text keeps the dark
+     theme's --text (#E8EDF3) for contrast */
+  --map-text: #E8EDF3;
+}
+
+
+/* Light theme: source: owner-proposed light values, PR #3 decision 3 (contrast-checked >= 4.5:1
+   for text roles). Map and breadth colours (--map-*, --breadth-*) keep the dark-theme values in
+   both themes. Follows prefers-color-scheme unless data-theme on <html> overrides it (theme
+   toggle); the two blocks below must stay identical. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #F6F7F9;
+    --bg-sidebar: #EEF1F5;
+    --surface: #FFFFFF;
+    --surface-2: #F3F5F8;
+    --surface-3: #E9EDF2;
+    --border: #DCE2EA;
+    --border-strong: #C9D1DC;
+    --divider: #E6EAF0;
+    --text: #121820;
+    --text-2: #2B3643;
+    --text-3: #3E4A58;
+    --muted: #5A6778;
+    --faint: #5F6B7C;
+    --brand: #1F6FEB;
+    --brand-bg: #E6F0FF;
+    --brand-text: #1553B8;
+    --link: #1553B8;
+    --link-hover: #0E3F8F;
+    --up: #0E8A55;
+    --up-text: #0B7547;
+    --up-bg: #E3F6EC;
+    --down: #D1343B;
+    --down-text: #B4232B;
+    --down-bg: #FDE8E9;
+    --down-chip: #A61F26;
+    --warn-bg: #FFF3D6;
+    --warn-text: #7A5200;
+    --cls-stock: #2F6FDB;
+    --cls-stock-bg: #E6F0FF;
+    --cls-stock-text: #1553B8;
+    --cls-fixed: #0E8C86;
+    --cls-fixed-bg: #DDF5F3;
+    --cls-fixed-text: #0A6B66;
+    --cls-gold: #B7860B;
+    --cls-gold-bg: #FFF3D6;
+    --cls-gold-text: #7A5200;
+    --cls-silver: #6B7A90;
+    --cls-silver-bg: #EDF1F6;
+    --cls-silver-text: #3E4A58;
+    --cls-unknown: #7D8896;
+    --cls-unknown-bg: #EEF1F5;
+    --cls-unknown-text: #4A5563;
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #F6F7F9;
+  --bg-sidebar: #EEF1F5;
+  --surface: #FFFFFF;
+  --surface-2: #F3F5F8;
+  --surface-3: #E9EDF2;
+  --border: #DCE2EA;
+  --border-strong: #C9D1DC;
+  --divider: #E6EAF0;
+  --text: #121820;
+  --text-2: #2B3643;
+  --text-3: #3E4A58;
+  --muted: #5A6778;
+  --faint: #5F6B7C;
+  --brand: #1F6FEB;
+  --brand-bg: #E6F0FF;
+  --brand-text: #1553B8;
+  --link: #1553B8;
+  --link-hover: #0E3F8F;
+  --up: #0E8A55;
+  --up-text: #0B7547;
+  --up-bg: #E3F6EC;
+  --down: #D1343B;
+  --down-text: #B4232B;
+  --down-bg: #FDE8E9;
+  --down-chip: #A61F26;
+  --warn-bg: #FFF3D6;
+  --warn-text: #7A5200;
+  --cls-stock: #2F6FDB;
+  --cls-stock-bg: #E6F0FF;
+  --cls-stock-text: #1553B8;
+  --cls-fixed: #0E8C86;
+  --cls-fixed-bg: #DDF5F3;
+  --cls-fixed-text: #0A6B66;
+  --cls-gold: #B7860B;
+  --cls-gold-bg: #FFF3D6;
+  --cls-gold-text: #7A5200;
+  --cls-silver: #6B7A90;
+  --cls-silver-bg: #EDF1F6;
+  --cls-silver-text: #3E4A58;
+  --cls-unknown: #7D8896;
+  --cls-unknown-bg: #EEF1F5;
+  --cls-unknown-text: #4A5563;
 }

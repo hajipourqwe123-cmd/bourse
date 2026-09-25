@@ -43,7 +43,7 @@ async function keyboard(page: Page) {
 
 test("gate 2", async ({ browser }) => {
   mkdirSync(OUT, { recursive: true });
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "dark" });
   const page = await ctx.newPage();
   await page.addInitScript(() => {
     (window as unknown as { __longTasks: number[] }).__longTasks = [];
@@ -80,16 +80,35 @@ test("gate 2", async ({ browser }) => {
   await body.evaluate((el) => { el.scrollTop = 0; });
   await page.waitForTimeout(500);
   await page.screenshot({ path: `${OUT}/desktop-1440.png`, fullPage: true });
-  const axeDesktop = await axe(page, "desktop-1440");
+  const axeDesktop = await axe(page, "desktop-1440-dark");
+  await page.emulateMedia({ colorScheme: "light" }); // auto mode follows the system
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: `${OUT}/desktop-1440-light.png`, fullPage: true });
+  const axeDesktopLight = await axe(page, "desktop-1440-light");
+  // Manual override: auto → light → dark wins over the (light) system preference.
+  const toggle = page.getByRole("button", { name: /^پوسته/ });
+  await toggle.click();
+  await toggle.click();
+  const override = await page.evaluate(() => ({
+    attr: document.documentElement.getAttribute("data-theme"),
+    bg: getComputedStyle(document.body).backgroundColor,
+  }));
+  await toggle.click(); // back to auto
+  const themeOverride = override.attr === "dark" && override.bg === "rgb(11, 16, 22)";
+  await page.emulateMedia({ colorScheme: "dark" });
   const kb = await keyboard(page);
 
-  const mctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+  const mctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2, colorScheme: "dark" });
   const m = await mctx.newPage();
   await m.goto("./");
   await expect.poll(async () => (await gate(m)).rows, { timeout: 60_000 }).toBeGreaterThanOrEqual(MIN_ROWS);
   await m.waitForTimeout(2000);
   await m.screenshot({ path: `${OUT}/mobile-390.png`, fullPage: true });
-  const axeMobile = await axe(m, "mobile-390");
+  const axeMobile = await axe(m, "mobile-390-dark");
+  await m.emulateMedia({ colorScheme: "light" });
+  await m.waitForTimeout(500);
+  await m.screenshot({ path: `${OUT}/mobile-390-light.png`, fullPage: true });
+  const axeMobileLight = await axe(m, "mobile-390-light");
   // Touch targets ≥ 44 px on mobile (interactive, visible elements).
   const small = await m.evaluate(() =>
     [...document.querySelectorAll<HTMLElement>("button, a, input, [role=tab]")]
@@ -110,13 +129,16 @@ test("gate 2", async ({ browser }) => {
     dom_rows_max: maxDom,
     long_tasks: longTasks.length,
     long_task_max_ms: Math.round(maxLong),
-    axe: [axeDesktop, axeMobile],
+    axe: [axeDesktop, axeDesktopLight, axeMobile, axeMobileLight],
+    theme_override: themeOverride,
     keyboard: kb,
     touch_targets_below_44px: small,
     pass: {
       latency: g.p95 !== null && g.p95 < 5000,
       virtualized: maxDom < 100,
       no_freeze: maxLong <= 200,
+      axe_clean: [axeDesktop, axeDesktopLight, axeMobile, axeMobileLight].every((a) => a.violations.length === 0),
+      theme_override: themeOverride,
     },
   };
   writeFileSync(`${OUT}/report.json`, JSON.stringify(report, null, 2));
@@ -124,4 +146,6 @@ test("gate 2", async ({ browser }) => {
   expect(report.pass.latency, `p95 ${g.p95} ms`).toBe(true);
   expect(report.pass.virtualized, `DOM rows ${maxDom}`).toBe(true);
   expect(report.pass.no_freeze, `longest task ${maxLong} ms`).toBe(true);
+  expect(report.pass.axe_clean, "axe violations (both themes): see report.json").toBe(true);
+  expect(report.pass.theme_override, `manual theme override: ${JSON.stringify(override)}`).toBe(true);
 });
