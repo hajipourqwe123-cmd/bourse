@@ -221,19 +221,24 @@ func TestFailedPublishRequeuesRadarAndHot(t *testing.T) {
 }
 
 type memStore struct {
-	m       map[string][]byte
-	failGet bool
-	puts    int
+	m        map[string][]byte
+	failGet  bool
+	failGets int // fail only the next N reads
+	puts     int
 }
 
-func (s *memStore) StateGet(_ context.Context, k string) ([]byte, bool, error) {
+func (s *memStore) RefGet(_ context.Context, k string) ([]byte, bool, error) {
+	if s.failGets > 0 {
+		s.failGets--
+		return nil, false, errors.New("kv down")
+	}
 	if s.failGet {
 		return nil, false, errors.New("kv down")
 	}
 	b, ok := s.m[k]
 	return b, ok, nil
 }
-func (s *memStore) StatePut(_ context.Context, k string, v []byte) error {
+func (s *memStore) RefPut(_ context.Context, k string, v []byte) error {
 	s.m[k] = v
 	s.puts++
 	return nil
@@ -327,5 +332,46 @@ func TestInProcessDayRollover(t *testing.T) {
 	h.saveTotals(context.Background())
 	if storedDay(t, store, keyPrevTotals) != "2026-09-23" || storedDay(t, store, keyTotals) != "2026-09-26" {
 		t.Errorf("stored: prev %q cur %q", storedDay(t, store, keyPrevTotals), storedDay(t, store, keyTotals))
+	}
+}
+
+// Only the start-up load fails (saveTotals' own reads succeed): still no save before a
+// successful load; and a retried load after the in-process day change keeps the fresher
+// in-memory reference.
+func TestRetriedLoadAfterRollover(t *testing.T) {
+	store := &memStore{m: map[string][]byte{keyTotals: []byte(`{"day":"2026-09-22","totals":{"S1":{"v":9,"val":9}}}`)}, failGets: 1}
+	day1 := tehranAt("12:29")
+	h, _, clock := hubAt(t, day1, false)
+	h.store = store
+	if h.loadPrevTotals(context.Background()) {
+		t.Fatal("load must fail")
+	}
+	ready(h)
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", day1, 1010, 5000)))
+	*clock = day1.Add(69 * time.Hour)
+	_ = h.flush(context.Background())  // Saturday: in-memory reference = Wednesday
+	h.saveTotals(context.Background()) // retries the load (Tuesday's record): must not win
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", *clock, 1010, 5000)))
+	if st, _ := h.state(*clock); !st.Rows[0].AwaitingReset || st.Summary.CarryoverCheck.Day != "2026-09-23" {
+		t.Errorf("rows %+v check %+v: Wednesday's in-memory reference must stay", st.Rows, st.Summary.CarryoverCheck)
+	}
+}
+
+// After a failed start-up load, the next save first retries the load (installing the stored
+// reference) instead of writing blindly over it.
+func TestSaveRetriesLoadFirst(t *testing.T) {
+	store := &memStore{m: map[string][]byte{keyTotals: []byte(`{"day":"2026-09-22","totals":{"S1":{"v":9,"val":9}}}`)}, failGets: 1}
+	now := tehranAt("10:00")
+	h, _, _ := hubAt(t, now, false)
+	h.store = store
+	h.loadPrevTotals(context.Background())
+	ready(h)
+	h.onSnapshot(msg("md.snap.S1", snapAt("S1", now, 1010, 5000)))
+	h.saveTotals(context.Background())
+	if st, _ := h.state(now); st.Summary.CarryoverCheck.Day != "2026-09-22" {
+		t.Errorf("reference %q: the save must load the stored record first", st.Summary.CarryoverCheck.Day)
+	}
+	if storedDay(t, store, keyPrevTotals) != "2026-09-22" {
+		t.Errorf("Tuesday's record must be rotated, not overwritten")
 	}
 }

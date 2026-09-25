@@ -349,9 +349,19 @@ const PrevKeepDays = 30
 // SetPrevTotals sets the previous trading day's last totals (e.g. loaded from storage after a
 // restart); ignored unless dt is of an earlier day than the state's.
 func (s *State) SetPrevTotals(dt DayTotals) {
-	if s.day != "" && dt.Day < s.day {
-		s.prev, s.prevDay = dt.Totals, dt.Day
+	// Never older than the reference already held (a load retried after an in-process day
+	// change must not replace the fresher one).
+	if s.day == "" || dt.Day >= s.day || dt.Day < s.prevDay {
+		return
 	}
+	m := make(map[string]model.Totals, len(dt.Totals))
+	for k, v := range dt.Totals {
+		if v.Seen == "" { // records written before Seen existed: prunable from their day
+			v.Seen = dt.Day
+		}
+		m[k] = v
+	}
+	s.prev, s.prevDay = m, dt.Day
 }
 
 // LastTotals returns the latest totals of today per instrument (the last snapshot with volume and
@@ -362,6 +372,9 @@ func (s *State) LastTotals() DayTotals {
 	today := map[string]model.Totals{}
 	for k, in := range s.ins {
 		if t, ok := model.TotalsOf(&in.snap); ok && in.snap.InsCode != "" {
+			if old, ok := s.prev[k]; ok && old.Active() && !t.Active() {
+				t = old // an all-zero day (reset, no trade) keeps the active reference: a flip-back is still caught
+			}
 			t.Seen = s.day
 			today[k] = t
 		}
@@ -404,7 +417,7 @@ func (s *State) prevTradingDay(day string) string {
 // same model.Totals comparison as the engine's.
 func (s *State) repeatsPrev(sn *model.Snapshot) bool {
 	if sess, ok := s.cfg.Sessions.Session(sn.InsCode, sn.SourceTime); ok && sn.SourceTime.Before(sess.Open) {
-		return false // before the open: the pre-open carryover rule (carryover) applies
+		return false // before the open the pre-open rule applies (defensive: carryover() runs first)
 	}
 	p, ok := s.prev[sn.InsCode]
 	if !ok || s.prevDay == "" || s.prevDay >= s.day || !p.Active() {

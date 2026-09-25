@@ -80,6 +80,7 @@ type Engine struct {
 	prev    map[string]model.Totals
 	prevDay string
 	rolled  bool
+	lastTot map[string]model.Totals // last totals seen per instrument (Seen = their day)
 }
 
 // PrevKeepDays bounds the carried totals: an instrument not seen for this many days is dropped.
@@ -103,9 +104,11 @@ func (e *Engine) TakeRolled() bool {
 	return r
 }
 
-// roll moves to trading day day: every instrument's last accepted totals of an earlier day
-// become the reference, merged over the older reference (instruments not seen since keep
-// theirs, dropped after PrevKeepDays).
+// roll moves to trading day day: every instrument's last SEEN totals of an earlier day (any
+// snapshot with volume and value, also incomplete or carryover ones: what the source showed last)
+// become the reference, merged over the older reference. Instruments not seen since keep
+// theirs and are dropped after PrevKeepDays; all-zero totals (a source reset with no trade)
+// never replace an active reference (a later flip-back to it is still caught).
 func (e *Engine) roll(day string) {
 	if day <= e.curDay {
 		return
@@ -114,21 +117,22 @@ func (e *Engine) roll(day string) {
 		e.curDay = day
 		return
 	}
-	next := make(map[string]model.Totals, len(e.prev)+len(e.state))
+	next := make(map[string]model.Totals, len(e.prev)+len(e.lastTot))
 	for k, v := range e.prev {
 		next[k] = v
 	}
 	newest := e.prevDay
-	for ins, st := range e.state {
-		if st.day >= day || st.prev == nil {
+	for ins, t := range e.lastTot {
+		if t.Seen >= day {
 			continue
 		}
-		if t, ok := model.TotalsOf(st.prev); ok {
-			t.Seen = st.day
-			next[ins] = t
-			if st.day > newest {
-				newest = st.day
-			}
+		if old, ok := next[ins]; ok && old.Active() && !t.Active() {
+			old.Seen = t.Seen
+			t = old
+		}
+		next[ins] = t
+		if t.Seen > newest {
+			newest = t.Seen
 		}
 	}
 	if d, err := time.ParseInLocation("2006-01-02", day, tehran.Loc); err == nil {
@@ -136,6 +140,7 @@ func (e *Engine) roll(day string) {
 		for k, v := range next {
 			if v.Seen != "" && v.Seen < cut {
 				delete(next, k)
+				delete(e.lastTot, k)
 			}
 		}
 	}
@@ -162,7 +167,7 @@ func New(cfg Config) *Engine {
 		cfg.GapAfter = 30 * time.Second
 	}
 	return &Engine{cfg: cfg, state: map[string]*symState{}, estDay: map[string]string{}, carryDay: map[string]string{},
-		prev: map[string]model.Totals{}}
+		prev: map[string]model.Totals{}, lastTot: map[string]model.Totals{}}
 }
 
 func (e *Engine) band(avg int64) model.Band {
@@ -179,7 +184,16 @@ func (e *Engine) band(avg int64) model.Band {
 // Process consumes one snapshot.
 func (e *Engine) Process(s model.Snapshot) Result {
 	var r Result
-	e.roll(tehran.TradingDay(s.SourceTime))
+	// A source time implausibly ahead of the ingest time must not move the trading day (it
+	// would roll the whole market's reference mid-day); the same guard as the checkpoint's.
+	if !s.SourceTime.After(s.IngestTime.Add(time.Hour)) {
+		day := tehran.TradingDay(s.SourceTime)
+		e.roll(day)
+		if t, ok := model.TotalsOf(&s); ok && day == e.curDay {
+			t.Seen = day
+			e.lastTot[s.InsCode] = t
+		}
+	}
 	class := e.cfg.Sessions.Class(s.InsCode)
 	sess, open := e.cfg.Sessions.Session(s.InsCode, s.SourceTime)
 	inSession := false

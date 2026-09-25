@@ -808,3 +808,31 @@ func TestPrevTotalsStorageAndCheck(t *testing.T) {
 		t.Error("no reference: the check is not OK")
 	}
 }
+
+// Review round 2: an all-zero day keeps the active reference; an older record never replaces a
+// fresher one; records without Seen become prunable.
+func TestReferenceEdgeCases(t *testing.T) {
+	st := dayOneThenTwo(t)                                         // reference: Wednesday, S1 5,000,000
+	st.ApplySnapshot(snap2("S1", "08:59:55", 1000, 1000, 0, 0, 0)) // Saturday: reset, no trade all day
+	sun := "2026-09-27"
+	st.Advance(sun)
+	if p := st.prev["S1"]; p.Volume != 5_000_000 || p.Seen != day2 {
+		t.Fatalf("reference after an all-zero day = %+v, want Wednesday's totals seen Saturday", p)
+	}
+	flip := snap("S1", "09:00:05", 1010, 1000, 5_000_000, 50_000_000_000)
+	flip.TradeCount = 900
+	flip.SourceTime, flip.IngestTime = at("09:00:05").AddDate(0, 0, 4), at("09:00:06").AddDate(0, 0, 4)
+	st.ApplySnapshot(flip)
+	if r := st.Rows(); len(r) != 1 || !r[0].AwaitingReset {
+		t.Errorf("flip-back after an all-zero day: %+v", r)
+	}
+	st.SetPrevTotals(DayTotals{Day: day, Totals: map[string]model.Totals{"S1": {Volume: 1}}}) // older than held
+	if st.prevDay != day2 {
+		t.Errorf("an older record replaced the reference: %s", st.prevDay)
+	}
+	fresh := testState()
+	fresh.SetPrevTotals(DayTotals{Day: "2026-09-22", Totals: map[string]model.Totals{"S9": {Volume: 1}}})
+	if fresh.prev["S9"].Seen != "2026-09-22" {
+		t.Errorf("legacy entry Seen = %q, want the record's day", fresh.prev["S9"].Seen)
+	}
+}

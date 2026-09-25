@@ -570,3 +570,22 @@ func TestPublishBatchOrderDedupAndErrors(t *testing.T) {
 		t.Errorf("stored = %v, want both in order and the duplicate dropped", got)
 	}
 }
+
+func TestRefBucketRoundTripLargeRecord(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	big := bytes.Repeat([]byte("x"), 600_000) // a ~5,000-instrument record
+	for i := 0; i < 4; i++ {                  // four records, overwritten repeatedly
+		for _, k := range []string{"a", "b", "c", "d"} {
+			if err := j.RefPut(ctxT(t), k, big); err != nil {
+				t.Fatalf("put %s #%d: %v", k, i, err)
+			}
+		}
+	}
+	got, ok, err := j.RefGet(ctxT(t), "c")
+	if err != nil || !ok || len(got) != len(big) {
+		t.Fatalf("get: %d bytes ok=%v err=%v", len(got), ok, err)
+	}
+	if _, ok, err := j.RefGet(ctxT(t), "missing"); ok || err != nil {
+		t.Errorf("missing key: ok=%v err=%v", ok, err)
+	}
+}

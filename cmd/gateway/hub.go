@@ -53,10 +53,10 @@ type (
 )
 
 // hub owns the market state: bus messages update it, the loop publishes changes every tick.
-// stateStore persists small service state (bus.JetStream: KV bucket service_state).
+// stateStore persists the previous-day totals (bus.JetStream: KV bucket bus.RefBucket).
 type stateStore interface {
-	StateGet(ctx context.Context, key string) ([]byte, bool, error)
-	StatePut(ctx context.Context, key string, val []byte) error
+	RefGet(ctx context.Context, key string) ([]byte, bool, error)
+	RefPut(ctx context.Context, key string, val []byte) error
 }
 
 // KV keys of the instruments' last day totals (post-open carryover rule): today's, saved every
@@ -253,7 +253,7 @@ func (h *hub) loadPrevTotals(ctx context.Context) bool {
 	}
 	read := func(key string) (market.DayTotals, error) {
 		var dt market.DayTotals
-		b, ok, err := h.store.StateGet(ctx, key)
+		b, ok, err := h.store.RefGet(ctx, key)
 		if err != nil {
 			return dt, err
 		}
@@ -313,19 +313,19 @@ func (h *hub) saveTotals(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	old, ok, err := h.store.StateGet(ctx, keyTotals)
+	old, ok, err := h.store.RefGet(ctx, keyTotals)
 	if err != nil {
 		log.Printf("gateway: save %s: %v", keyTotals, err)
 		return
 	}
 	var stored market.DayTotals
 	if ok && json.Unmarshal(old, &stored) == nil && stored.Day != "" && stored.Day < lt.Day {
-		if err := h.store.StatePut(ctx, keyPrevTotals, old); err != nil {
+		if err := h.store.RefPut(ctx, keyPrevTotals, old); err != nil {
 			log.Printf("gateway: save %s: %v", keyPrevTotals, err)
 			return
 		}
 	}
-	if err := h.store.StatePut(ctx, keyTotals, b); err != nil {
+	if err := h.store.RefPut(ctx, keyTotals, b); err != nil {
 		log.Printf("gateway: save %s: %v", keyTotals, err)
 	}
 }

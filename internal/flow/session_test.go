@@ -472,3 +472,60 @@ func TestPrevTotalsPersistence(t *testing.T) {
 		t.Errorf("pruning: %+v", m)
 	}
 }
+
+// Review round 2, item 1: a snapshot with a source time far ahead of its ingest time must not
+// roll the whole market's reference mid-day.
+func TestFutureSnapshotDoesNotRoll(t *testing.T) {
+	e := dayEnd(t)
+	e.TakeRolled()
+	f := sn("IRGOLD", tt("2026-09-28", "10:00:00"), 10_000, 1, 1, 0, 1, 0)
+	f.IngestTime = tt("2026-09-26", "12:30:00") // source time two days ahead
+	e.Process(f)
+	if e.TakeRolled() {
+		t.Fatal("a future-dated snapshot rolled the reference")
+	}
+	if r := e.Process(repeat("09:00:05")); !hasIssue(r, quality.PrevDayCarryover) {
+		t.Errorf("the next day's repeat must still be caught: %+v", r.Issues)
+	}
+}
+
+// Item 5: the reference is what the source showed last, also on a snapshot the engine could not
+// use (a flow field missing).
+func TestReferenceIsLastSeenTotals(t *testing.T) {
+	e := dayEnd(t)
+	inc := sn("IRSTOCK", tt("2026-09-26", "12:30:10"), 10_000, 5_100_000, 3_000_000, 3_000_000, 900, 900)
+	inc.TradeCount = 910
+	inc.Missing = []string{model.FIndBuyCount}
+	e.Process(inc)
+	r := sn("IRSTOCK", tt("2026-09-27", "09:00:05"), 10_000, 5_100_000, 3_000_000, 3_000_000, 900, 900)
+	r.TradeCount = 910
+	if res := e.Process(r); !hasIssue(res, quality.PrevDayCarryover) {
+		t.Errorf("the last seen totals are the reference: %+v", res.Issues)
+	}
+}
+
+// Items 4 and 7: a halted instrument showing its old totals every day stays in the reference
+// (seen) beyond PrevKeepDays; an all-zero day does not replace an active reference.
+func TestHaltedAndZeroDays(t *testing.T) {
+	e := dayEnd(t) // 2026-09-26: 5,000,000
+	d0, _ := time.ParseInLocation("2006-01-02", "2026-09-26", tehran.Loc)
+	for i := 1; i <= PrevKeepDays+5; i++ {
+		s := repeat("09:30:00")
+		s.SourceTime = d0.AddDate(0, 0, i).Add(9*time.Hour + 30*time.Minute)
+		s.IngestTime = s.SourceTime.Add(time.Second)
+		if r := e.Process(s); r.Game != nil || hasIssue(r, quality.DayStartMissed) {
+			t.Fatalf("day +%d: halted instrument's old totals accepted: %+v", i, r)
+		}
+	}
+	z := sessEngine()
+	z.Process(sn("IRSTOCK", tt("2026-09-26", "08:59:55"), 10_000, 0, 0, 0, 0, 0))
+	last := sn("IRSTOCK", tt("2026-09-26", "12:29:55"), 10_000, 5_000_000, 3_000_000, 3_000_000, 900, 900)
+	last.TradeCount = 900
+	z.Process(last)
+	z.Process(sn("IRSTOCK", tt("2026-09-27", "08:59:55"), 10_000, 0, 0, 0, 0, 0)) // reset, no trade all day
+	flip := repeat("09:00:00")
+	flip.SourceTime, flip.IngestTime = tt("2026-09-28", "09:00:00"), tt("2026-09-28", "09:00:01")
+	if r := z.Process(flip); !hasIssue(r, quality.PrevDayCarryover) {
+		t.Errorf("an all-zero day must not clear the reference: %+v", r.Issues)
+	}
+}
