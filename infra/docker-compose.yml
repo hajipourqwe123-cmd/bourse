@@ -1,11 +1,20 @@
 # Local development stack. Not production. Versions pinned; bump deliberately.
-# NOTE: authored in Sprint 0 but NOT yet started in CI — first `docker compose up` is Sprint 1 task I-01.
+# Run from the repo root via make (compose must read the root .env):
+#   make env   # once: .env with generated local-only secrets
+#   make up    # start and wait for health
+#   make ddl   # (re)apply ClickHouse DDL; idempotent
+# All ports are bound to 127.0.0.1 only.
 services:
   nats:
     image: nats:2.10-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
-    ports: ["4222:4222", "8222:8222"]
+    ports: ["127.0.0.1:4222:4222", "127.0.0.1:8222:8222"]
     volumes: [nats-data:/data]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -13,15 +22,28 @@ services:
       CLICKHOUSE_DB: market
       CLICKHOUSE_USER: dev
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
-    ports: ["8123:8123", "9000:9000"]
+    ports: ["127.0.0.1:8123:8123", "127.0.0.1:9000:9000"]
     volumes:
       - ch-data:/var/lib/clickhouse
       - ./clickhouse:/docker-entrypoint-initdb.d:ro
-    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+    # ClickHouse wants many fds. Hosts whose hard limit is lower (some CI/sandbox dockerd) fail
+    # with "error setting rlimit type 7"; set CLICKHOUSE_NOFILE in .env to `ulimit -Hn` there.
+    ulimits:
+      nofile: { soft: "${CLICKHOUSE_NOFILE:-262144}", hard: "${CLICKHOUSE_NOFILE:-262144}" }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   postgres:
     image: postgres:16-alpine
@@ -29,8 +51,13 @@ services:
       POSTGRES_DB: app
       POSTGRES_USER: app
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-d", "app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   centrifugo:
     image: centrifugo/centrifugo:v5
@@ -38,7 +65,12 @@ services:
     environment:
       CENTRIFUGO_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_SECRET:?set in .env}
       CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:?set in .env}
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
     volumes: [./centrifugo:/centrifugo:ro]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes: { nats-data: {}, ch-data: {}, pg-data: {} }

@@ -6,6 +6,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 ## Commands
 - `make test` (= `go test ./...`), `make vet`, `go test -race ./...`, `gofmt -l .` must be empty
 - `make synth` then `make demo` → replays a SYNTHETIC day through collector | engine → out.ndjson
+- `make env` (once) → `make up` → `make ddl`: local stack (infra/, ports on 127.0.0.1 only)
 
 ## Map
 - internal/model     canonical Snapshot + event types (rial int64, source_time vs ingest_time, Missing[])
