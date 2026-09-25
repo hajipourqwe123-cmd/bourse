@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"bourse/internal/bus"
 	"bourse/internal/flow"
@@ -26,8 +29,19 @@ import (
 
 func startServer(t *testing.T) string {
 	t.Helper()
-	s, err := server.NewServer(&server.Options{Host: "127.0.0.1", Port: -1, JetStream: true,
-		StoreDir: t.TempDir(), NoLog: true, NoSigs: true})
+	dir := t.TempDir()
+	// max_file_store is an accounting limit (the default streams reserve 26 GiB of MaxBytes);
+	// it is only honoured from a config file, like infra/nats/nats.conf.
+	conf := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf("listen: \"127.0.0.1:-1\"\njetstream { store_dir: %q, max_file_store: 64G }\n", dir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := server.ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.NoLog, opts.NoSigs = true, true
+	s, err := server.NewServer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,10 +130,14 @@ type rawMsg struct{ ins, data string }
 
 // runUntil runs a fresh processor over NATS until the durable's ack floor reaches floor.
 // It returns runNATS's error.
-func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64) error {
+func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64, opts ...func(*processor)) error {
 	t.Helper()
 	p := newProcessor(flow.DefaultConfig(), pub)
 	p.retry = []time.Duration{time.Millisecond, time.Millisecond}
+	p.allowSynthetic = true // test instruments are SYN*
+	for _, o := range opts {
+		o(p)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	go func() {
@@ -131,9 +149,9 @@ func runUntil(t *testing.T, js *bus.JetStream, pub bus.Publisher, floor uint64) 
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-	spec := bus.ConsumerSpec{Stream: bus.StreamMD, Durable: engineDurable, Filter: snapFilter,
-		AckWait: 300 * time.Millisecond, MaxDeliver: 3, Backoff: []time.Duration{10 * time.Millisecond}}
-	err := p.runNATS(ctx, js, spec)
+	spec := engineConsumer()
+	spec.AckWait, spec.Backoff = 300*time.Millisecond, []time.Duration{10 * time.Millisecond}
+	err := p.runNATS(ctx, js, spec, false)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatal("processor did not reach the ack floor in time")
 	}
@@ -230,7 +248,9 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 			t.Fatalf("baseline game totals look wrong: %+v", g)
 		}
 	}
-	for _, cut := range []uint64{121, 400, 580} { // prev day; today mid-morning; after the malformed msg
+	// Seqs 1..120 are the previous day, 121.. today; the malformed message is seq 372.
+	// Cuts are approximate (the first process may run a few messages past them).
+	for _, cut := range []uint64{60, 300, 580} {
 		gotLines, gotGame := scenario(t, in, func(js *bus.JetStream, n uint64) {
 			if err := runUntil(t, js, js, cut); err != nil {
 				t.Fatal(err)
@@ -250,14 +270,17 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 	}
 }
 
-// failingPub fails every publish once armed and the countdown of successful publishes is spent.
+// failingPub starts failing, permanently, at the first output with index > 0 (so part of that
+// snapshot's outputs are already stored) once okLeft publishes have succeeded.
 type failingPub struct {
 	*bus.JetStream
-	okLeft atomic.Int64
+	okLeft   atomic.Int64
+	failedID atomic.Value
 }
 
 func (f *failingPub) PublishID(subject, id string, v any) error {
-	if f.okLeft.Add(-1) < 0 {
+	if f.failedID.Load() != nil || f.okLeft.Add(-1) < 0 && !strings.HasSuffix(id, ":0") {
+		f.failedID.CompareAndSwap(nil, id)
 		return errors.New("nats down")
 	}
 	return f.JetStream.PublishID(subject, id, v)
@@ -280,6 +303,9 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "nats down") {
 			t.Fatalf("want abort with publish error, got %v", err)
 		}
+		if id, _ := fp.failedID.Load().(string); id == "" || strings.HasSuffix(id, ":0") {
+			t.Fatalf("failure must hit a later output of a snapshot, failed at %q", id)
+		}
 		floor, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable)
 		if floor == 0 || floor >= n {
 			t.Fatalf("ack floor %d: the failed snapshot must stay unacked", floor)
@@ -298,33 +324,306 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 	}
 }
 
-// A malformed snapshot is terminated with one UNDECODABLE quality issue and does not block
-// the next valid snapshot.
-func TestMalformedSnapshotReportedAndSkipped(t *testing.T) {
+// Malformed snapshots are terminated with exactly one UNDECODABLE quality issue each and do
+// not block, or leak zero-filled values into, the next valid snapshot.
+func TestMalformedSnapshotsReportedAndSkipped(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)
 	snaps := day("2026-09-23", 1, 3, 3)
-	feed(t, url, js, []any{snaps[0], rawMsg{"SYNTEST0000", `not json`}, snaps[1], snaps[2]})
-	if err := runUntil(t, js, js, 4); err != nil {
+	other, _ := json.Marshal(day("2026-09-23", 2, 1, 3)[1]) // SYNTEST0001 published on SYNTEST0000's subject
+	bad := []string{`not json`, `{}`, `null`, `{"ins_code":"SYNTEST0000"}`, string(other)}
+	in := []any{snaps[0]}
+	for _, b := range bad {
+		in = append(in, rawMsg{"SYNTEST0000", b})
+	}
+	in = append(in, snaps[1], snaps[2])
+	feed(t, url, js, in)
+	if err := runUntil(t, js, js, uint64(len(in))); err != nil {
 		t.Fatal(err)
 	}
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
 	jsc, _ := nc.JetStream()
-	m, err := jsc.GetLastMsg(bus.StreamQuality, "quality.SYNTEST0000")
+	sub, err := jsc.SubscribeSync("quality.>", nats.OrderedConsumer())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var iss model.QualityIssue
-	json.Unmarshal(m.Data, &iss)
-	if iss.Code != quality.Undecodable || !strings.Contains(iss.Detail, "stream seq 2") || iss.At.IsZero() {
-		t.Fatalf("issue %+v", iss)
+	var undecodable []string
+	for {
+		m, err := sub.NextMsg(300 * time.Millisecond)
+		if err != nil {
+			break
+		}
+		var iss model.QualityIssue
+		json.Unmarshal(m.Data, &iss)
+		if iss.Code == quality.Undecodable {
+			if m.Subject != "quality.SYNTEST0000" || iss.At.IsZero() {
+				t.Errorf("bad issue on %s: %+v", m.Subject, iss)
+			}
+			undecodable = append(undecodable, iss.Detail)
+		} else if iss.Code != quality.Stale {
+			t.Errorf("unexpected issue (zero-filled snapshot reached the engine?): %+v", iss)
+		}
+	}
+	if len(undecodable) != len(bad) {
+		t.Fatalf("%d UNDECODABLE issues, want %d: %q", len(undecodable), len(bad), undecodable)
+	}
+	for i, d := range undecodable {
+		if !strings.Contains(d, fmt.Sprintf("stream seq %d:", i+2)) {
+			t.Errorf("issue %d detail %q", i, d)
+		}
 	}
 	g, err := jsc.GetLastMsg(bus.StreamFlow, "flow.game.SYNTEST0000")
 	if err != nil {
-		t.Fatalf("no game totals after the malformed message: %v", err)
+		t.Fatalf("no game totals after the malformed messages: %v", err)
 	}
-	if g.Sequence == 0 {
-		t.Fatal("game totals missing")
+	var gt model.GameTotals
+	json.Unmarshal(g.Data, &gt)
+	if gt.Day != "2026-09-23" {
+		t.Fatalf("game totals %+v", gt)
+	}
+}
+
+type downPub struct{}
+
+func (downPub) Publish(string, any) error           { return errors.New("nats down") }
+func (downPub) PublishID(string, string, any) error { return errors.New("nats down") }
+
+// Deliveries count across processes: after 4 aborted runs the 5th process reports
+// POISON_SUSPECT once and stops; later processes stop too. The message is never dropped.
+func TestPoisonSuspectAcrossRestarts(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	snaps := day("2026-09-23", 1, 2, 4)
+	feed(t, url, js, []any{snaps[0], snaps[1]})
+	for run := 1; run <= 4; run++ {
+		if err := runUntil(t, js, downPub{}, 2); err == nil || !strings.Contains(err.Error(), "nats down") {
+			t.Fatalf("run %d: want publish abort, got %v", run, err)
+		}
+	}
+	for run := 5; run <= 6; run++ {
+		err := runUntil(t, js, js, 2)
+		if err == nil || !strings.Contains(err.Error(), "POISON_SUSPECT: MD seq 2") { // seq 1 is a baseline: no outputs, acked
+			t.Fatalf("run %d: want POISON_SUSPECT abort, got %v", run, err)
+		}
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 1 {
+		t.Fatalf("poisoned message acked/dropped: ack floor %d", f)
+	}
+	defer func() { // operator release: processed once more, then acked
+		if err := runUntil(t, js, js, 2, func(p *processor) { p.retryPoisonSeq = 2 }); err != nil {
+			t.Fatalf("released run: %v", err)
+		}
+	}()
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := nc.JetStream()
+	info, err := jsc.StreamInfo(bus.StreamQuality)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := jsc.GetLastMsg(bus.StreamQuality, "quality.SYNTEST0000")
+	if err != nil || info.State.Msgs != 1 || !strings.Contains(string(m.Data), quality.PoisonSuspect) {
+		t.Fatalf("want exactly one POISON_SUSPECT issue (deduplicated across runs 5 and 6): msgs=%d err=%v", info.State.Msgs, err)
+	}
+}
+
+// startLeased runs an engine under the single-engine lease in the background.
+func startLeased(t *testing.T, js *bus.JetStream, holder string) (stop func() error) {
+	t.Helper()
+	return startLeasedWith(t, js, js, holder)
+}
+
+func startLeasedWith(t *testing.T, js *bus.JetStream, pub bus.Publisher, holder string) (stop func() error) {
+	t.Helper()
+	p := newProcessor(flow.DefaultConfig(), pub)
+	p.allowSynthetic = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	spec := engineConsumer()
+	spec.AckWait = 300 * time.Millisecond
+	go func() { done <- runLeased(ctx, js, p, spec, false, holder, time.Second) }()
+	return func() error {
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatal("engine did not stop")
+			return nil
+		}
+	}
+}
+
+func waitFloor(t *testing.T, js *bus.JetStream, n uint64) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("engine did not catch up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// P-02: while one engine runs, a second refuses to start and touches nothing; once the first
+// stops (and releases), a new one starts at once.
+func TestSecondEngineRefusesToStart(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	var in []any
+	for _, s := range day("2026-09-23", 2, 20, 7) {
+		in = append(in, s)
+	}
+	feed(t, url, js, in)
+	stopA := startLeased(t, js, "engine-a")
+	waitFloor(t, js, uint64(len(in)))
+
+	pub := &recPub{}
+	b := newProcessor(flow.DefaultConfig(), pub)
+	b.allowSynthetic = true
+	err := runLeased(context.Background(), js, b, engineConsumer(), true, "engine-b", time.Second)
+	if !errors.Is(err, bus.ErrLeaseHeld) || !strings.Contains(err.Error(), "engine-a") {
+		t.Fatalf("second engine: want ErrLeaseHeld naming engine-a, got %v", err)
+	}
+	if len(pub.ids) != 0 || b.lastSeq != 0 {
+		t.Fatalf("refused engine did work: %d publishes, lastSeq %d", len(pub.ids), b.lastSeq)
+	}
+
+	if err := stopA(); err != nil {
+		t.Fatalf("first engine: %v", err)
+	}
+	c := newProcessor(flow.DefaultConfig(), js)
+	c.allowSynthetic = true
+	if err := runLeased(context.Background(), js, c, engineConsumer(), true, "engine-c", time.Second); err != nil {
+		t.Fatalf("engine after a clean stop: %v", err)
+	}
+	if c.lastSeq != uint64(len(in)) {
+		t.Fatalf("successor recovered lastSeq %d, want %d", c.lastSeq, len(in))
+	}
+}
+
+// A running engine whose lease disappears (operator action, or it was partitioned long enough
+// to expire and be taken) stops with ErrLeaseLost instead of carrying on beside a successor.
+func TestEngineStopsWhenLeaseLost(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	stop := startLeased(t, js, "engine-a")
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	var kv jetstream.KeyValue
+	deadline := time.Now().Add(5 * time.Second)
+	for { // wait until the lease exists
+		var err error
+		if kv, err = jsc.KeyValue(context.Background(), leaseBucket); err == nil {
+			if _, err = kv.Get(context.Background(), engineDurable); err == nil {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease never acquired")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second) // > one renewal period (ttl/3) plus slack
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+}
+
+// blockingPub blocks its first publish until released, then counts later publishes.
+type blockingPub struct {
+	*bus.JetStream
+	entered, release chan struct{}
+	after            atomic.Int64
+	first            atomic.Bool
+}
+
+func (b *blockingPub) PublishID(subject, id string, v any) error {
+	if b.first.CompareAndSwap(false, true) {
+		close(b.entered)
+		<-b.release
+	} else {
+		b.after.Add(1)
+	}
+	return b.JetStream.PublishID(subject, id, v)
+}
+
+// The lease is lost while a snapshot's outputs are being published: the in-flight publish may
+// complete, but no further output is published and the snapshot is not acked.
+func TestLostLeaseStopsPublishAndAck(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	snaps := day("2026-09-23", 1, 2, 11) // seq 1 is a baseline (no outputs), seq 2 has several
+	feed(t, url, js, []any{snaps[0], snaps[1]})
+	bp := &blockingPub{JetStream: js, entered: make(chan struct{}), release: make(chan struct{})}
+	stop := startLeasedWith(t, js, bp, "engine-a")
+	select {
+	case <-bp.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine never published")
+	}
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	kv, err := jsc.KeyValue(context.Background(), leaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil { // lease taken away
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second) // > one renewal period: the holder notices the revision change
+	close(bp.release)
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+	if n := bp.after.Load(); n != 0 {
+		t.Fatalf("%d outputs published after the lease was lost", n)
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 1 {
+		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
+	}
+}
+
+// The lease is lost while the only output of a snapshot is in flight: the handler then
+// succeeds, and the ack guard alone must keep the snapshot unacked.
+func TestLostLeaseBlocksAck(t *testing.T) {
+	url := startServer(t)
+	js := connectJS(t, url)
+	s := day("2026-09-23", 1, 1, 12)[0]
+	s.Missing = []string{model.FIndSellCount} // INCOMPLETE: exactly one output (the issue)
+	feed(t, url, js, []any{s})
+	bp := &blockingPub{JetStream: js, entered: make(chan struct{}), release: make(chan struct{})}
+	stop := startLeasedWith(t, js, bp, "engine-a")
+	select {
+	case <-bp.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine never published")
+	}
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	jsc, _ := jetstream.New(nc)
+	kv, err := jsc.KeyValue(context.Background(), leaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Delete(context.Background(), engineDurable); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	close(bp.release)
+	if err := stop(); !errors.Is(err, bus.ErrLeaseLost) {
+		t.Fatalf("want ErrLeaseLost, got %v", err)
+	}
+	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 0 {
+		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
 	}
 }

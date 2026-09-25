@@ -62,6 +62,10 @@ type TenMinute struct {
 	NetHot      int64     `json:"net_hot"`    // rial, attributed hot buy − attributed hot sell
 	PriceOpen   int64     `json:"price_open"` // first last-price seen in window
 	PriceLastV  int64     `json:"price_last"` // latest last-price seen in window
+	// Partial is true when snapshots of this window were lost before the engine applied them
+	// (engine restart after the bus discarded them): NetHot then covers only part of the window.
+	// The flow engine never sets it; see RECOVERY_TRUNCATED in docs/data-quality.md.
+	Partial bool `json:"partial"`
 }
 
 // ChangePct returns the price change in percent over the window (0 when undefined).
@@ -81,4 +85,8 @@ type GameTotals struct {
 	NetRetail  int64  `json:"net_retail"`
 	// NetUnattributed holds flow that cannot be banded (existing participants trading again).
 	NetUnattributed int64 `json:"net_unattributed"`
+	// Partial is true when snapshots of this day were lost before the engine applied them
+	// (engine restart after the bus discarded them): the totals cover only part of the day.
+	// The flow engine never sets it; see RECOVERY_TRUNCATED in docs/data-quality.md.
+	Partial bool `json:"partial"`
 }

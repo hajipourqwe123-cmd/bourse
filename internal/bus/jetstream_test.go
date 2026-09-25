@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,8 +20,19 @@ import (
 // startServer runs an in-process JetStream server in a temp dir and returns its client URL.
 func startServer(t *testing.T) string {
 	t.Helper()
-	s, err := server.NewServer(&server.Options{Host: "127.0.0.1", Port: -1, JetStream: true,
-		StoreDir: t.TempDir(), NoLog: true, NoSigs: true})
+	dir := t.TempDir()
+	// max_file_store is an accounting limit (the default streams reserve 26 GiB of MaxBytes);
+	// it is only honoured from a config file, like infra/nats/nats.conf.
+	conf := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf("listen: \"127.0.0.1:-1\"\njetstream { store_dir: %q, max_file_store: 64G }\n", dir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := server.ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.NoLog, opts.NoSigs = true, true
+	s, err := server.NewServer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,25 +279,29 @@ func TestReplayUpToAndFromStart(t *testing.T) {
 	publishN(t, j, "4", "5", "6")
 	collect := func(start time.Time, upTo uint64) string {
 		var s []string
-		if err := j.Replay(ctxT(t), StreamMD, "md.snap.>", start, upTo, func(m Msg) error {
+		last, err := j.Replay(ctxT(t), StreamMD, "md.snap.>", start, upTo, func(m Msg) error {
 			s = append(s, string(m.Data))
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.Join(s, "")
+		return fmt.Sprintf("%s@%d", strings.Join(s, ""), last)
 	}
-	if got := collect(time.Time{}, 4); got != "1234" {
+	if got := collect(time.Time{}, 4); got != "1234@4" {
 		t.Errorf("whole stream to 4: %q", got)
 	}
-	if got := collect(mid, 5); got != "45" {
+	if got := collect(mid, 5); got != "45@5" {
 		t.Errorf("from mid to 5: %q", got)
 	}
-	if got := collect(time.Time{}, 0); got != "" {
+	if got := collect(time.Time{}, 0); got != "@0" {
 		t.Errorf("upTo 0: %q", got)
 	}
-	if got := collect(time.Time{}, 99); got != "123456" {
+	if got := collect(time.Time{}, 99); got != "123456@6" {
 		t.Errorf("upTo beyond end: %q", got)
+	}
+	if got := collect(time.Now().Add(time.Hour), 6); got != "@0" {
+		t.Errorf("start after every message: %q", got)
 	}
 }
 
@@ -310,9 +327,19 @@ func TestStreamLimitsDiscardOldAndAreReported(t *testing.T) {
 	if n := strings.Count(logs.String(), "stream MD at"); n != 1 {
 		t.Errorf("limit logged %d times, want 1: %s", n, logs.String())
 	}
+	defer func() {
+		st, _ := j.js.Stream(ctxT(t), StreamMD)
+		if err := st.Purge(ctxT(t)); err != nil {
+			t.Fatal(err)
+		}
+		j.checkLimits(full)
+		if !strings.Contains(logs.String(), "stream MD back below MaxBytes") {
+			t.Errorf("recovery below the limit not logged: %s", logs.String())
+		}
+	}()
 	consumeUntil(t, j, mdSpec(), func(m Msg) error { got = append(got, m.StreamSeq); return nil },
 		func() bool { return true })
-	if want := fmt.Sprintf("stream sequences 2..%d were discarded", info.State.FirstSeq-1); !strings.Contains(logs.String(), want) {
+	if want := fmt.Sprintf("stream sequences 2..%d were not delivered", info.State.FirstSeq-1); !strings.Contains(logs.String(), want) {
 		t.Errorf("gap not logged (want %q): %s", want, logs.String())
 	}
 }
@@ -323,19 +350,25 @@ func TestConnectErrorHidesURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected connect error")
 	}
-	for _, leak := range []string{"s3cret", "alice", u} {
+	for _, leak := range []string{"s3cret", "alice:", u} {
 		if strings.Contains(err.Error(), leak) {
 			t.Fatalf("error leaks %q: %v", leak, err)
 		}
 	}
-	if got := redactURL("dial "+u+" failed for s3cret", u); strings.Contains(got, "s3cret") || strings.Contains(got, "alice") {
+	if got := redactURL("dial "+u+" failed for alice:s3cret@x", u); strings.Contains(got, "s3cret") || strings.Contains(got, "alice") {
 		t.Fatalf("redactURL: %s", got)
+	}
+	list := "nats://a:p1@h1:4222, nats://b:p2@h2:4222"
+	if got := redactURL("dial nats://b:p2@h2:4222: refused (pass p2, also p1)", list); strings.Contains(got, "p1") ||
+		strings.Contains(got, "p2") || strings.Contains(got, "@h2") || !strings.Contains(got, "dial <NATS_URL>: refused") {
+		t.Fatalf("redactURL server list: %s", got)
 	}
 }
 
 func TestRetry(t *testing.T) {
 	n, before := 0, 0
-	err := Retry([]time.Duration{0, 0, 0}, func() { before++ }, func() error {
+	ctx := context.Background()
+	err := Retry(ctx, []time.Duration{0, 0, 0}, func() { before++ }, func() error {
 		n++
 		if n < 3 {
 			return errors.New("x")
@@ -346,7 +379,104 @@ func TestRetry(t *testing.T) {
 		t.Fatalf("err=%v n=%d before=%d", err, n, before)
 	}
 	n = 0
-	if err := Retry([]time.Duration{0, 0}, nil, func() error { n++; return errors.New("x") }); err == nil || n != 3 {
+	if err := Retry(ctx, []time.Duration{0, 0}, nil, func() error { n++; return errors.New("x") }); err == nil || n != 3 {
 		t.Fatalf("exhausted: err=%v n=%d", err, n)
+	}
+	n = 0
+	if err := Retry(ctx, []time.Duration{time.Hour}, nil, func() error { n++; return Permanent(errors.New("x")) }); err == nil || n != 1 {
+		t.Fatalf("permanent error retried: err=%v n=%d", err, n)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	n = 0
+	start := time.Now()
+	err = Retry(cctx, []time.Duration{time.Hour}, nil, func() error { n++; return errors.New("x") })
+	if !errors.Is(err, context.Canceled) || n != 1 || time.Since(start) > time.Second {
+		t.Fatalf("cancelled: err=%v n=%d", err, n)
+	}
+}
+
+// MaxDeliver < 0: a message keeps being redelivered until it succeeds (never terminated).
+func TestConsumeUnlimitedMaxDeliver(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, "x", "y")
+	spec := mdSpec()
+	spec.MaxDeliver = -1
+	calls := 0
+	var got []string
+	consumeUntil(t, j, spec, func(m Msg) error {
+		if string(m.Data) == "x" {
+			if calls++; calls < 7 {
+				return errors.New("transient")
+			}
+		}
+		got = append(got, string(m.Data))
+		return nil
+	}, func() bool { return len(got) == 2 })
+	if strings.Join(got, "") != "xy" || calls != 7 {
+		t.Fatalf("got %v after %d calls", got, calls)
+	}
+}
+
+func TestConsumerDefaults(t *testing.T) {
+	var c ConsumerSpec
+	c.defaults()
+	if c.AckWait != 10*time.Second || c.MaxDeliver != 5 || fmt.Sprint(c.Backoff) != "[1s 2s 4s 8s]" {
+		t.Fatalf("defaults %+v", c)
+	}
+	c = ConsumerSpec{MaxDeliver: -1}
+	c.defaults()
+	if c.MaxDeliver != -1 {
+		t.Fatalf("unlimited MaxDeliver overwritten: %d", c.MaxDeliver)
+	}
+}
+
+func TestCheckpointRoundTrip(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	if _, ok, err := j.LoadCheckpoint(ctxT(t), "engine"); ok || err != nil {
+		t.Fatalf("empty: ok=%v err=%v", ok, err)
+	}
+	for _, cp := range []Checkpoint{{Seq: 7, Day: "2026-09-23"}, {Seq: 90, Day: "2026-09-24"}} {
+		if err := j.SaveCheckpoint(ctxT(t), "engine", cp); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok, err := j.LoadCheckpoint(ctxT(t), "engine"); !ok || err != nil || got != cp {
+			t.Fatalf("got %+v ok=%v err=%v, want %+v", got, ok, err, cp)
+		}
+	}
+}
+
+// BeforeAck failing stops the consumer without acking: the message comes back to the next one.
+func TestConsumeBeforeAckBlocksAck(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, "1", "2")
+	spec := mdSpec()
+	stop := errors.New("lease lost")
+	n := 0
+	spec.BeforeAck = func() error {
+		if n++; n == 2 {
+			return stop
+		}
+		return nil
+	}
+	err := consumeUntil(t, j, spec, func(Msg) error { return nil }, func() bool { return false })
+	if !errors.Is(err, stop) {
+		t.Fatalf("err %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if f, _ := j.AckFloor(ctxT(t), StreamMD, "engine"); f != 1 {
+		t.Fatalf("ack floor %d, want 1", f)
+	}
+}
+
+func TestDialDoesNotTouchStreams(t *testing.T) {
+	url := startServer(t)
+	j, err := DialJetStream(context.Background(), url, "test", DefaultStreams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if _, err := j.js.Stream(ctxT(t), StreamMD); err == nil {
+		t.Fatal("DialJetStream created streams")
 	}
 }

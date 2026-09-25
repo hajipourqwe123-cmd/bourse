@@ -13,6 +13,7 @@
 | آداپتور بازپخش (`replay`) | آماده، آزمون شده |
 | آداپتور سورس‌آرنا | **موقت**: نگاشت ۴ فیلد تأیید نشده؛ بدون توکن زنده آزمون نشده (وظیفه D-03) |
 | گذرگاه NATS JetStream (`BUS=nats`، `internal/bus`) | آماده (P-01)؛ بازیابی حالت پس از راه‌اندازی دوباره، آزمون با سرور NATS درون‌فرایندی |
+| اجاره تک‌نمونه engine (JetStream KV) | آماده (P-02)؛ engine دوم از شروع سر باز می‌زند |
 | نویسنده ClickHouse، دروازه Centrifugo | اسپرینت ۱ و ۲ |
 | `infra/docker-compose.yml` و DDL کلیک‌هاوس | اجرا و آزموده شده (I-01): هر ۵ سرویس سالم، ۴ جدول ساخته می‌شود |
 | رابط کاربری | اسپرینت ۲ |
@@ -37,9 +38,10 @@ make down
 اجرا روی NATS (پس از `make up`؛ پیش‌فرض همچنان NDJSON است):
 
 ```bash
+make demo-nats     # روز ساختگی → یک NATS دورریختنی جدا (نه پشته مشترک)؛ engine تا انتها اجرا و خارج می‌شود
 make build
-BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine
-BUS=nats SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector
+BUS=nats bin/engine &                                                  # مصرف‌کننده پایدار engine (اجاره تک‌نمونه)
+SOURCE=sourcearena BUS=nats bin/collector                             # فقط در COLLECT_WINDOW (پیش‌فرض ۰۸:۳۰–۱۳:۰۰)
 go run ./cmd/syngen -n 300 > /tmp/syn300.ndjson                        # بار آزمایشی ۳۰۰ نماد
 ```
 
