@@ -77,7 +77,7 @@
 | مسیر | پاسخ |
 | --- | --- |
 | `GET /api/v1/state` | `seq`، `now`، `day`، جلسه‌های امروز هر گروه (از تقویم)، `calendar_unverified`، `hot_threshold` و `plus_threshold` (ریال)، `stale_after_ms`، `centrifugo_ws`، `summary`، `rows`، `radar` |
-| `GET /api/v1/time` | `{now}`: ساعت سرور بر حسب میلی‌ثانیه یونیکس، برای برآورد اختلاف ساعت مرورگر |
+| `GET /api/v1/time` | `{now}`: ساعت سرور بر حسب میلی‌ثانیه یونیکس، برای برآورد اختلاف ساعت مرورگر. فقط با `DEMO_CLOCK`: `{now, rate}` (ساعت نمایشی، `docs/demo-clock.md`) |
 | `GET /api/v1/token` | توکن اتصال Centrifugo (توضیح پایین) |
 | `GET /healthz` | ۲۰۰ پس از بازخوانی |
 | `/` | خروجی ایستای `web/` (`WEB_DIR`) |

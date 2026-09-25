@@ -147,11 +147,17 @@ export function LiveChip() {
 export function DemoChip({ long = true }: { long?: boolean }) {
   const s = useMarket();
   if (!s.summary?.syn) return null;
-  return <span className="chip chip-demo">{long ? "داده نمایشی – غیرواقعی" : "داده نمایشی"}</span>;
+  const demo = s.state?.demo_clock;
+  return (
+    <span className="chip chip-demo" data-testid="demo-chip">
+      {long ? "داده نمایشی – غیرواقعی" : "داده نمایشی"}
+      {demo && ` · ساعت نمایشی ×${num(demo.rate, 0)}`}
+    </span>
+  );
 }
 
 export function Header({ query, onQuery }: { query: string; onQuery: (q: string) => void }) {
-  const now = useNow();
+  const now = useMarket().serverNow(useNow());
   const d = new Date(now);
   return (
     <header className="header">

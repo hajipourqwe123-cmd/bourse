@@ -62,6 +62,12 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// SetClock replaces the wall clock used for the shift and the pacing (DEMO_CLOCK: a virtual clock
+// whose sleep takes a demo duration). Call it before the first Fetch.
+func (r *Rebase) SetClock(now func() time.Time, sleep func(ctx context.Context, d time.Duration) error) {
+	r.now, r.sleep = now, sleep
+}
+
 func (r *Rebase) Name() string { return fmt.Sprintf("rebase(%s):%s", r.mode, r.src.Name()) }
 
 // Shift is the applied shift (zero before the first batch).

@@ -8,6 +8,8 @@
 //	REPLAY_REBASE=today|now                  # DEV ONLY: re-time a recording to the present, paced in real time
 //	                                         #   today: onto today's date (REPLAY_DATE=YYYY-MM-DD for another day)
 //	                                         #   now: recording time REPLAY_AT (default 10:00) = the current instant
+//	DEMO_CLOCK="last 11:40" DEMO_CLOCK_RATE=5 DEMO_CLOCK_ANCHOR=<unix s>
+//	                                         # DEV ONLY: synthetic replay on a virtual clock (docs/demo-clock.md)
 package main
 
 import (
@@ -24,6 +26,7 @@ import (
 	"bourse/internal/bus"
 	"bourse/internal/calendar"
 	"bourse/internal/config"
+	"bourse/internal/democlock"
 	"bourse/internal/model"
 	"bourse/internal/source"
 	"bourse/internal/tehran"
@@ -99,6 +102,20 @@ func run() int {
 		log.Printf("collector: WARNING: calendar sessions span up to %s a day, more than the %s the bus streams are sized for (contracts/subjects.md)",
 			span, bus.SizedSessionSpan)
 	}
+	demo, err := democlock.FromEnv(cal, time.Now())
+	if err != nil {
+		log.Printf("collector: %v", err)
+		return 1
+	}
+	if demo != nil {
+		rb, err := demoReplay(src, isReplay, demo)
+		if err != nil {
+			log.Printf("collector: %v", err)
+			return 1
+		}
+		log.Printf("collector: WARNING: DEMO_CLOCK: synthetic day replayed on a virtual clock from %s (local review only; docs/demo-clock.md)", demo)
+		src, replayDelay = rb, 0
+	}
 	if mode := config.Str("REPLAY_REBASE", ""); mode != "" {
 		if !isReplay {
 			log.Printf("collector: REPLAY_REBASE needs SOURCE=replay")
@@ -142,6 +159,10 @@ func run() int {
 		if errors.Is(err, source.ErrDone) {
 			log.Printf("collector: source exhausted")
 			return 0
+		}
+		if errors.Is(err, source.ErrNotSynthetic) {
+			log.Printf("collector: %v", err)
+			return 1
 		}
 		if err != nil {
 			log.Printf("collector: fetch error: %v (retry in %s)", err, backoff)
@@ -285,6 +306,26 @@ func (f *publishFilter) warnUnmapped(batch []model.Snapshot) {
 	if n > 0 {
 		log.Printf("collector: WARNING: %d of %d instruments have no class in the session calendar (class %q; see docs/sessions.md)", n, len(batch), calendar.Unknown)
 	}
+}
+
+// demoReplay wraps a replay for DEMO_CLOCK (docs/demo-clock.md): synthetic snapshots only,
+// re-timed onto the demo day and paced by the demo clock (earlier ones are sent at once), and a
+// bus on this machine only.
+func demoReplay(src source.Source, isReplay bool, demo *democlock.Clock) (source.Source, error) {
+	if !isReplay || config.Str("REPLAY_REBASE", "") != "" {
+		return nil, errors.New("DEMO_CLOCK needs SOURCE=replay and no REPLAY_REBASE")
+	}
+	if config.Str("BUS", "ndjson") == "nats" {
+		if err := democlock.RequireLoopback(config.Str("NATS_URL", "nats://127.0.0.1:4222")); err != nil {
+			return nil, err
+		}
+	}
+	rb, err := source.NewRebase(source.SyntheticOnly{Source: src}, source.RebaseToday, demo.Now(), 0)
+	if err != nil {
+		return nil, err
+	}
+	rb.SetClock(demo.Now, demo.Sleep)
+	return rb, nil
 }
 
 // rebase wraps a replay for REPLAY_REBASE. "today" is refused on a day no class trades (the

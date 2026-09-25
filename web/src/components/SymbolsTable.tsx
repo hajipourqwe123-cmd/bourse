@@ -38,7 +38,7 @@ function byDesc(key: (r: Row) => number | null) {
 
 export function SymbolsTable({ query }: { query: string }) {
   const s = useMarket();
-  const now = useNow(5000) + s.offsetMs;
+  const now = s.serverNow(useNow(5000));
   const [tab, setTab] = useState<Tab>("value");
   const sessions = s.state?.sessions ?? [];
   const staleAfter = s.state?.stale_after_ms ?? 30_000;

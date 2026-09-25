@@ -16,6 +16,9 @@ export class MarketStore {
   seq = 0;
   connection: Connection = "connecting";
   offsetMs = 0;
+  /** Demo clock speed (DEMO_CLOCK; 1 otherwise) and the browser time the offset was measured at. */
+  clockRate = 1;
+  clockAt = 0;
   clockSynced = false;
   latency = new LatencyWindow();
   lastLatency: { ms: number; basis: LatencyBasis; n: number } | null = null;
@@ -44,9 +47,19 @@ export class MarketStore {
     }
   }
 
-  setOffset(ms: number) {
+  setOffset(ms: number, rate = 1, at = 0) {
     this.offsetMs = ms;
+    this.clockRate = rate;
+    this.clockAt = at;
     this.clockSynced = true;
+  }
+
+  /**
+   * The gateway's clock (ms) at browser time browserMs: browser time + offset; under a demo
+   * clock (rate ≠ 1) extrapolated from the measurement at the demo speed.
+   */
+  serverNow(browserMs: number): number {
+    return browserMs + this.offsetMs + (this.clockRate - 1) * (browserMs - this.clockAt);
   }
 
   /** Replaces everything with a full state, then applies buffered newer deltas. */
@@ -93,7 +106,7 @@ export class MarketStore {
       const step = Math.max(1, Math.ceil(m.rows.length / SAMPLES_PER_DELTA));
       for (let i = 0; i < m.rows.length; i += step) {
         const r = m.rows[i];
-        const l = latencyMs(receivedMs, this.offsetMs, r.src, r.ing, r.est);
+        const l = latencyMs(this.serverNow(receivedMs), 0, r.src, r.ing, r.est, this.clockRate);
         this.latency.add(receivedMs, l.ms, l.basis);
       }
       this.lastLatency = this.latency.p95(receivedMs);

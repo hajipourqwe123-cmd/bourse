@@ -13,6 +13,8 @@
 //	WEB_DIR=web/out                      # static web build served at /
 //	ALLOW_SYNTHETIC_ON_BUS=1             # show SYN* data; disposable local stacks only (rule 5)
 //	HOT_THRESHOLD_RIAL, PLUS_THRESHOLD_RIAL, STALE_AFTER, SESSIONS_FILE: same values as the engine
+//	DEMO_CLOCK, DEMO_CLOCK_RATE, DEMO_CLOCK_ANCHOR   # DEV ONLY: virtual clock for a synthetic replay
+//	                                     # (same values as the collector; docs/demo-clock.md)
 package main
 
 import (
@@ -31,6 +33,7 @@ import (
 	"bourse/internal/bus"
 	"bourse/internal/calendar"
 	"bourse/internal/config"
+	"bourse/internal/democlock"
 	"bourse/internal/market"
 )
 
@@ -48,7 +51,8 @@ type Config struct {
 	AllowSynthetic bool
 	StaleAfter     time.Duration
 	Market         market.Config
-	Tick           time.Duration // publish period
+	Tick           time.Duration    // publish period
+	Demo           *democlock.Clock // DEMO_CLOCK; nil (always, in production) = the wall clock
 }
 
 func loadConfig() (Config, error) {
@@ -60,6 +64,10 @@ func loadConfig() (Config, error) {
 	m.Sessions = cal
 	m.HotThreshold = config.Int("HOT_THRESHOLD_RIAL", m.HotThreshold)
 	m.PlusThreshold = config.Int("PLUS_THRESHOLD_RIAL", m.PlusThreshold)
+	demo, err := democlock.FromEnv(cal, time.Now())
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		Addr:           config.Str("GATEWAY_ADDR", "127.0.0.1:8080"),
 		NATSURL:        config.Str("NATS_URL", "nats://127.0.0.1:4222"),
@@ -74,6 +82,7 @@ func loadConfig() (Config, error) {
 		StaleAfter:     config.Dur("STALE_AFTER", 30*time.Second),
 		Market:         m,
 		Tick:           time.Second,
+		Demo:           demo,
 	}, nil
 }
 
@@ -114,6 +123,9 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	if err := checkLoopback(cfg.Addr); err != nil {
 		return err
 	}
+	if err := checkDemo(cfg); err != nil {
+		return err
+	}
 	if cfg.LeaseTTL < 3*time.Second {
 		return fmt.Errorf("GATEWAY_LEASE_TTL %s is below 3s", cfg.LeaseTTL)
 	}
@@ -146,9 +158,15 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 		_ = lease.Release(rctx)
 	}()
 
-	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, time.Now)
-	h.store = js
-	h.loadPrevTotals(ctx)
+	now := time.Now
+	if cfg.Demo != nil {
+		now = cfg.Demo.Now
+	}
+	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, now)
+	if cfg.Demo == nil { // a demo day must not become anyone's previous-day totals
+		h.store = js
+		h.loadPrevTotals(ctx)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 6)
@@ -177,6 +195,23 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	case err := <-errc:
 		return err
 	}
+}
+
+// checkDemo: DEMO_CLOCK only with synthetic data allowed and every endpoint on this machine. The
+// hub then shows synthetic data only (hub.skip).
+func checkDemo(cfg Config) error {
+	if cfg.Demo == nil {
+		return nil
+	}
+	if !cfg.AllowSynthetic {
+		return errors.New("DEMO_CLOCK needs ALLOW_SYNTHETIC_ON_BUS=1 (it replays synthetic data only)")
+	}
+	if err := democlock.RequireLoopback(cfg.NATSURL, cfg.CentrifugoAPI, cfg.CentrifugoWS); err != nil {
+		return err
+	}
+	log.Printf("gateway: WARNING: DEMO_CLOCK: dashboard runs on a virtual clock from %s; synthetic data only, "+
+		"no totals persisted (local review only; docs/demo-clock.md)", cfg.Demo)
+	return nil
 }
 
 func holder() string {

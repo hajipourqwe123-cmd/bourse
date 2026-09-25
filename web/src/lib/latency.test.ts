@@ -9,7 +9,7 @@ describe("clock offset", () => {
       { t0: 2000, server: 4050, t1: 2100 }, // rtt 100: offset 4050 − 2050 = 2000
       { t0: 3000, server: 5200, t1: 3500 },
     ]);
-    expect(est).toEqual({ offset: 2000, rtt: 100 });
+    expect(est).toEqual({ offset: 2000, rtt: 100, at: 2050 });
   });
   it("ignores unusable samples", () => {
     expect(estimateOffset([])).toBeNull();
@@ -24,6 +24,11 @@ describe("latency", () => {
     const recv = Date.parse(src) + 1500 - 2000; // browser clock 2 s behind
     expect(latencyMs(recv, 2000, src, ing, false)).toEqual({ ms: 1500, basis: "source" });
     expect(latencyMs(recv, 2000, src, ing, true)).toEqual({ ms: 500, basis: "ingest" });
+  });
+  it("demo clock: latency in real ms", () => {
+    const src = "2026-09-23T08:10:00.000Z";
+    // 5 demo seconds after the source time at ×5 = 1 real second
+    expect(latencyMs(Date.parse(src) + 5000, 0, src, src, false, 5)).toEqual({ ms: 1000, basis: "source" });
   });
   it("nearest-rank p95", () => {
     const v = Array.from({ length: 100 }, (_, i) => i + 1);

@@ -55,6 +55,16 @@ describe("store sequencing", () => {
     s.applySymbols({ day: "2026-09-23", seq: 2, gw: "", rows: [row("A")] }, src + 1000);
     expect(s.lastLatency).toEqual({ ms: 500, basis: "source", n: 1 });
   });
+  it("demo clock: server time runs at the demo rate from the measurement", () => {
+    const s = new MarketStore();
+    expect(s.serverNow(1000)).toBe(1000); // not synced: the browser clock
+    s.setOffset(-500);
+    expect(s.serverNow(10_000)).toBe(9_500); // production: a fixed offset
+    const demoStart = Date.parse("2026-09-23T08:10:00Z"); // 11:40 Tehran
+    s.setOffset(demoStart - 50_000, 5, 50_000); // measured at browser 50 s
+    expect(s.serverNow(50_000)).toBe(demoStart);
+    expect(s.serverNow(60_000)).toBe(demoStart + 50_000); // 10 real s = 50 demo s
+  });
 });
 
 const sess = (cls: SessionInfo["class"], start: string, close: string): SessionInfo =>

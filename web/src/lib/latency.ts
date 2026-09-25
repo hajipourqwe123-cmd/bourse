@@ -9,16 +9,18 @@ export interface ClockSample {
 
 /**
  * NTP-style offset (server − browser) from the sample with the smallest round trip: the server
- * time is assumed to be read half-way through it (RTT/2). null without a usable sample.
+ * time is assumed to be read half-way through it (RTT/2), at browser time `at`. null without a
+ * usable sample.
  */
-export function estimateOffset(samples: ClockSample[]): { offset: number; rtt: number } | null {
+export function estimateOffset(samples: ClockSample[]): { offset: number; rtt: number; at: number } | null {
   let best: ClockSample | null = null;
   for (const s of samples) {
     if (!(s.t1 >= s.t0) || !Number.isFinite(s.server)) continue;
     if (!best || s.t1 - s.t0 < best.t1 - best.t0) best = s;
   }
   if (!best) return null;
-  return { offset: best.server - (best.t0 + best.t1) / 2, rtt: best.t1 - best.t0 };
+  const at = (best.t0 + best.t1) / 2;
+  return { offset: best.server - at, rtt: best.t1 - best.t0, at };
 }
 
 export type LatencyBasis = "source" | "ingest";
@@ -26,12 +28,13 @@ export type LatencyBasis = "source" | "ingest";
 /**
  * Latency of one message: (browser receive time + offset) − the value's source time; when the
  * source time was estimated by the collector (est) the ingest time is used instead and the
- * figure is labelled «از زمان دریافت».
+ * figure is labelled «از زمان دریافت». rate is the demo clock's speed (DEMO_CLOCK; 1 otherwise):
+ * the result is always in real milliseconds.
  */
-export function latencyMs(receivedMs: number, offsetMs: number, src: string, ing: string, est: boolean | undefined): { ms: number; basis: LatencyBasis } {
+export function latencyMs(receivedMs: number, offsetMs: number, src: string, ing: string, est: boolean | undefined, rate = 1): { ms: number; basis: LatencyBasis } {
   const basis: LatencyBasis = est ? "ingest" : "source";
   const from = Date.parse(basis === "ingest" ? ing : src);
-  return { ms: receivedMs + offsetMs - from, basis };
+  return { ms: (receivedMs + offsetMs - from) / rate, basis };
 }
 
 export const BASIS_LABEL: Record<LatencyBasis, string> = { source: "از منبع", ingest: "از زمان دریافت" };
