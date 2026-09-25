@@ -691,11 +691,32 @@ a:hover {
   font-weight: 700;
 }
 
+.tr > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.method-link {
+  color: var(--link);
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--touch);
+  min-width: var(--touch);
+}
+
 /* ---------- market map ---------- */
 .map {
   position: relative;
   height: 300px;
   direction: ltr;
+}
+
+.tile > div {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tile {

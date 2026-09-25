@@ -108,6 +108,9 @@ func Default() *Calendar {
 	return c
 }
 
+// EmbeddedJSON returns a copy of the embedded sessions.json (e.g. to derive a development file).
+func EmbeddedJSON() []byte { return append([]byte(nil), embedded...) }
+
 // Load reads path, or returns the embedded calendar when path is empty.
 func Load(path string) (*Calendar, error) {
 	if path == "" {

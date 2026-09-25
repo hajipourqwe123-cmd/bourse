@@ -1,6 +1,6 @@
 "use client";
 import { useId, useState } from "react";
-import { CLASS_LABEL, clock, money, num, signedNum, UNAVAILABLE } from "../lib/format";
+import { CLASS_LABEL, clock, num, signedNum, UNAVAILABLE } from "../lib/format";
 import { axisPos, phase, rowSession, SESSION_ROWS, statusText } from "../lib/session";
 import type { ClassFlow, ClassName, KPI } from "../lib/types";
 import { useMarket, useNow } from "./hooks";
@@ -90,11 +90,11 @@ function KpiCard({ k }: { k: KPI }) {
         <span className="end t-label">{st.text}</span>
       </div>
       <div className="kpi-value">
-        {k.value === null ? <NA /> : <span className="t-kpi num">{money(k.value)}</span>}
+        {k.value === null ? <NA /> : <span className="t-kpi"><Money rial={k.value} /></span>}
       </div>
       {k.secondary && (
         <span className="t-label">
-          {CLASS_LABEL[k.secondary.class]} (جدا): {k.secondary.value === null ? UNAVAILABLE : <span className="num">{money(k.secondary.value)}</span>}
+          {CLASS_LABEL[k.secondary.class]} (جدا): <Money rial={k.secondary.value} />
         </span>
       )}
       <div className="bars desktop-only" role="img" aria-label="ارزش معاملات هر ۱۰ دقیقه">

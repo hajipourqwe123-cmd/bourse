@@ -1,6 +1,6 @@
 "use client";
 // Shared building blocks. Every number goes through Num/Money/Pct: missing → «داده در دسترس نیست».
-import { age, arrow, CLASS_LABEL, classFamily, direction, money, moneyIn, moneyUnit, pct, UNAVAILABLE, type MoneyUnit } from "../lib/format";
+import { age, arrow, CLASS_LABEL, classFamily, direction, moneyIn, moneyUnit, pct, UNAVAILABLE, UNIT_LABEL, type MoneyUnit } from "../lib/format";
 import { useMarket, useNow } from "./hooks";
 import type { ClassName } from "../lib/types";
 import { ZERO_TIME } from "../lib/types";
@@ -14,11 +14,12 @@ export function Money({ rial, signed = false, unit, bare = false }: { rial: numb
   if (rial === null || rial === undefined) return <NA />;
   const u = unit ?? moneyUnit(rial);
   const d = signed ? (u === "hemmat" ? direction(rial / 1e13, 1) : direction(rial / 1e7, 0)) : "flat";
-  const text = bare ? moneyIn(rial, u, signed) : money(rial, signed, u);
+  // Only the number is an LTR island; the unit follows it in RTL reading order («۹٫۶ همت»).
   return (
     <span className={d === "up" ? "up" : d === "down" ? "down" : undefined}>
       {signed && d !== "flat" ? <span aria-hidden="true">{arrow(d)} </span> : null}
-      <span className="num">{text}</span>
+      <span className="num">{moneyIn(rial, u, signed)}</span>
+      {bare ? null : ` ${UNIT_LABEL[u]}`}
     </span>
   );
 }
@@ -61,7 +62,7 @@ export function Unavailable({ title, reason }: { title?: string; reason: string 
 
 export function MethodLink({ anchor }: { anchor: string }) {
   return (
-    <a className="t-label" style={{ color: "var(--link)" }} href={`method/#${anchor}`}>
+    <a className="t-label method-link" href={`method/#${anchor}`}>
       روش محاسبه
     </a>
   );
