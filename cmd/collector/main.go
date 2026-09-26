@@ -104,12 +104,14 @@ func run() int {
 		log.Printf("collector: WARNING: no official holiday listed in the session calendar for the next 12 months; " +
 			"on an unlisted holiday the vendor's previous-day data would be collected as today's (docs/sessions.md)")
 	}
+	_, budgeted := src.(*source.BrsApi)
 	if b, ok := src.(*source.BrsApi); ok {
 		cfg := b.Config()
 		if err := brsapiBudget(len(cfg.Types), interval, cal.MaxDailySpan(), int64(cfg.DailyLimit), brsPer5); err != nil {
 			log.Printf("collector: %v", err)
 			return 1
 		}
+		brsapiIntervalWarning(interval)
 	}
 	if span := cal.MaxDailySpan(); span > bus.SizedSessionSpan {
 		log.Printf("collector: WARNING: calendar sessions span up to %s a day, more than the %s the bus streams are sized for (contracts/subjects.md)",
@@ -145,7 +147,7 @@ func run() int {
 				select {
 				case <-ctx.Done():
 					return 0
-				case <-time.After(interval):
+				case <-time.After(outsideWait(cal, now, interval)):
 				}
 				continue
 			}
@@ -159,12 +161,27 @@ func run() int {
 			log.Printf("collector: source exhausted")
 			return 0
 		}
-		if err != nil {
-			log.Printf("collector: fetch error: %v (retry in %s)", err, backoff)
+		if errors.Is(err, source.ErrBudget) {
+			// The plan's quota is spent: no request until the next Tehran day.
+			wait := tehran.DayStart(time.Now().Add(24 * time.Hour)).Sub(time.Now())
+			log.Printf("collector: %v; pausing %s until the next Tehran day", err, wait.Round(time.Minute))
 			select {
 			case <-ctx.Done():
 				return 0
-			case <-time.After(backoff):
+			case <-time.After(wait):
+			}
+			continue
+		}
+		if err != nil {
+			wait := backoff
+			if budgeted && wait < interval { // every attempt costs quota: never faster than planned
+				wait = interval
+			}
+			log.Printf("collector: fetch error: %v (retry in %s)", err, wait)
+			select {
+			case <-ctx.Done():
+				return 0
+			case <-time.After(wait):
 			}
 			if backoff < time.Minute {
 				backoff *= 2
@@ -208,6 +225,17 @@ func run() int {
 			return 0
 		}
 	}
+}
+
+// outsideWait is the sleep outside the session union: one poll interval, but never past today's
+// pre-open, so a long interval still takes the day's first poll (its baseline) at the pre-open.
+func outsideWait(cal *calendar.Calendar, now time.Time, interval time.Duration) time.Duration {
+	if u, open := cal.Union(now); open && now.Before(u.PreOpen) {
+		if d := u.PreOpen.Sub(now); d < interval {
+			return d
+		}
+	}
+	return interval
 }
 
 // publishSnapshot publishes s; on JetStream with a message ID built from the instrument, source

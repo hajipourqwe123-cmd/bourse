@@ -54,9 +54,13 @@ const BrsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 // ErrBudget: the day's request budget (plan quota) is used up; nothing was sent.
 var ErrBudget = errors.New("brsapi: daily request budget reached")
 
-// NewBrsApi builds the adapter.
+// NewBrsApi builds the adapter. Redirects are not followed: they would carry the key-bearing
+// query to another URL (and into error messages).
 func NewBrsApi(cfg BrsApiConfig) *BrsApi {
-	return &BrsApi{cfg: cfg, client: &http.Client{Timeout: cfg.Timeout}, now: time.Now}
+	client := &http.Client{Timeout: cfg.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	return &BrsApi{cfg: cfg, client: client, now: time.Now}
 }
 
 func (b *BrsApi) Name() string { return "brsapi" }
@@ -65,17 +69,18 @@ func (b *BrsApi) Name() string { return "brsapi" }
 func (b *BrsApi) Config() BrsApiConfig { return b.cfg }
 
 // Fetch polls every configured type once and returns the union (first row wins on a repeated
-// instrument code).
+// instrument code). The budget for all types is reserved first, so a poll is never cut short
+// after some of its requests were paid for.
 func (b *BrsApi) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if b.cfg.Key == "" {
 		return nil, errors.New("brsapi: BRSAPI_KEY is not set")
 	}
+	if err := b.take(len(b.cfg.Types)); err != nil {
+		return nil, err
+	}
 	var out []model.Snapshot
 	seen := map[string]bool{}
 	for _, typ := range b.cfg.Types {
-		if err := b.take(); err != nil {
-			return nil, err
-		}
 		body, err := b.get(ctx, typ)
 		if err != nil {
 			return nil, err
@@ -94,17 +99,19 @@ func (b *BrsApi) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	return out, nil
 }
 
-// take counts one request against the day's budget, or refuses it.
-func (b *BrsApi) take() error {
+// take counts n requests against the day's budget, or refuses all of them. The count lives in
+// this process: a restart starts again from 0 (the vendor's own quota still applies; its
+// quota error is reported as ErrBudget).
+func (b *BrsApi) take(n int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if d := tehran.TradingDay(b.now()); d != b.day {
 		b.day, b.used = d, 0
 	}
-	if b.used >= b.cfg.DailyLimit {
-		return fmt.Errorf("%w (%d requests on %s; BRSAPI_DAILY_LIMIT=%d)", ErrBudget, b.used, b.day, b.cfg.DailyLimit)
+	if b.used+n > b.cfg.DailyLimit {
+		return fmt.Errorf("%w (%d requests on %s, %d more needed; BRSAPI_DAILY_LIMIT=%d)", ErrBudget, b.used, b.day, n, b.cfg.DailyLimit)
 	}
-	b.used++
+	b.used += n
 	return nil
 }
 
@@ -125,6 +132,10 @@ func (b *BrsApi) get(ctx context.Context, typ string) ([]byte, error) {
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	resp, err := b.client.Do(req)
 	if err != nil {
+		var ue *url.Error // its message carries the whole URL: report only the operation and cause
+		if errors.As(err, &ue) {
+			err = fmt.Errorf("%s: %w", ue.Op, ue.Err)
+		}
 		return nil, fmt.Errorf("brsapi: request failed: %s", redact(err.Error(), b.cfg.Key))
 	}
 	defer resp.Body.Close()
@@ -132,18 +143,23 @@ func (b *BrsApi) get(ctx context.Context, typ string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("brsapi: read body: %s", redact(err.Error(), b.cfg.Key))
 	}
-	if msg, isErr := vendorError(body); resp.StatusCode != http.StatusOK || isErr {
+	msg, isErr, quota := vendorError(body)
+	if quota {
+		return nil, fmt.Errorf("%w: vendor quota: %s", ErrBudget, redact(msg, b.cfg.Key))
+	}
+	if resp.StatusCode != http.StatusOK || isErr {
 		return nil, fmt.Errorf("brsapi type=%s: HTTP %d: %s", typ, resp.StatusCode, redact(msg, b.cfg.Key))
 	}
 	return body, nil
 }
 
 // vendorError reads the vendor's error object ({"successful": false, "status", "message_error",
-// "account": {usage…}}); a JSON array is a data payload.
-func vendorError(body []byte) (string, bool) {
+// "account": {usage…}}); a JSON array is a data payload. quota: the plan's daily or 5-minute
+// quota is used up, or the key is blocked.
+func vendorError(body []byte) (msg string, isErr, quota bool) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
-		return "", false
+		return "", false, false
 	}
 	var e struct {
 		Successful *bool  `json:"successful"`
@@ -159,16 +175,20 @@ func vendorError(body []byte) (string, bool) {
 		} `json:"account"`
 	}
 	if json.Unmarshal(trimmed, &e) != nil || e.Successful == nil {
-		return "unexpected non-JSON-array response", true
+		return "unexpected non-JSON-array response", true, false
 	}
-	msg := strings.TrimSpace(e.Status + ": " + e.Message)
+	msg = strings.TrimSpace(e.Status + ": " + e.Message)
 	if a := e.Account; a != nil {
 		msg += fmt.Sprintf(" (plan %s: today %d/%d, 5 min %d/%d, blocked %d)", a.Type, a.Today, a.TodayLimit, a.Min5, a.Min5Limit, a.Block)
+		quota = !*e.Successful && (a.Block != 0 || (a.TodayLimit > 0 && a.Today >= a.TodayLimit) || (a.Min5Limit > 0 && a.Min5 >= a.Min5Limit))
 	}
-	return msg, !*e.Successful
+	return msg, !*e.Successful, quota
 }
 
 var digitsOnly = regexp.MustCompile(`^[0-9]+$`)
+
+// brsNoLimit is the vendor's "no upper price limit" sentinel.
+const brsNoLimit = 999_999_999
 
 // brsFlow maps canonical fields to the vendor's keys (all verified live, 2026-09-25). price:
 // a value <= 1 rial is the vendor's placeholder (ISIN …0002 fund rows, likely issuance and
@@ -219,21 +239,24 @@ func ParseBrsApi(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 			IngestTime: ingest, SourceTime: ingest, SourceTimeEstimated: true,
 		}
 		for _, f := range brsFlow {
-			if v, ok := num(row, f.key); ok && (!f.price || v > 1) {
+			// Prices must exceed the 1-rial placeholder; totals and counts cannot be negative.
+			if v, ok := num(row, f.key); ok && ((f.price && v > 1) || (!f.price && v >= 0)) {
 				*f.dst(&sn) = v
 			} else {
 				sn.Missing = append(sn.Missing, f.canon)
 			}
 		}
-		// A placeholder last price makes the value (volume × placeholder) meaningless too.
-		if !sn.Has(model.FPriceLast) && sn.Has(model.FValue) && sn.Volume > 0 {
+		// A placeholder last price makes the value (volume × placeholder) meaningless too,
+		// unless nothing traded (value 0 with volume 0 is real).
+		if !sn.Has(model.FPriceLast) && sn.Has(model.FValue) && (!sn.Has(model.FVolume) || sn.Volume > 0) {
 			sn.Value = 0
 			sn.Missing = append(sn.Missing, model.FValue)
 		}
-		// Price limits: a value <= 1 is the vendor's "no limit" sentinel (block/auction boards).
+		// Price limits: tmin <= 1 or tmax >= 999,999,999 are the vendor's "no limit" sentinels
+		// (ISIN …0002 fund rows; energy products carry tmin=1, tmax=999999999).
 		lo, okLo := num(row, "tmin")
 		hi, okHi := num(row, "tmax")
-		if okLo && okHi && lo > 1 && hi >= lo {
+		if okLo && okHi && lo > 1 && hi >= lo && hi < brsNoLimit {
 			sn.PriceLimitMin, sn.PriceLimitMax = lo, hi
 		} else {
 			sn.Missing = append(sn.Missing, model.FPriceLimits)

@@ -7,8 +7,9 @@
 # Usage, from the repo root, before 08:20 Tehran: infra/brsapi-preopen.sh   (waits for the window)
 #   PREOPEN_FROM=08:20 PREOPEN_TO=09:10 PREOPEN_INTERVAL=60 BRSAPI_TYPES=1 BRSAPI_DAILY_LIMIT=100
 #   PREOPEN_ANYDAY=1 to run on a day other than Saturday.
-# The key comes from BRSAPI_KEY or .env and is handed to curl on stdin: never in argv, output or
-# the recording (scrubbed). Requests are counted against BRSAPI_DAILY_LIMIT before starting.
+# The key comes from BRSAPI_KEY or .env and is handed to curl on stdin and to awk via its environment:
+# never in argv or output; the recording is scrubbed of it (raw and URL-encoded). Requests are
+# counted against BRSAPI_DAILY_LIMIT before starting; the collector shares the same daily quota.
 set -eu
 cd "$(dirname "$0")/.."
 from=${PREOPEN_FROM:-08:20} to=${PREOPEN_TO:-09:10} every=${PREOPEN_INTERVAL:-60}
@@ -39,24 +40,31 @@ echo "recording $from-$to Tehran every ${every}s, types: $types ($need requests)
 now_min() { mins "$(tehran_fmt %H:%M)"; }
 while [ "$(now_min)" -lt "$start" ]; do sleep 20; done
 
-esc=$(printf '%s' "$key" | sed 's/[][\.*^$#/&]/\\&/g') # the key as a literal sed pattern
 # The key percent-encoded for the query string (a '#', '&' or '+' would otherwise cut or alter it).
 qkey=$(printf '%s\n' "$key" | LC_ALL=C awk 'BEGIN { for (n = 1; n < 256; n++) ord[sprintf("%c", n)] = n }
 	{ for (i = 1; i <= length($0); i++) { c = substr($0, i, 1)
 		if (c ~ /[A-Za-z0-9._~-]/) printf "%s", c; else printf "%%%02X", ord[c] } }')
+# scrub replaces both key forms literally; the keys reach awk through its environment, never argv.
+scrub() {
+	BRS_K="$key" BRS_Q="$qkey" awk 'BEGIN { k[1] = ENVIRON["BRS_K"]; k[2] = ENVIRON["BRS_Q"] }
+	{ for (j = 1; j <= 2; j++) while ((i = index($0, k[j])) > 0) $0 = substr($0, 1, i - 1) "***" substr($0, i + length(k[j]))
+	  printf "%s", $0 }' "$1"
+}
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 while [ "$(now_min)" -lt "$end" ]; do
 	t0=$(date -u +%s)
 	for typ in $types; do
 		ingest=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+		: >"$tmp"
+		# A failed or cut-off transfer (timeout) records http 0 and no body: never half a JSON value.
 		code=$(printf 'url = "%s?type=%s&key=%s"\n' "$url" "$typ" "$qkey" |
 			curl -s -K - --compressed -A "$UA" -H 'Accept: application/json, text/plain, */*' --max-time 60 \
-				-o "$tmp" -w '%{http_code}' 2>/dev/null) || code=000
-		body=$(sed "s#$esc#***#g" "$tmp" | tr -d '\r\n')
+				-o "$tmp" -w '%{http_code}' 2>/dev/null) || { code=0; : >"$tmp"; }
+		body=$(scrub "$tmp" | tr -d '\r\n')
 		case "$body" in
-		\[* | \{*) printf '{"ingest":"%s","type":"%s","http":%s,"body":%s}\n' "$ingest" "$typ" "$code" "$body" >>"$out" ;;
-		*) printf '{"ingest":"%s","type":"%s","http":%s,"body":null}\n' "$ingest" "$typ" "$code" >>"$out" ;;
+		\[*\] | \{*\}) printf '{"ingest":"%s","type":"%s","http":%d,"body":%s}\n' "$ingest" "$typ" "$code" "$body" >>"$out" ;;
+		*) printf '{"ingest":"%s","type":"%s","http":%d,"body":null}\n' "$ingest" "$typ" "$code" >>"$out" ;;
 		esac
 		echo "$(tehran_fmt %H:%M:%S) type=$typ http=$code bytes=$(wc -c <"$tmp")"
 	done

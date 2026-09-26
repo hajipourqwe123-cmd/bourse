@@ -85,6 +85,10 @@ func TestBrsApiLiveContract(t *testing.T) {
 	if k2.PriceLast != 0 || k2.Value != 0 || k2.PriceYesterday != 111959 || k2.Volume != 90000000 || !k2.Has(model.FVolume) {
 		t.Errorf("کیان2 values: %+v", k2)
 	}
+	// Energy product: tmin=1, tmax=999999999 are "no limit" sentinels.
+	if e := by["جپاعادی"]; e.HasPriceLimits() || e.Has(model.FPriceLimits) {
+		t.Errorf("جپاعادی limits must be missing: %d..%d %v", e.PriceLimitMin, e.PriceLimitMax, e.Missing)
+	}
 	// ISIN …0003 board: one fixed price, tmin == tmax, a real limit.
 	if t3 := by["تابان3"]; !t3.HasPriceLimits() || t3.PriceLimitMin != 20570 || t3.PriceLimitMax != 20570 || t3.PriceLast != 20570 {
 		t.Errorf("تابان3: %+v", t3)
@@ -115,14 +119,27 @@ func TestBrsApiIdFormsAndMissing(t *testing.T) {
 	 {"id":"34144395039913458","l18":"عیار","pl":315399,"tvol":10,"tval":3153990,"tmin":285706,"tmax":349196},
 	 {"id":6233172939132588,"l18":"پتوسعه","pl":"12.5","tvol":"1,000"},
 	 {"id":"12.5","l18":"bad"},
+	 {"id":7,"l18":"neg","pl":1,"tval":5,"tvol":-3,"tno":-1,"tmin":100,"tmax":999999999},
+	 {"id":8,"l18":"idle","pl":1,"tvol":0,"tval":0},
 	 {"id":null,"l18":"none"},
 	 {"l18":"noid"}
 	]`)
 	got, err := ParseBrsApi(body, time.Now())
-	if err != nil || len(got) != 2 {
+	if err != nil || len(got) != 4 {
 		t.Fatalf("parse: %v, n=%d", err, len(got))
 	}
-	a, b := got[0], got[1]
+	a, b, neg, idle := got[0], got[1], got[2], got[3]
+	// Negative totals are missing; with the placeholder price and an unknown volume the value
+	// cannot be trusted either; a real limit with the no-limit sentinel on the other side is missing.
+	for _, fld := range []string{model.FVolume, model.FTradeCount, model.FValue, model.FPriceLimits, model.FPriceLast} {
+		if neg.Has(fld) {
+			t.Errorf("neg: %s must be missing: %+v", fld, neg)
+		}
+	}
+	// Nothing traded: value 0 with volume 0 is real even next to a placeholder price.
+	if !idle.Has(model.FValue) || idle.Has(model.FPriceLast) {
+		t.Errorf("idle: %+v", idle)
+	}
 	if a.InsCode != "34144395039913458" || b.InsCode != "6233172939132588" {
 		t.Fatalf("ids %q %q", a.InsCode, b.InsCode)
 	}
@@ -213,6 +230,31 @@ func TestBrsApiErrorsRedactKey(t *testing.T) {
 	}
 }
 
+// A quota or block reported by the vendor is ErrBudget (the collector must not keep polling);
+// redirects are not followed (they would carry the key elsewhere).
+func TestBrsApiVendorQuotaAndRedirect(t *testing.T) {
+	var hits int32
+	quota := brsServer(t, &hits, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"successful":false,"status":"limit","message_error":"daily limit","account":{"type":"رایگان","usage_today":100,"usage_today_limit":100,"usage_5min":1,"usage_5min_limit":300,"request_block":0}}`))
+	})
+	b := NewBrsApi(BrsApiConfig{URL: quota.URL, Key: testKey, Types: []string{"1"}, Timeout: time.Second, DailyLimit: 10})
+	if _, err := b.Fetch(context.Background()); !errors.Is(err, ErrBudget) || !strings.Contains(err.Error(), "today 100/100") {
+		t.Fatalf("vendor quota: %v", err)
+	}
+	var elsewhere int32
+	target := brsServer(t, &elsewhere, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`[]`)) })
+	redir := brsServer(t, &hits, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/?"+r.URL.RawQuery, http.StatusFound)
+	})
+	b.cfg.URL = redir.URL
+	_, err := b.Fetch(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "HTTP 302") || elsewhere != 0 {
+		t.Fatalf("redirect followed (%d) or not reported: %v", elsewhere, err)
+	}
+	assertNoKey(t, err)
+}
+
 func assertNoKey(t *testing.T, err error) {
 	t.Helper()
 	for _, form := range []string{testKey, url.QueryEscape(testKey), url.PathEscape(testKey)} {
@@ -222,8 +264,8 @@ func assertNoKey(t *testing.T, err error) {
 	}
 }
 
-// The plan's daily quota is enforced before any request: over budget nothing is sent; the
-// budget renews on the next Tehran day.
+// The plan's daily quota is enforced before any request, for all types of a poll at once: over
+// budget nothing is sent (never half a poll); the budget renews on the next Tehran day.
 func TestBrsApiDailyBudget(t *testing.T) {
 	var hits int32
 	srv := brsServer(t, &hits, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`[]`)) })
@@ -233,14 +275,14 @@ func TestBrsApiDailyBudget(t *testing.T) {
 	if _, err := b.Fetch(context.Background()); err != nil { // 2 requests
 		t.Fatal(err)
 	}
-	if _, err := b.Fetch(context.Background()); !errors.Is(err, ErrBudget) { // 3rd sent, 4th refused
+	if _, err := b.Fetch(context.Background()); !errors.Is(err, ErrBudget) { // needs 2, 1 left
 		t.Fatalf("over budget: %v", err)
 	}
-	if hits != 3 {
-		t.Fatalf("%d requests sent, want 3 (budget)", hits)
+	if hits != 2 {
+		t.Fatalf("%d requests sent, want 2 (the second poll must not start)", hits)
 	}
 	now = now.Add(24 * time.Hour)
-	if _, err := b.Fetch(context.Background()); err != nil || hits != 5 {
+	if _, err := b.Fetch(context.Background()); err != nil || hits != 4 {
 		t.Fatalf("next day: %v, hits %d", err, hits)
 	}
 	zero := NewBrsApi(BrsApiConfig{URL: srv.URL, Key: testKey, Types: []string{"1"}})
