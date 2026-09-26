@@ -3,8 +3,8 @@
 # and SourceArena around the pre-open (default Saturday 08:20–09:10 Tehran, every 60 s) to
 # recordings/preopen-<Tehran date>.ndjson, one line per request:
 #   {"ingest": UTC time, "vendor", "type", "http", "body": <vendor JSON or null>}
-# Question it answers: does each vendor still show yesterday's day totals after 08:25, and when
-# do they reset? (docs/source-mapping.md; cmd/vendorcmp compares the vendors on one poll).
+# Question it answers: does each vendor still show yesterday's day totals in the pre-open (from
+# 08:20; the union pre-open is 08:25), and when do they reset? Needs GNU date (Git Bash, Linux). (docs/source-mapping.md; cmd/vendorcmp compares the vendors on one poll).
 # Usage, from the repo root, before 08:20 Tehran: infra/preopen-record.sh   (waits for the window)
 #   PREOPEN_FROM=08:20 PREOPEN_TO=09:10 PREOPEN_INTERVAL=60 PREOPEN_VENDORS="brsapi sourcearena"
 #   BRSAPI_TYPES=1 BRSAPI_DAILY_LIMIT=100 SOURCEARENA_DAILY_LIMIT=100 (each vendor's plan quota)
@@ -19,7 +19,8 @@ from=${PREOPEN_FROM:-08:20} to=${PREOPEN_TO:-09:10} every=${PREOPEN_INTERVAL:-60
 vendors=${PREOPEN_VENDORS:-brsapi sourcearena}
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-envval() { sed -n "s/^$1=//p" .env 2>/dev/null | tr -d '\r' | tail -n 1; }
+# envval: the last VAR=value of .env, without CR and surrounding quotes.
+envval() { sed -n "s/^$1=//p" .env 2>/dev/null | tr -d '\r' | tail -n 1 | sed "s/^[\"']\(.*\)[\"']\$/\1/"; }
 # urlenc: percent-encode stdin (a '#', '&' or '+' in a secret would otherwise cut or alter the URL).
 urlenc() {
 	LC_ALL=C awk 'BEGIN { for (n = 1; n < 256; n++) ord[sprintf("%c", n)] = n }
@@ -33,7 +34,11 @@ btypes=$(printf '%s' "${BRSAPI_TYPES:-1}" | tr ',' ' ')
 
 # Tehran = UTC+03:30 (no DST since 2022; internal/tehran uses the tz database).
 tehran_fmt() { date -u -d "@$(($(date -u +%s) + 12600))" "+$1"; }
-mins() { h=${1%:*} m=${1#*:}; echo $((${h#0} * 60 + ${m#0})); }
+mins() { # HH:MM -> minutes; "08", "8" and "0" all parse (no octal)
+	h=${1%:*} m=${1#*:}
+	h=${h#0} m=${m#0}
+	echo $((${h:-0} * 60 + ${m:-0}))
+}
 start=$(mins "$from") end=$(mins "$to")
 [ "$end" -gt "$start" ] && [ "$every" -gt 0 ] || { echo "bad window $from-$to / interval $every" >&2; exit 1; }
 polls=$((((end - start) * 60) / every + 1))
@@ -78,6 +83,10 @@ record() {
 		curl -s -K - --compressed -A "$UA" -H 'Accept: application/json, text/plain, */*' --max-time 60 \
 			-o "$tmp" -w '%{http_code}' 2>/dev/null) || { code=0; : >"$tmp"; }
 	body=$(scrub "$tmp" | tr -d '\r\n')
+	# Only valid JSON is embedded (checked with jq when installed; else by its first/last char).
+	if command -v jq >/dev/null 2>&1 && ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+		body=
+	fi
 	case "$body" in
 	\[*\] | \{*\}) printf '{"ingest":"%s","vendor":"%s","type":"%s","http":%d,"body":%s}\n' "$ingest" "$1" "$2" "$code" "$body" >>"$out" ;;
 	*) printf '{"ingest":"%s","vendor":"%s","type":"%s","http":%d,"body":null}\n' "$ingest" "$1" "$2" "$code" >>"$out" ;;

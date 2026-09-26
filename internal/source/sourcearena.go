@@ -130,6 +130,11 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		set := func(canon string, dst *int64) {
 			spec := fieldMap[canon]
 			v, ok := num(row, spec.key)
+			// A price of 0 is the vendor's "no trade today" (first/high/low of an untraded
+			// instrument), never a price; totals and counts cannot be negative.
+			if price := strings.HasPrefix(canon, "price_"); ok && ((price && v <= 0) || (!price && v < 0)) {
+				ok = false
+			}
 			if !ok {
 				sn.Missing = append(sn.Missing, canon)
 				return

@@ -14,7 +14,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - internal/quality   data-quality rules (docs/data-quality.md)
 - internal/flow      hot money / hot-plus / market game / 10-min matrix (ADR-0004)
 - internal/anomaly   AI tier 1: per-symbol EWMA anomaly radar (AI-01), flow–price divergence (AI-02)
-- internal/source    adapters: replay (done), sourcearena (PROVISIONAL), brsapi (verified live; quota-guarded) — docs/source-mapping.md
+- internal/source    adapters: replay (done), sourcearena (verified live), brsapi (verified live; quota-guarded) — docs/source-mapping.md
 - internal/bus       Publisher: NDJSON | JetStream (BUS=ndjson|nats); streams+ack rules in contracts/subjects.md
 - internal/calendar  per-instrument trading sessions (data: sessions.json, dated, UNVERIFIED); ALL time logic uses it
 - internal/market    dashboard aggregates (docs/market-metrics.md); cmd/gateway → Centrifugo + REST (loopback only)

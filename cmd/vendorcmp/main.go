@@ -7,8 +7,9 @@
 //	BRSAPI_KEY=… SOURCEARENA_TOKEN=… go run ./cmd/vendorcmp -out docs/vendor-comparison.md
 //	go run ./cmd/vendorcmp -brsapi saved.json -sourcearena saved.json -out report.md
 //
-// Compare payloads of the same moment: with the market open the vendors are about a minute
-// apart (pre-open recording of 2026-09-26), so closed-market payloads give the fair comparison.
+// Compare payloads of the same moment: with the market open the vendors lag each other by an
+// unmeasured amount (pre-open recording of 2026-09-26), so closed-market payloads give the fair
+// comparison.
 package main
 
 import (
@@ -75,9 +76,9 @@ func load(file, secretVar string, mkURL func(string) string) ([]byte, string, er
 		if err != nil {
 			return nil, "", err
 		}
-		at := "فایل ذخیره‌شده"
+		at := "فایل ذخیره‌شده" // the file time is not the data time: see the latest time inside the payload
 		if st, err := os.Stat(file); err == nil {
-			at += "، " + st.ModTime().UTC().Format("2006-01-02 15:04 UTC")
+			at += "، زمان فایل " + st.ModTime().UTC().Format("2006-01-02 15:04 UTC")
 		}
 		return b, at, nil
 	}

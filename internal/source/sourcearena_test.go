@@ -1,7 +1,12 @@
 package source
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,7 +117,49 @@ func TestParseLiveSample(t *testing.T) {
 	if s := by["حفارس"]; s.InsCode == "" {
 		t.Error("suspended row dropped")
 	}
-	if p := by["پویا"]; p.InsCode != "48970598895465763" || p.Volume != 0 || !p.Has(model.FVolume) || p.PriceLast != 653121 {
+	// Never traded (last_trade_date "-"): first/high/low are the vendor's 0 → missing, not a
+	// price; last and close carry the reference price (TSETMC convention), volume 0 is real.
+	p := by["پویا"]
+	if p.InsCode != "48970598895465763" || p.Volume != 0 || !p.Has(model.FVolume) || p.PriceLast != 653121 {
 		t.Errorf("no-trade row: %+v", p)
+	}
+	for _, fld := range []string{"price_first", "price_max", "price_min"} {
+		if p.Has(fld) {
+			t.Errorf("no-trade row: %s 0 must be missing", fld)
+		}
+	}
+}
+
+const saTestToken = "t0k+/=en" // escapes differently in a query string
+
+// Redirects are not followed (they would carry the token); transport errors never show the
+// token, raw or URL-encoded; a vendor error object with HTTP 200 is an error.
+func TestSourceArenaRedirectAndErrors(t *testing.T) {
+	var elsewhere int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { elsewhere++ }))
+	defer target.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/?"+r.URL.RawQuery, http.StatusFound)
+	}))
+	defer redir.Close()
+	_, err := NewSourceArena(redir.URL+"/api/", saTestToken, time.Second).Fetch(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "HTTP 302") || elsewhere != 0 {
+		t.Fatalf("redirect followed (%d) or not reported: %v", elsewhere, err)
+	}
+	_, err = NewSourceArena("http://127.0.0.1:1/api/", saTestToken, time.Second).Fetch(context.Background())
+	if err == nil {
+		t.Fatal("unreachable host: no error")
+	}
+	for _, form := range []string{saTestToken, url.QueryEscape(saTestToken), url.PathEscape(saTestToken)} {
+		if strings.Contains(err.Error(), form) {
+			t.Fatalf("token leaked (%q): %v", form, err)
+		}
+	}
+	vendorErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"Error": "request timeout or empty response"}`)) // seen live, HTTP 200
+	}))
+	defer vendorErr.Close()
+	if _, err := NewSourceArena(vendorErr.URL+"/api/", saTestToken, time.Second).Fetch(context.Background()); err == nil {
+		t.Fatal("vendor error object accepted as data")
 	}
 }

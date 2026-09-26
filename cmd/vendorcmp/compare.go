@@ -41,15 +41,46 @@ func (r row) text(k string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// int reads an integer given as a JSON number or string; "71690.00" (zero fraction) is accepted,
-// any other fraction is not an integer.
+type valState int
+
+const (
+	valAbsent valState = iota // absent, null, "" or "-"
+	valBad                    // present but not an integer (fraction, overflow, text)
+	valOK
+)
+
+// int reads an integer given as a JSON number or string; thousands separators and a zero
+// fraction ("71690.00") are accepted, any other fraction, overflow or text is not an integer.
 func (r row) int(k string) (int64, bool) {
+	v, st := r.parseInt(k)
+	return v, st == valOK
+}
+
+func (r row) parseInt(k string) (int64, valState) {
 	s := strings.ReplaceAll(r.text(k), ",", "")
-	if i := strings.IndexByte(s, '.'); i >= 0 && strings.Trim(s[i+1:], "0") == "" {
+	if s == "" || s == "-" {
+		return 0, valAbsent
+	}
+	if i := strings.IndexByte(s, '.'); i >= 0 && i > 0 && strings.Trim(s[i+1:], "0") == "" {
 		s = s[:i]
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
-	return v, err == nil
+	if err != nil {
+		return 0, valBad
+	}
+	return v, valOK
+}
+
+// value is a field as comparable text: normalised text, or the integer in decimal.
+func (r row) value(k string, text bool) (string, valState) {
+	if text {
+		if t := normName(r.text(k)); t != "" && t != "-" {
+			return t, valOK
+		}
+		return "", valAbsent
+	}
+	v, st := r.parseInt(k)
+	return strconv.FormatInt(v, 10), st
 }
 
 // format classifies how a vendor encodes a field: number, numeric string, decimal string, …
@@ -67,6 +98,8 @@ func (r row) format(k string) string {
 			return "empty string"
 		case reInt.MatchString(s):
 			return "numeric string"
+		case reInt.MatchString(strings.ReplaceAll(s, ",", "")):
+			return "numeric string with separators"
 		case reDec.MatchString(s):
 			return "decimal string"
 		case rePersianDigit.MatchString(s):
@@ -132,87 +165,199 @@ func fields() []field {
 
 type pair struct {
 	Brs, Sa row
-	ByName  bool // joined by symbol, not by instrument code
+	ByName  bool // joined by symbol: one side had no instrument code
 }
 
-// FieldStat is the comparison of one field over the joined rows.
+// FieldStat is the comparison of one field over the joined rows. Every pair lands in exactly
+// one of Match, Mismatch, OnlyBrs, OnlySa, Neither or BothBad.
 type FieldStat struct {
 	field
-	Both, Match     int      // rows where both vendors have a value / where they are equal
-	OnlyBrs, OnlySa int      // rows where only one vendor has a value
-	Examples        []string // up to 3 mismatches
-	BrsFmt, SaFmt   map[string]int
+	Both         int      // both sides parsed
+	Match        int      // both parsed and equal
+	NonZeroMatch int      // equal and not 0 (0 is also the vendors' "nothing": empty book level, untraded)
+	Mismatch     int      // both parsed and different, or one side unparseable next to a parsed value
+	OnlyBrs      int      // BrsApi has a value, SourceArena none (absent, null, "" or "-")
+	OnlySa       int      // the reverse
+	Neither      int      // no value on either side
+	BothBad      int      // unparseable on at least one side and no parsed value on the other
+	BadBrs       int      // BrsApi value present but not an integer (fraction, overflow, text)
+	BadSa        int      // the same for SourceArena
+	Examples     []string // up to 3 mismatches
+	BrsFmt       map[string]int
+	SaFmt        map[string]int
 }
 
 // Report is everything the markdown shows.
 type Report struct {
-	BrsAt, SaAt, Note       string
+	BrsAt, SaAt, Note       string // file or fetch time, and optional context
+	BrsDataAt, SaDataAt     string // latest time found in the payload itself
 	BrsRows, SaRows         int
 	Pairs                   []pair
 	OnlyBrs, OnlySa         []row
-	Ambiguous               []string // symbols matching several rows of the other vendor
-	NameIDConflict          []string // same symbol, different instrument code
+	NameTried               int      // rows for which the symbol fallback was attempted
+	Ambiguous               []string // symbols matching several unjoined rows
+	NameIDConflict          []string // same symbol, both sides coded, different codes (not joined)
+	DupCodeBrs, DupCodeSa   []string // instrument codes on more than one row (not joined by code)
+	DupSymBrs, DupSymSa     int      // normalised symbols on more than one row, per side
 	Stats                   []FieldStat
 	Classes                 []classCount
+	ClassDiff               map[string]int // "BrsApi class → SourceArena class" of joined pairs that differ
 	OnlyBrsKeys, OnlySaKeys []string
 }
 
 type classCount struct {
-	Class           string
-	Brs, Sa, Joined int
+	Class               string
+	Brs, Sa, JoinedSame int // JoinedSame: joined pairs both vendors put in this class
 }
 
-// compare joins BrsApi rows (id) and SourceArena rows (instance_code); rows without a code
-// match are joined by normalised symbol when that symbol is unique on both sides.
+func brsCode(r row) string { return code(r.text("id")) }
+func saCode(r row) string  { return code(r.text("instance_code")) }
+
+// code keeps a digits-only instrument code ("" otherwise).
+func code(s string) string {
+	if reInt.MatchString(s) && !strings.HasPrefix(s, "-") {
+		return s
+	}
+	return ""
+}
+
+// compare joins BrsApi rows (id) and SourceArena rows (instance_code). Pass 1 joins by code,
+// codes repeated on a side are reported and not used. Pass 2 joins the rows left by normalised
+// symbol, only when the symbol is unique among the rows left on both sides and at least one of
+// the two rows has no code: two different codes are two instruments (NameIDConflict).
 func compare(brs, sa []row) *Report {
-	rep := &Report{BrsRows: len(brs), SaRows: len(sa)}
-	saByID := map[string]row{}
-	saByName := map[string][]row{}
-	for _, r := range sa {
-		if id := r.text("instance_code"); id != "" {
-			saByID[id] = r
+	rep := &Report{BrsRows: len(brs), SaRows: len(sa), ClassDiff: map[string]int{}}
+	usedB, usedS := make([]bool, len(brs)), make([]bool, len(sa))
+	idxB, dupB := index(brs, brsCode)
+	idxS, dupS := index(sa, saCode)
+	rep.DupCodeBrs, rep.DupCodeSa = dupB, dupS
+	for c, i := range idxB {
+		if j, ok := idxS[c]; ok {
+			rep.Pairs = append(rep.Pairs, pair{Brs: brs[i], Sa: sa[j]})
+			usedB[i], usedS[j] = true, true
 		}
-		n := normName(r.text("name"))
-		saByName[n] = append(saByName[n], r)
 	}
-	brsByName := map[string]int{}
-	for _, r := range brs {
-		brsByName[normName(r.text("l18"))]++
+	sort.Slice(rep.Pairs, func(a, b int) bool { return brsCode(rep.Pairs[a].Brs) < brsCode(rep.Pairs[b].Brs) })
+	leftB, leftS := map[string][]int{}, map[string][]int{}
+	for i, r := range brs {
+		if !usedB[i] {
+			n := normName(r.text("l18"))
+			leftB[n] = append(leftB[n], i)
+		}
 	}
-	used := map[string]bool{} // SourceArena instance codes joined
-	for _, r := range brs {
-		if s, ok := saByID[r.text("id")]; ok && r.text("id") != "" {
-			rep.Pairs = append(rep.Pairs, pair{Brs: r, Sa: s})
-			used[s.text("instance_code")] = true
+	for j, r := range sa {
+		if !usedS[j] {
+			n := normName(r.text("name"))
+			leftS[n] = append(leftS[n], j)
+		}
+	}
+	names := make([]string, 0, len(leftB))
+	for n := range leftB {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		bs, ss := leftB[n], leftS[n]
+		if n == "" || len(ss) == 0 {
 			continue
 		}
-		n := normName(r.text("l18"))
-		cands := saByName[n]
-		switch {
-		case len(cands) == 1 && brsByName[n] == 1 && !used[cands[0].text("instance_code")]:
-			if r.text("id") != "" && cands[0].text("instance_code") != "" {
-				rep.NameIDConflict = append(rep.NameIDConflict, r.text("l18"))
-			}
-			rep.Pairs = append(rep.Pairs, pair{Brs: r, Sa: cands[0], ByName: true})
-			used[cands[0].text("instance_code")] = true
-		case len(cands) > 1 || (len(cands) == 1 && brsByName[n] > 1):
-			rep.Ambiguous = append(rep.Ambiguous, r.text("l18"))
-			rep.OnlyBrs = append(rep.OnlyBrs, r)
-		default:
+		rep.NameTried += len(bs)
+		if len(bs) > 1 || len(ss) > 1 {
+			rep.Ambiguous = append(rep.Ambiguous, brs[bs[0]].text("l18"))
+			continue
+		}
+		i, j := bs[0], ss[0]
+		if cb, cs := brsCode(brs[i]), saCode(sa[j]); cb != "" && cs != "" {
+			rep.NameIDConflict = append(rep.NameIDConflict, fmt.Sprintf("%s (%s ≠ %s)", brs[i].text("l18"), cb, cs))
+			continue
+		}
+		rep.Pairs = append(rep.Pairs, pair{Brs: brs[i], Sa: sa[j], ByName: true})
+		usedB[i], usedS[j] = true, true
+	}
+	for i, r := range brs {
+		if !usedB[i] {
 			rep.OnlyBrs = append(rep.OnlyBrs, r)
 		}
 	}
-	for _, r := range sa {
-		if !used[r.text("instance_code")] {
+	for j, r := range sa {
+		if !usedS[j] {
 			rep.OnlySa = append(rep.OnlySa, r)
 		}
 	}
+	rep.DupSymBrs, rep.DupSymSa = dupSymbols(brs, "l18"), dupSymbols(sa, "name")
 	for _, f := range fields() {
 		rep.Stats = append(rep.Stats, stat(f, rep.Pairs))
 	}
-	rep.Classes = classes(brs, sa, rep.Pairs)
+	rep.Classes = classes(brs, sa, rep.Pairs, rep.ClassDiff)
 	rep.OnlyBrsKeys, rep.OnlySaKeys = extraKeys(brs, sa)
+	rep.BrsDataAt, rep.SaDataAt = latestBrs(brs), latestSa(sa)
 	return rep
+}
+
+// index maps each code found on exactly one row to that row; repeated codes are returned apart.
+func index(rows []row, key func(row) string) (map[string]int, []string) {
+	n := map[string]int{}
+	for _, r := range rows {
+		if c := key(r); c != "" {
+			n[c]++
+		}
+	}
+	idx := map[string]int{}
+	var dup []string
+	for i, r := range rows {
+		c := key(r)
+		switch {
+		case c == "":
+		case n[c] == 1:
+			idx[c] = i
+		case n[c] > 1:
+			dup = append(dup, c)
+			n[c] = -1 // list once
+		}
+	}
+	sort.Strings(dup)
+	return idx, dup
+}
+
+func dupSymbols(rows []row, k string) int {
+	n := map[string]int{}
+	for _, r := range rows {
+		n[normName(r.text(k))]++
+	}
+	d := 0
+	for _, c := range n {
+		if c > 1 {
+			d++
+		}
+	}
+	return d
+}
+
+// latestBrs is the latest BrsApi last-event time (time of day only: the payload has no date).
+func latestBrs(rows []row) string {
+	max := ""
+	for _, r := range rows {
+		if t := r.text("time"); t > max {
+			max = t
+		}
+	}
+	return max
+}
+
+// latestSa is the latest SourceArena last-trade date and time (Jalali), compared numerically.
+func latestSa(rows []row) string {
+	best, bestKey := "", ""
+	for _, r := range rows {
+		d := strings.Split(r.text("last_trade_date"), "/")
+		if len(d) != 3 {
+			continue
+		}
+		key := fmt.Sprintf("%04s%02s%02s %8s", d[0], d[1], d[2], r.text("last_trade_time"))
+		if key > bestKey {
+			bestKey, best = key, r.text("last_trade_date")+" "+r.text("last_trade_time")
+		}
+	}
+	return best
 }
 
 func stat(f field, pairs []pair) FieldStat {
@@ -220,31 +365,46 @@ func stat(f field, pairs []pair) FieldStat {
 	for _, p := range pairs {
 		s.BrsFmt[p.Brs.format(f.Brs)]++
 		s.SaFmt[p.Sa.format(f.Sa)]++
-		var a, b string
-		var okA, okB bool
-		if f.Text {
-			a, b = normName(p.Brs.text(f.Brs)), normName(p.Sa.text(f.Sa))
-			okA, okB = a != "", b != ""
-		} else {
-			x, ox := p.Brs.int(f.Brs)
-			y, oy := p.Sa.int(f.Sa)
-			a, b, okA, okB = strconv.FormatInt(x, 10), strconv.FormatInt(y, 10), ox, oy
+		a, sa := p.Brs.value(f.Brs, f.Text)
+		b, sb := p.Sa.value(f.Sa, f.Text)
+		if sa == valBad {
+			s.BadBrs++
+		}
+		if sb == valBad {
+			s.BadSa++
 		}
 		switch {
-		case okA && okB:
+		case sa == valOK && sb == valOK:
 			s.Both++
 			if a == b {
 				s.Match++
-			} else if len(s.Examples) < 3 {
-				s.Examples = append(s.Examples, fmt.Sprintf("%s: %s ≠ %s", p.Brs.text("l18"), a, b))
+				if a != "0" {
+					s.NonZeroMatch++
+				}
+			} else {
+				s.Mismatch++
+				s.example(p, a, b)
 			}
-		case okA:
+		case sa == valOK && sb == valBad, sa == valBad && sb == valOK:
+			s.Mismatch++
+			s.example(p, p.Brs.text(f.Brs), p.Sa.text(f.Sa))
+		case sa == valOK:
 			s.OnlyBrs++
-		case okB:
+		case sb == valOK:
 			s.OnlySa++
+		case sa == valAbsent && sb == valAbsent:
+			s.Neither++
+		default:
+			s.BothBad++
 		}
 	}
 	return s
+}
+
+func (s *FieldStat) example(p pair, a, b string) {
+	if len(s.Examples) < 3 {
+		s.Examples = append(s.Examples, fmt.Sprintf("%s: %s ≠ %s", p.Brs.text("l18"), a, b))
+	}
 }
 
 // class is the proposed instrument class of a row (docs/source-mapping.md): board by ISIN
@@ -287,7 +447,7 @@ func saClass(r row) string {
 	return class(r.text("namad_code"), strings.TrimLeft(r.text("industry_code"), "0"), r.text("full_name"))
 }
 
-func classes(brs, sa []row, pairs []pair) []classCount {
+func classes(brs, sa []row, pairs []pair, diff map[string]int) []classCount {
 	m := map[string]*classCount{}
 	get := func(c string) *classCount {
 		if m[c] == nil {
@@ -302,13 +462,22 @@ func classes(brs, sa []row, pairs []pair) []classCount {
 		get(saClass(r)).Sa++
 	}
 	for _, p := range pairs {
-		get(brsClass(p.Brs)).Joined++
+		if cb, cs := brsClass(p.Brs), saClass(p.Sa); cb == cs {
+			get(cb).JoinedSame++
+		} else {
+			diff[cb+" → "+cs]++
+		}
 	}
 	out := make([]classCount, 0, len(m))
 	for _, c := range m {
 		out = append(out, *c)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Brs+out[i].Sa > out[j].Brs+out[j].Sa })
+	sort.Slice(out, func(i, j int) bool {
+		if a, b := out[i].Brs+out[i].Sa, out[j].Brs+out[j].Sa; a != b {
+			return a > b
+		}
+		return out[i].Class < out[j].Class
+	})
 	return out
 }
 
