@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,12 +16,13 @@ import (
 	"bourse/internal/model"
 )
 
-// SourceArena polls the vendor's "all instruments" endpoint (documented form: ?token=…&all&type=0).
+// SourceArena polls the vendor's "all instruments" endpoint (?token=…&all&type=0).
 //
-// STATUS: PROVISIONAL. Field names marked "unverified" in fieldMap were not visible in the vendor's
-// public documentation and MUST be confirmed against a live response (Sprint 1, task D-03).
-// Until then, a missing field is reported in Snapshot.Missing and the engine refuses to compute
-// metrics that depend on it.
+// STATUS: every mapped key VERIFIED against one live response (2026-09-26 07:00 Tehran, data of
+// 2026-09-23; D-03, docs/source-mapping.md): 1102 rows, instance_code on every row. Numbers are
+// mostly numeric strings (num() parses both). The payload has a 5-level book, the permitted
+// price range and individual/institutional values too; they are not mapped yet (report only).
+// last_trade_date/time is the last trade, not a snapshot time: SourceTimeEstimated stays set.
 type SourceArena struct {
 	base   string
 	token  string // never logged
@@ -29,15 +31,19 @@ type SourceArena struct {
 }
 
 // NewSourceArena builds the adapter. token comes from the environment, never from code.
+// Redirects are not followed: they would carry the token-bearing query to another URL.
 func NewSourceArena(base, token string, timeout time.Duration) *SourceArena {
-	return &SourceArena{base: base, token: token, client: &http.Client{Timeout: timeout}, now: time.Now}
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	return &SourceArena{base: base, token: token, client: client, now: time.Now}
 }
 
 func (s *SourceArena) Name() string { return "sourcearena" }
 
 type fieldSpec struct {
 	key      string // vendor JSON key
-	verified bool   // seen in the vendor's public documentation
+	verified bool   // seen in the vendor's documentation or a live response
 }
 
 // fieldMap maps canonical fields to vendor keys.
@@ -48,7 +54,7 @@ var fieldMap = map[string]fieldSpec{
 	"price_first":        {"first_price", true},
 	"price_max":          {"highest_price", true},
 	"price_min":          {"lowest_price", true},
-	"price_yesterday":    {"yesterday_price", false},
+	"price_yesterday":    {"yesterday_price", true},
 	"trade_count":        {"trade_number", true},
 	model.FVolume:        {"trade_volume", true},
 	model.FValue:         {"trade_value", true},
@@ -57,9 +63,9 @@ var fieldMap = map[string]fieldSpec{
 	model.FIndSellVol:    {"real_sell_volume", true},
 	model.FInstSellVol:   {"co_sell_volume", true},
 	model.FIndBuyCount:   {"real_buy_count", true},
-	model.FIndSellCount:  {"real_sell_count", false},
-	model.FInstBuyCount:  {"co_buy_count", false},
-	model.FInstSellCount: {"co_sell_count", false},
+	model.FIndSellCount:  {"real_sell_count", true},
+	model.FInstBuyCount:  {"co_buy_count", true},
+	model.FInstSellCount: {"co_sell_count", true},
 }
 
 // Fetch performs one poll.
@@ -74,6 +80,10 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
+		var ue *url.Error // its message carries the whole URL: report only the operation and cause
+		if errors.As(err, &ue) {
+			err = fmt.Errorf("%s: %w", ue.Op, ue.Err)
+		}
 		return nil, fmt.Errorf("sourcearena: request failed: %s", redact(err.Error(), s.token))
 	}
 	defer resp.Body.Close()
@@ -112,7 +122,7 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		sn := model.Snapshot{
 			InsCode: str(row, "instance_code"), Symbol: str(row, "name"),
 			Source: "sourcearena", IngestTime: ingest,
-			SourceTime: ingest, SourceTimeEstimated: true, // no timestamp in the documented payload
+			SourceTime: ingest, SourceTimeEstimated: true, // no snapshot time (last_trade_* is the last trade)
 		}
 		if sn.InsCode == "" {
 			continue // cannot key an instrument without its internal code
@@ -143,7 +153,7 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		set(model.FIndSellCount, &sn.IndSellCount)
 		set(model.FInstBuyCount, &sn.InstBuyCount)
 		set(model.FInstSellCount, &sn.InstSellCount)
-		sn.Missing = append(sn.Missing, model.FBook, model.FPriceLimits) // not in the documented "all" payload
+		sn.Missing = append(sn.Missing, model.FBook, model.FPriceLimits) // in the payload, not mapped yet (D-03 report)
 		out = append(out, sn)
 	}
 	return out, nil

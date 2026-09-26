@@ -19,7 +19,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - internal/calendar  per-instrument trading sessions (data: sessions.json, dated, UNVERIFIED); ALL time logic uses it
 - internal/market    dashboard aggregates (docs/market-metrics.md); cmd/gateway → Centrifugo + REST (loopback only)
 - web/               Next.js RTL dashboard; tokens.css = owner design (verbatim); boards in docs/design/
-- cmd/{collector,engine,gateway,syngen}; infra/ (compose, ClickHouse DDL, Centrifugo, gate2.sh)
+- cmd/{collector,engine,gateway,syngen,vendorcmp}; infra/ (compose, ClickHouse DDL, Centrifugo, gate2.sh, preopen-record.sh)
 
 ## Non-negotiable rules
 1. Missing/inconsistent data → no metric + a QualityIssue. Never zero-fill, never estimate.
