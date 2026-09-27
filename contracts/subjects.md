@@ -100,3 +100,15 @@
 داده جابه‌جاشده داده واقعی بازار نیست، چون زمانش ساختگی است. منبع آن `rebase:<منبع>` می‌شود و `model.IsSynthetic` آن را ساختگی می‌شمارد. نتیجه: collector و engine آن را فقط با `ALLOW_SYNTHETIC_ON_BUS=1` روی NATS می‌پذیرند و داشبورد آن را با برچسب «داده نمایشی – غیرواقعی» نشان می‌دهد (قاعده‌های ۲ و ۵). فقط برای پشته محلی است.
 
 فیلدهای `as_of` و `volume` در `flow.game.*` (`GameTotals`): `source_time` و حجم تجمعی تازه‌ترین snapshot که در این جمع‌ها آمده است. `as_of` برای نمایش سن داده است و `volume` برای تشخیص عقب‌ماندن جمع‌ها از snapshotهای تازه‌تر. engine تغییر `partial` به `true` بر اثر مبنای دوباره را همان لحظه منتشر می‌کند.
+
+## نویسنده ClickHouse (W-01)
+
+`cmd/writer` بایگانی بلندمدت گذرگاه در ClickHouse است (`infra/clickhouse/001_schema.sql`): `md.snap.*` ← `snapshots`، `flow.event.*` ← `flow_events`، `flow.game.*` ← `game_totals`، `flow.10m.*` ← `flow_10m`، `quality.*` ← `quality_issues`. سیگنال‌های `ai.signal.*` هنوز ذخیره نمی‌شوند.
+
+- برای هر جریان یک مصرف‌کننده پایدار دسته‌ای دارد (`writer-md`، `writer-flow`، `writer-quality`؛ `bus.ConsumeBatch`). یک دسته فقط پس از درج همه ردیف‌هایش تأیید می‌شود. خطای ClickHouse با تأخیر تکرار می‌شود و اگر ادامه یابد، writer با کد غیرصفر خارج می‌شود. دسته تأییدنشده پس از `WRITER_ACK_WAIT` به اجرای بعدی می‌رسد.
+- **تکرارپذیر:** همه جدول‌ها `ReplacingMergeTree` هستند که کلیدشان کلید طبیعی ردیف است و نسخه‌شان شماره پیام در جریان (`bus_seq`). پس تحویل دوباره، خرابی میان درج و تأیید، و انتشار دوباره engine پس از پنجره حذف تکراری ۳۰ دقیقه‌ای همه به یک ردیف می‌رسند و تازه‌ترین انتشار می‌ماند. ادغام در زمان merge انجام می‌شود، پس **خواندن باید با `FINAL`** (یا `argMax` بر پایه `bus_seq`) باشد.
+- کلیدها: `snapshots` (ins_code، source_time، source)؛ `flow_events` (ins_code، interval_to، side، interval_from)؛ `flow_10m` (ins_code، window_start)؛ `game_totals` (ins_code، day)؛ `quality_issues` (code، ins_code، day، dedup_at، dedup_detail). `DAY_START_MISSED` و `PREV_DAY_CARRYOVER` برای هر نماد و روز یک بار رخ می‌دهند، پس `dedup_at` آن‌ها نیمه‌شب تهران است و `dedup_detail` خالی: هر تعداد انتشار دوباره روی (code، ins_code، day) یک ردیف می‌شود.
+- `partial` و `class` در `flow_10m` و `game_totals`، و `class` در `flow_events` ذخیره می‌شوند (قاعده ۱). `FlowEvent` در قرارداد فیلد `partial` ندارد، پس `flow_events` هم این ستون را ندارد.
+- داده ساختگی (`SYN*`، `synthetic`، `rebase:`) هرگز ذخیره نمی‌شود. writer با `ALLOW_SYNTHETIC_ON_BUS=1` شروع نمی‌شود (قاعده ۵).
+- پیامی که قابل ذخیره نیست (JSON نامعتبر، `ins_code` ناهمخوان با موضوع، side/band ناشناخته، روز نامعتبر) با کد `UNDECODABLE` و جزئیات «writer: …» در `quality_issues` ثبت و تأیید می‌شود و پیام بعدی را قفل نمی‌کند.
+- writer در شروع طرح جدول‌ها را بررسی می‌کند و با طرح قدیمی شروع نمی‌شود. `make ddl-reset` جدول‌ها را فقط وقتی همه خالی‌اند از نو می‌سازد.
