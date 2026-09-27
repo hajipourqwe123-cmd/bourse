@@ -171,3 +171,14 @@ func TestClassAndScrub(t *testing.T) {
 		t.Errorf("scrub: %s", got)
 	}
 }
+
+func TestSummarizeCountsOnly(t *testing.T) {
+	brs, _ := parseRows([]byte(`[{"id":"1","l18":"الف","isin":"IRO1AAAA0001","cs_id":27,"py":100,"tvol":50},
+		{"id":"2","l18":"ب","isin":"IRO1BBBB0001","cs_id":27,"py":200,"tvol":10}]`))
+	sa, _ := parseRows([]byte(`[{"instance_code":"1","name":"الف","namad_code":"IRO1AAAA0001","industry_code":"27","yesterday_price":"100","trade_volume":"40"},
+		{"instance_code":"2","name":"ب","namad_code":"IRO1BBBB0001","industry_code":"27","yesterday_price":"201","trade_volume":"10"}]`))
+	s := summarize(compare(brs, sa))
+	if s.Joined != 2 || s.Static["price_yesterday"] != 1 || s.VolumeAhead["brsapi"] != 1 || s.VolumeAhead["equal"] != 1 {
+		t.Fatalf("%+v", s)
+	}
+}
