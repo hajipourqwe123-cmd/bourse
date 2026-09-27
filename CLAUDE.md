@@ -7,6 +7,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - `make test` (= `go test ./...`), `make vet`, `go test -race ./...`, `gofmt -l .` must be empty
 - `make synth` then `make demo` → replays a SYNTHETIC day through collector | engine → out.ndjson
 - `make env` (once) → `make up` → `make ddl`: local stack (infra/, ports on 127.0.0.1 only)
+- `make web` (npm ci, tsc, vitest, next build → web/out); `make gate2` (Chromium, throwaway NATS+Centrifugo)
 
 ## Map
 - internal/model     canonical Snapshot + event types (rial int64, source_time vs ingest_time, Missing[])
@@ -16,7 +17,9 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - internal/source    adapters: replay (done), sourcearena (PROVISIONAL, docs/source-mapping.md)
 - internal/bus       Publisher: NDJSON | JetStream (BUS=ndjson|nats); streams+ack rules in contracts/subjects.md
 - internal/calendar  per-instrument trading sessions (data: sessions.json, dated, UNVERIFIED); ALL time logic uses it
-- cmd/{collector,engine,syngen}; infra/ (compose, ClickHouse DDL, Centrifugo)
+- internal/market    dashboard aggregates (docs/market-metrics.md); cmd/gateway → Centrifugo + REST (loopback only)
+- web/               Next.js RTL dashboard; tokens.css = owner design (verbatim); boards in docs/design/
+- cmd/{collector,engine,gateway,syngen}; infra/ (compose, ClickHouse DDL, Centrifugo, gate2.sh)
 
 ## Non-negotiable rules
 1. Missing/inconsistent data → no metric + a QualityIssue. Never zero-fill, never estimate.
@@ -34,7 +37,7 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 - Do not Read testdata/*.ndjson or recordings/ (large); use `head -c` or jq summaries instead.
 
 ## Current state
-Sprint 0 done. Sprint 1: I-01 (compose + DDL), P-01 (JetStream bus), P-02 (single-engine KV lease),
-DL-01 (session calendar; late-start partial rule) done.
-Next, in order: W-01 ClickHouse writer (idempotent: dedup key / ReplacingMergeTree for flow_events;
-store `partial`), R-01 daily recording, Q-01 Grafana. D-03 waits for the live token.
+Sprint 1: I-01, P-01, P-02, DL-01 done (merged). Sprint 2: G-01 gateway, UI-01 shell, M-dash, Gate 2 done
+(PR open). Next: W-01 ClickHouse writer (idempotent: dedup key / ReplacingMergeTree for flow_events;
+store `partial`), R-01 daily recording, Q-01 Grafana. D-03 waits for the live token (indices, order book
+L1, trade type, tmin/tmax added). Light theme waits for owner values.

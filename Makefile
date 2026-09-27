@@ -1,4 +1,4 @@
-.PHONY: test vet build synth demo demo-nats env up down ps ddl
+.PHONY: test vet build synth demo demo-nats env up down ps ddl web gate2
 COMPOSE := docker compose --env-file .env -f infra/docker-compose.yml
 
 test: ; go test ./...
@@ -9,6 +9,10 @@ synth: ; go run ./cmd/syngen > testdata/synthetic_day.ndjson
 demo: build ; ALLOW_SYNTHETIC_ON_BUS=1 SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson bin/collector | bin/engine > out.ndjson && echo "wrote out.ndjson"
 # Needs docker. Replays the synthetic day over a THROWAWAY NATS container (not the `make up` stack).
 demo-nats: build ; infra/demo-nats.sh
+# Web app: typecheck, unit tests, static export (web/out, served by the gateway).
+web: ; cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && NEXT_TELEMETRY_DISABLED=1 npm run build
+# Needs docker + Chromium. Gate 2: 1500 synthetic symbols, real-time replay, THROWAWAY NATS and Centrifugo.
+gate2: ; infra/gate2.sh
 
 # Local stack (I-01). `make env` once, then `make up ddl`.
 env: ; infra/gen-env.sh

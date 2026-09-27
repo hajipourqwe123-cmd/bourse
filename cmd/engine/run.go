@@ -134,6 +134,18 @@ type idPublisher interface {
 	PublishID(subject, id string, v any) error
 }
 
+// batchPublisher sends several messages in one attempt (bus.JetStream).
+type batchPublisher interface {
+	PublishBatch(items []bus.BatchItem) []error
+}
+
+func outputID(o output, idPrefix string, i int) string {
+	if o.id == "" && idPrefix != "" {
+		return fmt.Sprintf("%s:%d", idPrefix, i)
+	}
+	return o.id
+}
+
 // publish sends outs in order. A failed output is retried (the SAME value, same message ID)
 // with bounded backoff, then the error is returned; outputs already sent are not resent.
 // idPrefix != "" gives output i the message ID idPrefix:i (JetStream de-duplication).
@@ -149,12 +161,29 @@ func (p *processor) publish(ctx context.Context, outs []output, idPrefix string,
 		}
 	}
 	var guardErr error
-	for i, o := range outs {
-		alive()
-		id := o.id
-		if id == "" && idPrefix != "" {
-			id = fmt.Sprintf("%s:%d", idPrefix, i)
+	done := make([]bool, len(outs))
+	// First attempt: every output at once (one round trip instead of one per output), after the
+	// lease guard; anything not stored is retried one by one below, same value and message ID.
+	if bp, ok := p.pub.(batchPublisher); ok && len(outs) > 1 {
+		if p.guard != nil {
+			if err := p.guard(); err != nil {
+				return fmt.Errorf("before output 1/%d: %w", len(outs), err)
+			}
 		}
+		items := make([]bus.BatchItem, len(outs))
+		for i, o := range outs {
+			items[i] = bus.BatchItem{Subject: o.subject, ID: outputID(o, idPrefix, i), V: o.v}
+		}
+		for i, err := range bp.PublishBatch(items) {
+			done[i] = err == nil
+		}
+	}
+	for i, o := range outs {
+		if done[i] {
+			continue
+		}
+		alive()
+		id := outputID(o, idPrefix, i)
 		err := bus.Retry(ctx, p.retry, alive, func() error {
 			if p.guard != nil { // before EVERY attempt, retries included
 				if guardErr = p.guard(); guardErr != nil {
@@ -242,6 +271,8 @@ type jsBus interface {
 	SaveCheckpoint(ctx context.Context, name string, cp bus.Checkpoint) error
 	StateGet(ctx context.Context, key string) ([]byte, bool, error)
 	StatePut(ctx context.Context, key string, val []byte) error
+	RefGet(ctx context.Context, key string) ([]byte, bool, error)
+	RefPut(ctx context.Context, key string, val []byte) error
 }
 
 // recoveryStart picks where replay begins: 1h before the Tehran day start of the snapshot at
@@ -269,7 +300,11 @@ func recoveryStart(floorSource, floorStored time.Time) time.Time {
 // floor's day missing from the replay.
 func (p *processor) recoverState(ctx context.Context) (replayed int, err error) {
 	floor, err := p.js.AckFloor(ctx, bus.StreamMD, engineDurable)
-	if err != nil || floor == 0 {
+	if err != nil {
+		return 0, err
+	}
+	if floor == 0 { // nothing processed yet: still take the newest stored reference
+		_, err := p.loadPrev(ctx, "")
 		return 0, err
 	}
 	st, err := p.js.StreamState(ctx, bus.StreamMD)
@@ -324,6 +359,10 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		log.Printf("engine: recovery: MD starts at seq %d (stored %s), ack floor %d, floor day %q: snapshots were lost; affected days are marked partial by the late-start rule (DAY_START_MISSED)",
 			st.FirstSeq, st.FirstStored.UTC().Format(time.RFC3339), floor, floorDay)
 	}
+	loaded, err := p.loadPrev(ctx, floorDay)
+	if err != nil {
+		return 0, err
+	}
 	replayIssues := map[string]output{}
 	last, err := p.js.Replay(ctx, bus.StreamMD, snapFilter, start, floor, func(m bus.Msg) error {
 		s, err := decode(m.Subject, m.Data)
@@ -370,6 +409,13 @@ func (p *processor) recoverState(ctx context.Context) (replayed int, err error) 
 		}
 		log.Printf("engine: recovery: published %d DAY_START_MISSED issue(s) from the replay", len(outs))
 	}
+	// The replay may have rolled into the floor day from margin snapshots of the day before,
+	// replacing the reference with one the original run never had: re-install the stored one
+	// (it is the floor day's reference); the replay's last seen totals are kept for the next roll.
+	if loaded != nil {
+		p.eng.SetPrevTotals(loaded.Day, loaded.Totals)
+	}
+	p.eng.TakeRolled()
 	p.lastSeq = floor
 	return replayed, nil
 }
@@ -472,6 +518,13 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	}
 	// From here on Process() has run: never Nak. Retry the same outputs, else abort.
 	outs := p.compute(s)
+	if p.eng.TakeRolled() {
+		// A new trading day: persist the previous-day reference BEFORE anything of this day is
+		// published or acked (a restart replays only the current day and needs it).
+		if err := bus.Retry(ctx, p.retry, keepAlive, func() error { return p.savePrev(ctx) }); err != nil {
+			return bus.Abort(fmt.Errorf("save previous-day totals: %w", err))
+		}
+	}
 	for i := range outs {
 		if iss, ok := outs[i].v.(model.QualityIssue); ok && iss.Code == quality.DayStartMissed {
 			outs[i].id = p.dsmID(s.InsCode, tehran.TradingDay(s.SourceTime))
@@ -483,6 +536,70 @@ func (p *processor) apply(ctx context.Context, m bus.Msg, keepAlive func()) erro
 	p.lastSeq = m.StreamSeq
 	p.checkpoint(ctx, s, m.StreamSeq)
 	return nil
+}
+
+// KV keys (bus.RefBucket) of the engine's previous-day reference: the latest record and the
+// one before it, so a restart can pick the record older than the day it replays.
+const (
+	keyPrev       = "engine_prev_totals"
+	keyPrevBefore = "engine_prev_totals_before"
+)
+
+type prevRecord struct {
+	Day    string                  `json:"day"`
+	Totals map[string]model.Totals `json:"totals"`
+}
+
+// savePrev stores the engine's previous-day reference, rotating an older stored record.
+func (p *processor) savePrev(ctx context.Context) error {
+	if p.guard != nil {
+		if err := p.guard(); err != nil {
+			return bus.Permanent(err)
+		}
+	}
+	day, totals := p.eng.PrevTotals()
+	b, err := json.Marshal(prevRecord{Day: day, Totals: totals})
+	if err != nil {
+		return bus.Permanent(err)
+	}
+	old, ok, err := p.js.RefGet(ctx, keyPrev)
+	if err != nil {
+		return err
+	}
+	var rec prevRecord
+	if ok && json.Unmarshal(old, &rec) == nil && rec.Day != "" && rec.Day < day {
+		if err := p.js.RefPut(ctx, keyPrevBefore, old); err != nil {
+			return err
+		}
+	}
+	return p.js.RefPut(ctx, keyPrev, b)
+}
+
+// loadPrev installs the stored previous-day reference older than day (the day being replayed;
+// "" = the newest) and returns it (nil if none).
+func (p *processor) loadPrev(ctx context.Context, day string) (*prevRecord, error) {
+	for _, key := range []string{keyPrev, keyPrevBefore} {
+		b, ok, err := p.js.RefGet(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("recovery: load %s: %w", key, err)
+		}
+		if !ok {
+			continue
+		}
+		var rec prevRecord
+		if err := json.Unmarshal(b, &rec); err != nil || rec.Day == "" {
+			log.Printf("engine: WARNING: stored %s is undecodable; ignored", key)
+			continue
+		}
+		if day != "" && rec.Day >= day {
+			continue
+		}
+		p.eng.SetPrevTotals(rec.Day, rec.Totals)
+		log.Printf("engine: recovery: previous-day totals of %s loaded (%d instruments)", rec.Day, len(rec.Totals))
+		return &rec, nil
+	}
+	log.Printf("engine: WARNING: no stored previous-day totals before %q: a post-open carryover of the previous day is not detected until the next day change", day)
+	return nil, nil
 }
 
 // checkpoint records the first MD sequence of each new trading day, so a restart can place its

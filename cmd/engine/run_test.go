@@ -260,7 +260,7 @@ func TestRestartMidDayEqualsUninterruptedRun(t *testing.T) {
 			}
 		})
 		for ins, g := range wantGame {
-			if gotGame[ins] != g {
+			if !sameGame(gotGame[ins], g) {
 				t.Errorf("cut %d: %s game totals\n got %+v\nwant %+v", cut, ins, gotGame[ins], g)
 			}
 		}
@@ -284,6 +284,15 @@ func (f *failingPub) PublishID(subject, id string, v any) error {
 		return errors.New("nats down")
 	}
 	return f.JetStream.PublishID(subject, id, v)
+}
+
+// PublishBatch routes every item through PublishID, so failures are injected per output.
+func (f *failingPub) PublishBatch(items []bus.BatchItem) []error {
+	errs := make([]error, len(items))
+	for i, it := range items {
+		errs[i] = f.PublishID(it.Subject, it.ID, it.V)
+	}
+	return errs
 }
 
 // A publish failure after Process(): retries, then aborts without acking; the next process
@@ -315,7 +324,7 @@ func TestPublishFailureAbortsAndNextProcessCompletes(t *testing.T) {
 		}
 	})
 	for ins, g := range wantGame {
-		if gotGame[ins] != g {
+		if !sameGame(gotGame[ins], g) {
 			t.Errorf("%s game totals\n got %+v\nwant %+v", ins, gotGame[ins], g)
 		}
 	}
@@ -556,8 +565,21 @@ func (b *blockingPub) PublishID(subject, id string, v any) error {
 	return b.JetStream.PublishID(subject, id, v)
 }
 
-// The lease is lost while a snapshot's outputs are being published: the in-flight publish may
-// complete, but no further output is published and the snapshot is not acked.
+// PublishBatch is one attempt carrying all of a snapshot's outputs: it blocks as a whole (the
+// batch is in flight) and counts as one call.
+func (b *blockingPub) PublishBatch(items []bus.BatchItem) []error {
+	if b.first.CompareAndSwap(false, true) {
+		close(b.entered)
+		<-b.release
+	} else {
+		b.after.Add(1)
+	}
+	return b.JetStream.PublishBatch(items)
+}
+
+// The lease is lost while a snapshot's outputs are being published: the in-flight publish
+// attempt (one output, or one batch of a snapshot's outputs) may complete, but no further
+// attempt is made and the snapshot is not acked.
 func TestLostLeaseStopsPublishAndAck(t *testing.T) {
 	url := startServer(t)
 	js := connectJS(t, url)
@@ -626,4 +648,13 @@ func TestLostLeaseBlocksAck(t *testing.T) {
 	if f, _ := js.AckFloor(context.Background(), bus.StreamMD, engineDurable); f != 0 {
 		t.Fatalf("snapshot acked after the lease was lost: ack floor %d", f)
 	}
+}
+
+// sameGame compares totals; AsOf by instant (decoded times carry distinct *Location values).
+func sameGame(a, b model.GameTotals) bool {
+	if !a.AsOf.Equal(b.AsOf) {
+		return false
+	}
+	a.AsOf, b.AsOf = time.Time{}, time.Time{}
+	return a == b
 }

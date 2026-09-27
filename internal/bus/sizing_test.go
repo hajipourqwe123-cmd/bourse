@@ -1,6 +1,7 @@
 package bus
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -112,4 +113,29 @@ func TestFlowAndQualitySizing(t *testing.T) {
 			t.Errorf("%s MaxBytes %d < 1.2 x worst-case day (%.1f GB)", s.Name, s.MaxBytes, daily/1e9)
 		}
 	}
+}
+
+// The carryover reference: four market-wide records (engine and gateway, each rotated) must fit
+// RefBucket with room, and one record must fit a NATS message (default max_payload 1 MiB), at
+// 5,000 instruments with 17-digit codes (the market has ~1,500).
+func TestRefBucketSizing(t *testing.T) {
+	m := map[string]model.Totals{}
+	for i := 0; i < 5000; i++ {
+		m[fmt.Sprintf("%017d", 46348559193224090+int64(i))] = model.Totals{Volume: 123_456_789_012, Value: 9_876_543_210_987_654,
+			TradeCount: 1_234_567, HasCount: true, Seen: "2026-09-26"}
+	}
+	b, err := json.Marshal(struct {
+		Day    string                  `json:"day"`
+		Totals map[string]model.Totals `json:"totals"`
+	}{"2026-09-26", m})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) >= 1<<20 {
+		t.Errorf("one record of 5,000 instruments is %d bytes: over the 1 MiB NATS payload", len(b))
+	}
+	if need := 4 * len(b) * 12 / 10; RefBucketBytes < need {
+		t.Errorf("RefBucket %d bytes < 1.2 × 4 records (%d)", RefBucketBytes, need)
+	}
+	t.Logf("record at 5,000 instruments: %d bytes (%d per instrument)", len(b), len(b)/5000)
 }

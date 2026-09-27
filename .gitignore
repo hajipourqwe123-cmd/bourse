@@ -6,3 +6,5 @@ out.ndjson
 /collector
 /engine
 /syngen
+/gate2-out/
+/gateway

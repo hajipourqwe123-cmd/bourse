@@ -31,6 +31,9 @@ func main() {
 	step := flag.Duration("step", 5*time.Second, "snapshot interval")
 	seed := flag.Int64("seed", 1405, "random seed (deterministic output)")
 	n := flag.Int("n", 5, "number of instruments (>= 5; the first 5 are the fixed scenarios, more are load)")
+	from := flag.String("from", "", "emit trading snapshots only from this Tehran time (HH:MM); the day's state is still computed from the open, and pre-open baselines are always emitted")
+	to := flag.String("to", "", "emit nothing after this Tehran time (HH:MM)")
+	mapOut := flag.String("map", "", "write a session calendar mapping the load instruments to a realistic class mix to this path (use it as SESSIONS_FILE everywhere)")
 	flag.Parse()
 	d, err := time.ParseInLocation("2006-01-02", *day, tehran.Loc)
 	if err != nil {
@@ -41,6 +44,17 @@ func main() {
 		panic(err)
 	}
 	rng := rand.New(rand.NewSource(*seed))
+	hm := func(v string) time.Time {
+		if v == "" {
+			return time.Time{}
+		}
+		t, err := time.ParseInLocation("15:04", v, tehran.Loc)
+		if err != nil {
+			panic("syngen: bad time " + v)
+		}
+		return d.Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute)
+	}
+	emitFrom, emitTo := hm(*from), hm(*to)
 
 	mk := func(code, sym string, price float64, drift float64, bb, bs int) *inst {
 		return &inst{s: model.Snapshot{InsCode: code, Symbol: sym, Source: "synthetic",
@@ -58,6 +72,17 @@ func main() {
 		in := mk(fmt.Sprintf("SYNTHETIC%04d", k+1), fmt.Sprintf("%s-%d", base.s.Symbol, k+1),
 			base.price*(0.5+float64(k%7)/4), base.drift, base.bigBuyEvery, base.bigSellEvery)
 		insts = append(insts, in)
+	}
+	if *mapOut != "" {
+		m := classMix(insts)
+		b, err := withInstruments(calendar.EmbeddedJSON(), m)
+		if err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(*mapOut, b, 0o644); err != nil {
+			panic(err)
+		}
+		cal = cal.WithInstruments(m)
 	}
 	// Each instrument trades in its own session from the calendar; one zero-volume snapshot one
 	// step before its open is its pre-open day baseline, so the demo day is complete.
@@ -77,6 +102,9 @@ func main() {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
+	if !emitTo.IsZero() && emitTo.Before(end) {
+		end = emitTo
+	}
 	for t := start; !t.After(end); t = t.Add(*step) {
 		for _, in := range insts {
 			if t.Equal(in.sess.Open.Add(-*step)) {
@@ -135,7 +163,53 @@ func main() {
 			s.IndSellCount += newSellers
 			s.SourceTime = t
 			s.IngestTime = t.Add(time.Duration(300+rng.Intn(900)) * time.Millisecond)
+			if !emitFrom.IsZero() && t.Before(emitFrom) {
+				continue // computed (cumulative totals stay right), not emitted
+			}
 			enc.Encode(map[string]any{"subject": "md.snap." + s.InsCode, "data": s})
 		}
 	}
+}
+
+// classMix assigns the load instruments (all but the 5 fixed scenarios) a deterministic, roughly
+// market-like class mix: of every 20, 13 stock, 2 equity ETF, 2 fixed income, 1 gold, 1 silver
+// and 1 left unmapped (class unknown).
+func classMix(insts []*inst) map[string]string {
+	cycle := []string{"stock", "stock", "equity_etf", "stock", "fixed_income", "stock", "stock", "gold", "stock", "stock",
+		"equity_etf", "stock", "", "stock", "fixed_income", "stock", "silver", "stock", "stock", "stock"}
+	m := map[string]string{}
+	for i, in := range insts[5:] {
+		if c := cycle[i%len(cycle)]; c != "" {
+			m[in.s.InsCode] = c
+		}
+	}
+	return m
+}
+
+// withInstruments adds instrument mappings to a sessions.json document and validates the result.
+func withInstruments(doc []byte, m map[string]string) ([]byte, error) {
+	var f map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &f); err != nil {
+		return nil, err
+	}
+	ins := map[string]string{}
+	if err := json.Unmarshal(f["instruments"], &ins); err != nil {
+		return nil, err
+	}
+	for k, v := range m {
+		ins[k] = v
+	}
+	b, err := json.Marshal(ins)
+	if err != nil {
+		return nil, err
+	}
+	f["instruments"] = b
+	out, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := calendar.Parse(out); err != nil {
+		return nil, fmt.Errorf("syngen: derived calendar invalid: %w", err)
+	}
+	return out, nil
 }

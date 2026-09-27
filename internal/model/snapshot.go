@@ -83,6 +83,7 @@ const (
 	FInstBuyCount  = "inst_buy_count"
 	FInstSellCount = "inst_sell_count"
 	FBook          = "book"
+	FTradeCount    = "trade_count"
 )
 
 // FlowFields are required for any real-person money-flow metric.
@@ -118,8 +119,13 @@ func DecodeSnapshot(data []byte) (Snapshot, error) {
 	return s, nil
 }
 
-// IsSynthetic reports SYNTHETIC development data (rule 5: never shown to users or used in
-// backtests): source "synthetic" or a SYN* instrument code or symbol.
+// RebasedPrefix marks the source of a recording re-timed to the present (collector
+// REPLAY_REBASE, development only): its times are not the market's.
+const RebasedPrefix = "rebase:"
+
+// IsSynthetic reports data that is not real market data (rule 5: never shown to users or used
+// in backtests): source "synthetic", a SYN* instrument code or symbol, or a re-timed recording.
 func IsSynthetic(s *Snapshot) bool {
-	return s.Source == "synthetic" || strings.HasPrefix(s.InsCode, "SYN") || strings.HasPrefix(s.Symbol, "SYN")
+	return s.Source == "synthetic" || strings.HasPrefix(s.Source, RebasedPrefix) ||
+		strings.HasPrefix(s.InsCode, "SYN") || strings.HasPrefix(s.Symbol, "SYN")
 }

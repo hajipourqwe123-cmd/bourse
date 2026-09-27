@@ -29,6 +29,8 @@ type fakeBus struct {
 	stopAfter uint64 // Replay stops (without error) after this sequence; 0 = never
 	start     time.Time
 	replayed  []uint64
+	refGetErr error // RefGet / RefPut fail when set
+	refPutErr error
 }
 
 type fakeMsg struct {
@@ -92,6 +94,18 @@ func (f *fakeBus) SaveCheckpoint(_ context.Context, _ string, cp bus.Checkpoint)
 func (f *fakeBus) StateGet(_ context.Context, key string) ([]byte, bool, error) {
 	v, ok := f.state[key]
 	return v, ok, nil
+}
+func (f *fakeBus) RefGet(ctx context.Context, key string) ([]byte, bool, error) {
+	if f.refGetErr != nil {
+		return nil, false, f.refGetErr
+	}
+	return f.StateGet(ctx, "ref/"+key)
+}
+func (f *fakeBus) RefPut(ctx context.Context, key string, val []byte) error {
+	if f.refPutErr != nil {
+		return f.refPutErr
+	}
+	return f.StatePut(ctx, "ref/"+key, val)
 }
 func (f *fakeBus) StatePut(_ context.Context, key string, val []byte) error {
 	if f.state == nil {
@@ -177,7 +191,7 @@ func TestRecoveryStart(t *testing.T) {
 // the margin are included, and nothing after the ack floor is touched.
 func TestRecoverStateReplaysTradingDayUpToFloor(t *testing.T) {
 	d := day("2026-09-23", 1, 3, 5)
-	prev := day("2026-09-22", 1, 2, 5)
+	prev := day("2026-09-22", 1, 2, 6) // own seed: identical totals would be (correctly) carryover
 	f := &fakeBus{floor: 4}
 	f.add(1, tehranTime("2026-09-22", "12:00"), prev[0]) // outside the window
 	f.add(2, tehranTime("2026-09-22", "23:30"), prev[1]) // inside the 1h margin
@@ -724,5 +738,128 @@ func TestReplayIssuesOnlyAfterLossAndPublishedAtRecovery(t *testing.T) {
 	}
 	if fmt.Sprint(pub.ids) != "[eng:1:dsm:SYNTEST0000:2026-09-23]" || pub.subj[0] != "quality.SYNTEST0000" {
 		t.Fatalf("published %v on %v", pub.ids, pub.subj)
+	}
+}
+
+// The previous-day reference is saved at a day change (rotating the older record) and loaded at
+// recovery as the newest record older than the replayed day.
+func TestPrevTotalsSaveRotateLoad(t *testing.T) {
+	f := &fakeBus{}
+	p := newTestProcessor(f, &recPub{})
+	p.eng.SetPrevTotals("2026-09-22", map[string]model.Totals{"A": {Volume: 1}})
+	if err := p.savePrev(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.eng.SetPrevTotals("2026-09-23", map[string]model.Totals{"A": {Volume: 2}})
+	_ = p.savePrev(context.Background())
+	_ = p.savePrev(context.Background()) // same day again: must not rotate over the older record
+	for day, want := range map[string]int64{"2026-09-24": 2, "2026-09-23": 1, "": 2} {
+		q := newTestProcessor(f, &recPub{})
+		if _, err := q.loadPrev(context.Background(), day); err != nil {
+			t.Fatal(err)
+		}
+		if _, m := q.eng.PrevTotals(); m["A"].Volume != want {
+			t.Errorf("replaying %q: loaded volume %d, want %d", day, m["A"].Volume, want)
+		}
+	}
+	q := newTestProcessor(f, &recPub{})
+	_, _ = q.loadPrev(context.Background(), "2026-09-22") // nothing older: no reference
+	if d, _ := q.eng.PrevTotals(); d != "" {
+		t.Errorf("reference %q loaded for a day it is not older than", d)
+	}
+}
+
+// stockCal maps IRSTOCK to the stock class (09:00–12:30).
+func stockProcessor(f *fakeBus, pub *recPub) *processor {
+	cfg := flow.DefaultConfig()
+	cfg.Sessions = calendar.Default().WithInstruments(map[string]string{"IRSTOCK": "stock"})
+	p := newProcessor(cfg, pub)
+	p.retry = []time.Duration{time.Millisecond}
+	p.js, p.epoch = f, 1
+	return p
+}
+
+func stockSnap(day, hms string, vol, trades int64) model.Snapshot {
+	t, _ := time.ParseInLocation("2006-01-02 15:04:05", day+" "+hms, tehran.Loc)
+	return model.Snapshot{InsCode: "IRSTOCK", Symbol: "S", Source: "test", SourceTime: t, IngestTime: t.Add(time.Second),
+		PriceLast: 10_000, PriceYesterday: 10_000, Volume: vol, Value: vol * 10_000, TradeCount: trades,
+		IndBuyVol: vol, IndSellVol: vol, IndBuyCount: trades, IndSellCount: trades}
+}
+
+// The previous-day reference is saved at the day change BEFORE anything of the new day is
+// published; a failed save aborts with nothing of that snapshot published or applied.
+func TestApplySavesReferenceBeforePublishing(t *testing.T) {
+	f := &fakeBus{}
+	pub := &recPub{}
+	p := stockProcessor(f, pub)
+	snaps := []model.Snapshot{stockSnap("2026-09-26", "08:59:55", 0, 0), stockSnap("2026-09-26", "12:29:55", 5_000, 90),
+		stockSnap("2026-09-27", "09:00:05", 5_000, 90)}
+	for i, s := range snaps {
+		f.add(uint64(i+1), s.IngestTime, s)
+	}
+	msg := func(seq uint64) bus.Msg {
+		m := f.msgs[seq]
+		return bus.Msg{Subject: m.subj, Data: m.data, StreamSeq: seq, Stored: m.stored}
+	}
+	ctx := context.Background()
+	for _, seq := range []uint64{1, 2} {
+		if err := p.apply(ctx, msg(seq), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(pub.ids)
+	f.refPutErr = errors.New("kv full")
+	if err := p.apply(ctx, msg(3), nil); err == nil || len(pub.ids) != before || p.lastSeq != 2 {
+		t.Fatalf("failed save: err=%v, %d outputs published, lastSeq %d; want abort, nothing published, not applied", err, len(pub.ids)-before, p.lastSeq)
+	}
+	// Next process: recovers (the day-2 reference was never saved, so none newer than day 1),
+	// gets seq 3 redelivered, saves, then publishes the carryover issue.
+	f.refPutErr, f.floor = nil, 2
+	q := stockProcessor(f, pub)
+	if _, err := q.recoverState(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.apply(ctx, msg(3), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.state["ref/"+keyPrev]; !ok {
+		t.Fatal("reference not saved at the day change")
+	}
+	var codes []string
+	for _, v := range pub.vals[before:] {
+		if iss, ok := v.(model.QualityIssue); ok {
+			codes = append(codes, iss.Code)
+		}
+	}
+	if fmt.Sprint(codes) != "[PREV_DAY_CARRYOVER]" {
+		t.Errorf("day-2 repeat after the open: issues %v", codes)
+	}
+}
+
+// Recovery loads the stored reference: a post-open repeat of yesterday's totals is caught by a
+// restarted engine (the replay covers only the current day).
+func TestRecoveryLoadsReference(t *testing.T) {
+	f := &fakeBus{}
+	b, _ := json.Marshal(prevRecord{Day: "2026-09-26", Totals: map[string]model.Totals{"IRSTOCK": {Volume: 5_000, Value: 50_000_000, TradeCount: 90, HasCount: true, Seen: "2026-09-26"}}})
+	f.state = map[string][]byte{"ref/" + keyPrev: b}
+	// A snapshot in the replay's 1h margin before the day: the replay rolls over it, but the
+	// reference of the day is the stored one (re-installed after the replay).
+	m := stockSnap("2026-09-26", "23:30:00", 7, 1)
+	f.add(1, m.IngestTime, m)
+	s1 := stockSnap("2026-09-27", "08:59:55", 0, 0)
+	f.add(2, s1.IngestTime, s1)
+	f.floor = 2
+	pub := &recPub{}
+	p := stockProcessor(f, pub)
+	if _, err := p.recoverState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r := p.eng.Process(stockSnap("2026-09-27", "09:00:05", 5_000, 90)) // flip-back after the zero
+	found := false
+	for _, i := range r.Issues {
+		found = found || i.Code == quality.PrevDayCarryover
+	}
+	if !found || r.Game != nil {
+		t.Errorf("restarted engine: %+v", r)
 	}
 }
