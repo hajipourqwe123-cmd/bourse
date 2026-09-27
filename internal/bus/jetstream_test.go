@@ -589,3 +589,54 @@ func TestRefBucketRoundTripLargeRecord(t *testing.T) {
 		t.Errorf("missing key: ok=%v err=%v", ok, err)
 	}
 }
+
+// ConsumeBatch reports Settled only when nothing delivered is left unacked: a batch abandoned by a
+// failed run keeps it silent (empty fetches included) until the batch is redelivered and acked.
+func TestConsumeBatchSettledWaitsForUnackedBatch(t *testing.T) {
+	j := connect(t, DefaultStreams())
+	publishN(t, j, "1", "2", "3")
+	spec := BatchSpec{Stream: StreamMD, Durable: "writer-md", Filter: "md.snap.>", MaxBatch: 10,
+		MaxWait: 50 * time.Millisecond, AckWait: 700 * time.Millisecond}
+	// Run 1: the batch fails (left unacked for redelivery).
+	fail := errors.New("crash")
+	if err := j.ConsumeBatch(ctxT(t), spec, func([]Msg) error { return fail }); !errors.Is(err, fail) {
+		t.Fatalf("run 1: %v", err)
+	}
+	// Run 2 (restart): before the redelivery every fetch is empty, yet nothing may settle.
+	type settle struct {
+		drained bool
+		last    time.Time
+	}
+	var mu sync.Mutex
+	var settles []settle
+	var handled int
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	spec.Settled = func(_ time.Time, drained bool, last time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		settles = append(settles, settle{drained, last})
+		if handled == 3 && drained {
+			cancel()
+		}
+	}
+	start := time.Now()
+	err := j.ConsumeBatch(ctx, spec, func(ms []Msg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(settles) > 0 {
+			t.Errorf("settled %+v before the unacked batch was redelivered", settles)
+		}
+		handled += len(ms)
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run 2: %v (handled %d, settles %+v)", err, handled, settles)
+	}
+	if handled != 3 || time.Since(start) < 500*time.Millisecond {
+		t.Fatalf("handled %d after %s, want the 3 redelivered after AckWait", handled, time.Since(start))
+	}
+	if !settles[0].drained || settles[0].last.IsZero() {
+		t.Errorf("first settle %+v, want the redelivered batch, drained", settles[0])
+	}
+}

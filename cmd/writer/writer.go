@@ -138,13 +138,25 @@ var oncePerDay = map[string]bool{quality.DayStartMissed: true, quality.PrevDayCa
 // quality batch is inserted only once writer-md has CHECKED (for synthetic data) every snapshot
 // that could have produced it. An output is always stored after its input snapshot, so a batch
 // received at local time h, whose newest message was stored at server time t, may go when
-//   - writer-md has checked a snapshot stored at or after t (server clock vs server clock), or
-//   - writer-md found MD empty on a fetch started after h (local clock vs local clock).
+//   - every MD message stored up to t has been checked and acked (server clock vs server clock), or
+//   - no MD message was pending or unacked at a local time after h (local clock vs local clock).
 //
-// The two clocks are never compared with each other.
+// The two clocks are never compared with each other. Both are advanced only from writer-md's
+// bus.BatchSpec.Settled, i.e. when the server reports nothing unacked: a batch left unacked by a
+// crashed or stopped run (awaiting redelivery) holds the gate closed.
 type mdGate struct {
-	checked atomic.Int64 // stored time (server, ns) of the newest snapshot writer-md has checked
-	drained atomic.Int64 // local start time (ns) of writer-md's latest empty fetch
+	checked atomic.Int64 // stored time (server, ns) up to which every MD message is checked
+	drained atomic.Int64 // local time (ns) at which no MD message was pending or unacked
+}
+
+// settled is writer-md's bus.BatchSpec.Settled.
+func (g *mdGate) settled(at time.Time, drained bool, lastStored time.Time) {
+	if !lastStored.IsZero() && lastStored.UnixNano() > g.checked.Load() {
+		g.checked.Store(lastStored.UnixNano())
+	}
+	if drained {
+		g.drained.Store(at.UnixNano())
+	}
 }
 
 func (g *mdGate) open(h, t time.Time) bool {
@@ -175,11 +187,11 @@ func (g *mdGate) wait(ctx context.Context, h, t time.Time, msgs []bus.Msg) error
 
 // writer turns bus messages into rows. It is stateless: idempotency is the tables' job.
 type writer struct {
-	// Exactly one of mark (writer-md: advanced after each checked batch) and gate (writer-flow,
-	// writer-quality: waited on before inserting) is set in production; both nil in unit tests.
-	mark, gate *mdGate
-	sink       sink
-	retry      []time.Duration // insert retries before giving up (the batch then stays unacked)
+	// gate (writer-flow, writer-quality) is waited on before inserting; nil for writer-md, whose
+	// Settled callback advances it, and in unit tests.
+	gate  *mdGate
+	sink  sink
+	retry []time.Duration // insert retries before giving up (the batch then stays unacked)
 	// afterInsert (tests) runs after the rows are inserted and before the batch is acked.
 	afterInsert func() error
 	stats       struct{ rows, undecodable int }
@@ -239,9 +251,6 @@ func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
 			return fmt.Errorf("insert %d rows into %s: %w", len(out[t]), t, err)
 		}
 		w.stats.rows += len(out[t])
-	}
-	if w.mark != nil { // every snapshot of this batch was checked (none synthetic)
-		w.mark.checked.Store(newest.UnixNano())
 	}
 	if w.afterInsert != nil {
 		return w.afterInsert()

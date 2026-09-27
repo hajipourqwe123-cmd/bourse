@@ -581,9 +581,13 @@ type BatchSpec struct {
 	MaxBatch                int           // default 1000
 	MaxWait                 time.Duration // longest wait to fill a batch; default 1s
 	AckWait                 time.Duration // default 60s; must exceed the handler's worst case
-	// Idle, if set, is called after a fetch that returned no message, with the (local) time the
-	// fetch started: every message stored before then had already been handled and acked.
-	Idle func(fetchStart time.Time)
+	// Settled, if set, is called after each fetch cycle (an empty fetch, or a batch handled and
+	// acked) but ONLY when the server reports no delivered message left unacked (NumAckPending 0;
+	// e.g. a batch of a crashed run awaiting redelivery keeps it silent). Then every message up to
+	// lastStored (the stored time of this batch's newest message; zero after an empty fetch) has
+	// been handled; drained additionally reports that none was pending at local time at, so every
+	// message stored before at has been handled.
+	Settled func(at time.Time, drained bool, lastStored time.Time)
 }
 
 // ConsumeBatch runs a durable pull consumer (created or updated from spec) and calls fn with each
@@ -618,7 +622,6 @@ func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		start := time.Now()
 		batch, err := c.Fetch(spec.MaxBatch, jetstream.FetchMaxWait(spec.MaxWait))
 		if err != nil {
 			if ctx.Err() != nil {
@@ -642,14 +645,16 @@ func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]
 		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && ctx.Err() == nil {
 			log.Printf("jetstream: consumer %s/%s: fetch: %v", spec.Stream, spec.Durable, err)
 		}
-		if len(msgs) == 0 {
-			if spec.Idle != nil {
-				spec.Idle(start)
+		var lastStored time.Time
+		if len(msgs) > 0 {
+			if err := fn(msgs); err != nil {
+				return err // unacked: redelivered after AckWait
 			}
-			continue
-		}
-		if err := fn(msgs); err != nil {
-			return err // unacked: redelivered after AckWait
+			for _, m := range msgs { // the newest (a redelivery may come after newer messages)
+				if m.Stored.After(lastStored) {
+					lastStored = m.Stored
+				}
+			}
 		}
 		// The last ack is synchronous, so a returned batch is known to be acked on the server.
 		for i, m := range raw {
@@ -660,6 +665,20 @@ func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]
 			}
 			if err != nil {
 				log.Printf("jetstream: ack %s: %v", m.Subject(), err)
+			}
+		}
+		if spec.Settled != nil {
+			at := time.Now()
+			info, err := c.Info(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				log.Printf("jetstream: consumer %s/%s info: %v", spec.Stream, spec.Durable, err)
+				continue
+			}
+			if info.NumAckPending == 0 {
+				spec.Settled(at, info.NumPending == 0, lastStored)
 			}
 		}
 	}

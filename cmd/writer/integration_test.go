@@ -134,8 +134,9 @@ func waitAcked(t *testing.T, js *bus.JetStream) {
 	}
 }
 
-// TestRestartAndRedelivery: a writer crashes after inserting a batch but before acking it; the
-// restarted writer receives the batch again and inserts it again; then the engine republishes
+// TestRestartAndRedelivery: a writer crashes after inserting a batch but before acking it (flow and
+// quality in one run, MD in another); the restarted writer receives the batches again and inserts
+// them again; then the engine republishes
 // outputs (after the dedup window: no message ID) and re-emits DAY_START_MISSED. Every key is
 // stored exactly once (FINAL, and after a forced merge), with the latest values, partial and class.
 func TestRestartAndRedelivery(t *testing.T) {
@@ -180,18 +181,22 @@ func TestRestartAndRedelivery(t *testing.T) {
 	cfg := Config{NATSURL: natsURL, CHURL: ch.base, CHDB: ch.db, CHUser: ch.user, CHKey: ch.pass,
 		Batch: 100, MaxWait: 200 * time.Millisecond, AckWait: 2 * time.Second, Retry: []time.Duration{10 * time.Millisecond}}
 
-	// Run 1: every stream's first batch is inserted, then the process "crashes" before the ack.
-	// A barrier makes all three streams insert before any crashes (the first crash stops the others).
+	// Run 1: writer-md stores and acks its batch (the flow and quality batches may only be inserted
+	// once MD is checked AND acked, mdGate); the flow and quality batches are inserted, then the
+	// process "crashes" before their ack. A barrier makes both insert before either crashes.
 	var crashes atomic.Int32
-	all := make(chan struct{})
+	both := make(chan struct{})
 	crash := errors.New("crash between insert and ack")
-	err = run(ctx, cfg, func(_ string, w *writer) {
+	err = run(ctx, cfg, func(stream string, w *writer) {
+		if stream == bus.StreamMD {
+			return
+		}
 		w.afterInsert = func() error {
-			if crashes.Add(1) == int32(len(consumers)) {
-				close(all)
+			if crashes.Add(1) == 2 {
+				close(both)
 			}
 			select {
-			case <-all:
+			case <-both:
 			case <-time.After(10 * time.Second):
 			}
 			return bus.Abort(crash)
@@ -201,7 +206,18 @@ func TestRestartAndRedelivery(t *testing.T) {
 		t.Fatalf("run 1 = %v, want the simulated crash", err)
 	}
 	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 4 {
-		t.Fatalf("run 1 inserted %d snapshots before crashing, want 4", n)
+		t.Fatalf("run 1 inserted %d snapshots, want 4", n)
+	}
+	// Run 1b: a new snapshot; writer-md inserts it and crashes before the ack.
+	pub(bus.SubjSnapshot("S1"), model.Snapshot{InsCode: "S1", Symbol: "ش۱", Source: "sourcearena",
+		SourceTime: at.Add(25 * time.Second), IngestTime: at.Add(26 * time.Second), Volume: 4})
+	err = run(ctx, cfg, func(stream string, w *writer) {
+		if stream == bus.StreamMD {
+			w.afterInsert = func() error { crashes.Add(1); return bus.Abort(crash) }
+		}
+	})
+	if !errors.Is(err, crash) {
+		t.Fatalf("run 1b = %v, want the simulated crash", err)
 	}
 
 	// Run 2 (restart): the unacked batches are redelivered and inserted again.
@@ -220,13 +236,13 @@ func TestRestartAndRedelivery(t *testing.T) {
 	}
 
 	// Every stream's batch was inserted twice (run 1, then the redelivery), plus the republish.
-	for table, min := range map[string]int{"snapshots": 8, "flow_events": 3, "game_totals": 3, "flow_10m": 3, "quality_issues": 7} {
+	for table, min := range map[string]int{"snapshots": 6, "flow_events": 3, "game_totals": 3, "flow_10m": 3, "quality_issues": 7} {
 		if raw := ch.count(t, "SELECT count() FROM {db}."+table); raw < min {
 			t.Errorf("%s: %d raw rows, want >= %d: the redelivery was not exercised", table, raw, min)
 		}
 	}
 	for q, n := range map[string]int{
-		"snapshots":   4,
+		"snapshots":   5,
 		"flow_events": 1,
 		"game_totals": 1,
 		"flow_10m":    1,
@@ -258,8 +274,8 @@ func TestRestartAndRedelivery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 4 {
-		t.Errorf("after merge: %d snapshots, want 4", n)
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 5 {
+		t.Errorf("after merge: %d snapshots, want 5", n)
 	}
 	if n := ch.count(t, "SELECT count() FROM {db}.quality_issues WHERE code = 'DAY_START_MISSED'"); n != 1 {
 		t.Errorf("after merge: %d DAY_START_MISSED rows, want 1", n)
@@ -274,7 +290,20 @@ func TestRestartAndRedelivery(t *testing.T) {
 	if err := run(ctx, cfg, nil); !errors.Is(err, errSynthetic) {
 		t.Errorf("run with synthetic data on the bus = %v, want errSynthetic", err)
 	}
-	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 4 {
-		t.Errorf("%d snapshots after the synthetic batch, want 4 (the batch is not stored)", n)
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 5 {
+		t.Errorf("%d snapshots after the synthetic batch, want 5 (the batch is not stored)", n)
+	}
+	// The stop is latched: a restart refuses to run, even once the demo is over.
+	if err := run(ctx, cfg, nil); !errors.Is(err, errSynthetic) || !strings.Contains(err.Error(), "WRITER_CLEAR_SYNTHETIC_STOP") {
+		t.Errorf("restart after the synthetic stop = %v, want the latch", err)
+	}
+	// The operator clears it without purging: the writer stops (and latches) again at once.
+	cleared := cfg
+	cleared.ClearSyntheticStop = true
+	if err := run(ctx, cleared, nil); !errors.Is(err, errSynthetic) {
+		t.Errorf("cleared latch, synthetic data still on the bus = %v, want errSynthetic", err)
+	}
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 5 {
+		t.Errorf("%d snapshots, want 5", n)
 	}
 }

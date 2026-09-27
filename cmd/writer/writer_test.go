@@ -249,17 +249,23 @@ func TestFlowWaitsForTheSnapshotCheck(t *testing.T) {
 	}
 }
 
-// writer-md advances the gate only for a batch it checked and stored.
-func TestSnapshotBatchAdvancesTheGate(t *testing.T) {
-	at := tehranAt("09:00")
+// The gate never moves backwards, and moves on "drained" only when the server said so.
+func TestGateSettled(t *testing.T) {
 	g := &mdGate{}
-	w := &writer{sink: &fakeSink{}, mark: g}
-	syn := msg(t, "md.snap.123", 9, model.Snapshot{InsCode: "123", Source: "rebase:replay", SourceTime: at})
-	if err := w.handle(context.Background(), []bus.Msg{syn}); !errors.Is(err, errSynthetic) || g.checked.Load() != 0 {
-		t.Fatalf("synthetic batch: err %v, gate %d; the gate must not move", err, g.checked.Load())
+	h := time.Now()
+	g.settled(h.Add(-time.Second), false, stored(9))
+	if g.open(h, stored(9)) != true || g.open(h, stored(10)) {
+		t.Error("checked must cover exactly the messages up to the settled batch's newest")
 	}
-	ok := msg(t, "md.snap.123", 10, model.Snapshot{InsCode: "123", Source: "sourcearena", SourceTime: at})
-	if err := w.handle(context.Background(), []bus.Msg{ok}); err != nil || g.checked.Load() != stored(10).UnixNano() {
-		t.Fatalf("checked batch: err %v, gate %d", err, g.checked.Load())
+	g.settled(h.Add(time.Second), false, stored(3)) // an older redelivery settles later
+	if !g.open(h, stored(9)) {
+		t.Error("checked moved backwards")
+	}
+	if g.open(h, stored(20)) {
+		t.Error("drained=false must not open the gate by time")
+	}
+	g.settled(h.Add(time.Second), true, time.Time{})
+	if !g.open(h, stored(20)) {
+		t.Error("drained after the batch arrived must open the gate")
 	}
 }
