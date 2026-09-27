@@ -90,6 +90,20 @@ export interface Unavailable {
   reason: string;
 }
 
+/** «ارزش صف‌ها»: stock class, from order-book level 1 and each instrument's permitted range. */
+export interface Queues {
+  available: boolean;
+  reason?: string;
+  instruments?: number;
+  missing?: number;
+  buy_count?: number;
+  sell_count?: number;
+  buy_value?: number;
+  sell_value?: number;
+  as_of?: string;
+  est?: boolean;
+}
+
 export interface Summary {
   day: string;
   as_of: string;
@@ -106,7 +120,7 @@ export interface Summary {
   flows: ClassFlow[];
   kpis: KPI[];
   breadth: Breadth;
-  queues: Unavailable;
+  queues: Queues;
 }
 
 export interface Signal {

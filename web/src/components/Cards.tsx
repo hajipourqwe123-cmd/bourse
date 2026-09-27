@@ -213,7 +213,7 @@ function FlowBands({ f, labels }: { f: ClassFlow; labels: string[] }) {
   );
 }
 
-/** «ارزش صف‌ها» (unavailable by contract) + «پهنای بازار سهام». */
+/** «ارزش صف‌ها» (order-book level 1 at the permitted range) + «پهنای بازار سهام». */
 export function QueueBreadthCard() {
   const s = useMarket();
   const b = s.summary?.breadth;
@@ -234,7 +234,24 @@ export function QueueBreadthCard() {
       <div className="card-head">
         <h2 className="t-card" id={id}>ارزش صف‌ها</h2>
       </div>
-      <Unavailable reason={q?.reason ?? "سطح یک دفتر سفارش در قرارداد داده فعلی نیست (D-03)"} />
+      {q?.available ? (
+        <div className="queues">
+          <div>
+            <span className="t-label">صف خرید · <span className="num">{num(q.buy_count ?? 0)}</span> نماد</span>
+            <div className="up"><Money rial={q.buy_value ?? 0} /></div>
+          </div>
+          <div>
+            <span className="t-label">صف فروش · <span className="num">{num(q.sell_count ?? 0)}</span> نماد</span>
+            <div className="down"><Money rial={q.sell_value ?? 0} /></div>
+          </div>
+          <span className="t-label">
+            {(q.missing ?? 0) > 0 && <>بدون دفتر یا دامنه: <span className="num">{num(q.missing ?? 0)}</span> · </>}
+            <Age at={q.as_of} />
+          </span>
+        </div>
+      ) : (
+        <Unavailable reason={q?.reason ?? "دفتر سفارش در دسترس نیست"} />
+      )}
       <div className="card-head" style={{ marginTop: 8 }}>
         <span className="t-label">
           پهنای بازار سهام · <span className="num">{num(covered)}</span> نماد معامله‌شده

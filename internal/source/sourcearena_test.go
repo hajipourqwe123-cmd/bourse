@@ -115,7 +115,12 @@ func TestParseLiveSample(t *testing.T) {
 	if !f.HasPriceLimits() || f.PriceLimitMin != 3170 || f.PriceLimitMax != 3350 {
 		t.Errorf("فولاد limits: %d..%d", f.PriceLimitMin, f.PriceLimitMax)
 	}
-	if f.Has(model.FBook) || !f.SourceTimeEstimated {
+	// Book: level 1 of the live sample (bid 973 orders of 128,495,206 at 3350; ask 1 of 2,200 at 3360).
+	if !f.Has(model.FBook) || len(f.Book) != 5 || f.Book[0] != (model.Level{BidPrice: 3350, BidVol: 128495206, BidCount: 973,
+		AskPrice: 3360, AskVol: 2200, AskCount: 1}) {
+		t.Errorf("فولاد book: %+v", f.Book)
+	}
+	if !f.SourceTimeEstimated {
 		t.Errorf("فولاد flags: %v", f.Missing)
 	}
 	// A suspended instrument and one with no trade date still parse (by instance_code).
