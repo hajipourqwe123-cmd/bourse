@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,53 +78,53 @@ func (c *clickhouse) insert(ctx context.Context, table string, rows [][]byte) er
 	return err
 }
 
-// requiredColumns are the W-01 columns the writer depends on; an older schema is refused at start.
-var requiredColumns = map[string][]string{
-	tSnapshots: {"bus_seq"},
-	tFlow:      {"class", "bus_seq"},
-	tGame:      {"class", "partial", "day", "bus_seq"},
-	t10m:       {"class", "partial", "bus_seq"},
-	tQuality:   {"day", "dedup_at", "dedup_detail", "bus_seq"},
+// schema is what the writer's idempotency depends on: each table's sorting key (the dedup key) and
+// its ReplacingMergeTree version column. Anything else is refused at start, so dedup can never
+// fail silently against an older table.
+var schema = map[string]string{
+	tSnapshots: "ins_code, source_time, source",
+	tFlow:      "ins_code, interval_to, side, interval_from",
+	t10m:       "ins_code, window_start",
+	tGame:      "ins_code, day",
+	tQuality:   "code, ins_code, day, dedup_at, dedup_detail",
 }
 
-// checkSchema verifies every table has the W-01 columns and a ReplacingMergeTree engine.
+// checkSchema verifies every table's engine, version column and sorting key.
 func (c *clickhouse) checkSchema(ctx context.Context) error {
-	out, err := c.do(ctx, fmt.Sprintf("SELECT table, engine FROM system.tables WHERE database = '%s' FORMAT TSV", c.db), nil)
+	out, err := c.do(ctx, fmt.Sprintf("SELECT name, engine_full, sorting_key FROM system.tables WHERE database = '%s' FORMAT TSV", c.db), nil)
 	if err != nil {
 		return err
 	}
-	engines := map[string]string{}
+	type info struct{ engine, key string }
+	tables := map[string]info{}
 	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if t, e, ok := strings.Cut(l, "\t"); ok {
-			engines[t] = e
+		if f := strings.Split(l, "\t"); len(f) == 3 {
+			tables[f[0]] = info{f[1], f[2]}
 		}
-	}
-	out, err = c.do(ctx, fmt.Sprintf("SELECT table, name FROM system.columns WHERE database = '%s' FORMAT TSV", c.db), nil)
-	if err != nil {
-		return err
-	}
-	cols := map[string]bool{}
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		cols[l] = true
 	}
 	var bad []string
-	for t, need := range requiredColumns {
-		if engines[t] != "ReplacingMergeTree" {
-			bad = append(bad, fmt.Sprintf("%s: engine %q, want ReplacingMergeTree", t, engines[t]))
-			continue
-		}
-		for _, col := range need {
-			if !cols[t+"\t"+col] {
-				bad = append(bad, t+"."+col+" missing")
-			}
+	for t, key := range schema {
+		got, ok := tables[t]
+		switch {
+		case !ok:
+			bad = append(bad, t+" missing")
+		case !strings.HasPrefix(got.engine, "ReplacingMergeTree(ver)"):
+			bad = append(bad, fmt.Sprintf("%s: engine %q, want ReplacingMergeTree(ver)", t, got.engine))
+		case got.key != key:
+			bad = append(bad, fmt.Sprintf("%s: sorting key %q, want %q", t, got.key, key))
 		}
 	}
 	if len(bad) > 0 {
+		sort.Strings(bad)
 		return fmt.Errorf("clickhouse schema %s is not the W-01 schema (%s); apply infra/clickhouse (make ddl-reset on an empty database)",
 			c.db, strings.Join(bad, "; "))
 	}
 	return nil
 }
+
+// ver is a row's ReplacingMergeTree version: when JetStream stored the message (unix ns). Unlike
+// the stream sequence it keeps increasing when a stream is recreated, and a redelivery keeps it.
+func ver(m bus.Msg) int64 { return m.Stored.UnixNano() }
 
 // ClickHouse formats (UTC, basic input format).
 func chTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000") }
@@ -138,7 +139,7 @@ type writer struct {
 	retry []time.Duration // insert retries before giving up (the batch then stays unacked)
 	// afterInsert (tests) runs after the rows are inserted and before the batch is acked.
 	afterInsert func() error
-	stats       struct{ rows, synthetic, undecodable int }
+	stats       struct{ rows, undecodable int }
 }
 
 // rows groups a batch's rows by table.
@@ -156,13 +157,18 @@ func (r rows) add(table string, v any) {
 func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
 	out := rows{}
 	for _, m := range msgs {
-		if err := w.convert(out, m); err != nil {
+		err := w.convert(out, m)
+		if errors.Is(err, errSynthetic) {
+			// Nothing of this batch is inserted or acked: the writer stops (rule 5).
+			return fmt.Errorf("%s seq %d: %w", m.Subject, m.StreamSeq, err)
+		}
+		if err != nil {
 			w.stats.undecodable++
 			ins := m.Subject[strings.LastIndexByte(m.Subject, '.')+1:]
 			log.Printf("writer: %s seq %d: undecodable, stored as %s: %v", m.Subject, m.StreamSeq, quality.Undecodable, err)
-			now := time.Now()
+			// At = the stored time, so a redelivered batch yields the same row (idempotent).
 			out.add(tQuality, qualityRow(model.QualityIssue{InsCode: ins, Code: quality.Undecodable,
-				Detail: fmt.Sprintf("writer: %s seq %d: %v", m.Subject, m.StreamSeq, err), At: now}, m.StreamSeq))
+				Detail: fmt.Sprintf("writer: %s seq %d: %v", m.Subject, m.StreamSeq, err), At: m.Stored}, m))
 		}
 	}
 	for _, t := range []string{tSnapshots, tFlow, tGame, t10m, tQuality} {
@@ -187,16 +193,21 @@ func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
 
 var errMismatch = errors.New("ins_code does not match the subject")
 
-// convert adds m's row to out; it skips synthetic data (rule 5: never stored) and returns an
-// error for a message that cannot be stored as is.
+// errSynthetic stops the writer: synthetic data on the bus means a demo stack (collector and engine
+// ran with ALLOW_SYNTHETIC_ON_BUS=1). Engine outputs carry no source, so outputs computed from a
+// re-timed recording (rebase:, real instrument codes) cannot be told apart from real ones: nothing
+// of such a stack may be archived (rule 5). Purge the streams (or wait out their 48 h) to resume.
+var errSynthetic = errors.New("synthetic data on the bus: this stack must not be archived (rule 5)")
+
+// convert adds m's row to out. It returns errSynthetic for synthetic data (never stored, rule 5)
+// and another error for a message that cannot be stored as is.
 func (w *writer) convert(out rows, m bus.Msg) error {
 	kind, ins, ok := splitSubject(m.Subject)
 	if !ok {
 		return fmt.Errorf("unexpected subject")
 	}
 	if strings.HasPrefix(ins, "SYN") {
-		w.stats.synthetic++
-		return nil
+		return errSynthetic
 	}
 	switch kind {
 	case "md.snap":
@@ -208,13 +219,12 @@ func (w *writer) convert(out rows, m bus.Msg) error {
 			return errMismatch
 		}
 		if model.IsSynthetic(&s) {
-			w.stats.synthetic++
-			return nil
+			return errSynthetic
 		}
 		if s.SourceTime.IsZero() {
 			return errors.New("no source_time")
 		}
-		out.add(tSnapshots, snapshotRow(s, m.StreamSeq))
+		out.add(tSnapshots, snapshotRow(s, m))
 	case "flow.event":
 		var e model.FlowEvent
 		if err := decode(m.Data, &e); err != nil {
@@ -223,11 +233,14 @@ func (w *writer) convert(out rows, m bus.Msg) error {
 		if e.InsCode != ins {
 			return errMismatch
 		}
+		if strings.HasPrefix(e.Symbol, "SYN") {
+			return errSynthetic
+		}
 		if !oneOf(string(e.Side), "buy", "sell") || !oneOf(string(e.Band), "hot", "hot_plus", "retail") ||
 			!oneOf(string(e.Attribution), "attributed", "unattributed") {
 			return fmt.Errorf("side/band/attribution %q/%q/%q", e.Side, e.Band, e.Attribution)
 		}
-		out.add(tFlow, flowRow(e, m.StreamSeq))
+		out.add(tFlow, flowRow(e, m))
 	case "flow.game":
 		var g model.GameTotals
 		if err := decode(m.Data, &g); err != nil {
@@ -239,7 +252,7 @@ func (w *writer) convert(out rows, m bus.Msg) error {
 		if _, err := time.Parse("2006-01-02", g.Day); err != nil {
 			return fmt.Errorf("day %q", g.Day)
 		}
-		out.add(tGame, gameRow(g, m.StreamSeq))
+		out.add(tGame, gameRow(g, m))
 	case "flow.10m":
 		var t model.TenMinute
 		if err := decode(m.Data, &t); err != nil {
@@ -248,7 +261,7 @@ func (w *writer) convert(out rows, m bus.Msg) error {
 		if t.InsCode != ins {
 			return errMismatch
 		}
-		out.add(t10m, tenRow(t, m.StreamSeq))
+		out.add(t10m, tenRow(t, m))
 	case "quality":
 		var q model.QualityIssue
 		if err := decode(m.Data, &q); err != nil {
@@ -260,7 +273,7 @@ func (w *writer) convert(out rows, m bus.Msg) error {
 		if q.At.IsZero() {
 			return errors.New("no at")
 		}
-		out.add(tQuality, qualityRow(q, m.StreamSeq))
+		out.add(tQuality, qualityRow(q, m))
 	default:
 		return fmt.Errorf("unexpected subject")
 	}
@@ -318,9 +331,10 @@ type snapshotRec struct {
 	InstSellCount       int64    `json:"inst_sell_count"`
 	Missing             []string `json:"missing"`
 	BusSeq              uint64   `json:"bus_seq"`
+	Ver                 int64    `json:"ver"`
 }
 
-func snapshotRow(s model.Snapshot, seq uint64) snapshotRec {
+func snapshotRow(s model.Snapshot, m bus.Msg) snapshotRec {
 	missing := s.Missing
 	if missing == nil {
 		missing = []string{}
@@ -328,7 +342,7 @@ func snapshotRow(s model.Snapshot, seq uint64) snapshotRec {
 	return snapshotRec{s.InsCode, s.Symbol, s.Source, chTime(s.SourceTime), chTime(s.IngestTime), s.SourceTimeEstimated,
 		s.PriceLast, s.PriceClose, s.PriceFirst, s.PriceYesterday, s.PriceMin, s.PriceMax,
 		s.TradeCount, s.Volume, s.Value, s.IndBuyVol, s.IndSellVol, s.InstBuyVol, s.InstSellVol,
-		s.IndBuyCount, s.IndSellCount, s.InstBuyCount, s.InstSellCount, missing, seq}
+		s.IndBuyCount, s.IndSellCount, s.InstBuyCount, s.InstSellCount, missing, m.StreamSeq, ver(m)}
 }
 
 type flowRec struct {
@@ -347,11 +361,12 @@ type flowRec struct {
 	VWAP         int64  `json:"vwap"`
 	PriceLast    int64  `json:"price_last"`
 	BusSeq       uint64 `json:"bus_seq"`
+	Ver          int64  `json:"ver"`
 }
 
-func flowRow(e model.FlowEvent, seq uint64) flowRec {
+func flowRow(e model.FlowEvent, m bus.Msg) flowRec {
 	return flowRec{e.InsCode, e.Symbol, e.Class, string(e.Side), string(e.Band), string(e.Attribution),
-		chTime(e.IntervalFrom), chTime(e.IntervalTo), e.Volume, e.Value, e.Participants, e.AvgTicket, e.VWAP, e.PriceLast, seq}
+		chTime(e.IntervalFrom), chTime(e.IntervalTo), e.Volume, e.Value, e.Participants, e.AvgTicket, e.VWAP, e.PriceLast, m.StreamSeq, ver(m)}
 }
 
 type gameRec struct {
@@ -366,10 +381,11 @@ type gameRec struct {
 	NetUnattributed int64  `json:"net_unattributed"`
 	Partial         bool   `json:"partial"`
 	BusSeq          uint64 `json:"bus_seq"`
+	Ver             int64  `json:"ver"`
 }
 
-func gameRow(g model.GameTotals, seq uint64) gameRec {
-	return gameRec{g.InsCode, g.Class, g.Day, chTime(g.AsOf), g.Volume, g.NetHot, g.NetHotPlus, g.NetRetail, g.NetUnattributed, g.Partial, seq}
+func gameRow(g model.GameTotals, m bus.Msg) gameRec {
+	return gameRec{g.InsCode, g.Class, g.Day, chTime(g.AsOf), g.Volume, g.NetHot, g.NetHotPlus, g.NetRetail, g.NetUnattributed, g.Partial, m.StreamSeq, ver(m)}
 }
 
 type tenRec struct {
@@ -381,10 +397,11 @@ type tenRec struct {
 	PriceLast   int64  `json:"price_last"`
 	Partial     bool   `json:"partial"`
 	BusSeq      uint64 `json:"bus_seq"`
+	Ver         int64  `json:"ver"`
 }
 
-func tenRow(t model.TenMinute, seq uint64) tenRec {
-	return tenRec{t.InsCode, t.Class, t.WindowStart.UTC().Format("2006-01-02 15:04:05"), t.NetHot, t.PriceOpen, t.PriceLastV, t.Partial, seq}
+func tenRow(t model.TenMinute, m bus.Msg) tenRec {
+	return tenRec{t.InsCode, t.Class, t.WindowStart.UTC().Format("2006-01-02 15:04:05"), t.NetHot, t.PriceOpen, t.PriceLastV, t.Partial, m.StreamSeq, ver(m)}
 }
 
 type qualityRec struct {
@@ -396,13 +413,14 @@ type qualityRec struct {
 	DedupAt     string `json:"dedup_at"`
 	DedupDetail string `json:"dedup_detail"`
 	BusSeq      uint64 `json:"bus_seq"`
+	Ver         int64  `json:"ver"`
 }
 
-func qualityRow(q model.QualityIssue, seq uint64) qualityRec {
+func qualityRow(q model.QualityIssue, m bus.Msg) qualityRec {
 	r := qualityRec{InsCode: q.InsCode, Code: q.Code, Detail: q.Detail, At: chTime(q.At), Day: tehran.TradingDay(q.At),
-		DedupAt: chTime(q.At), DedupDetail: q.Detail, BusSeq: seq}
+		DedupAt: chTime(q.At), DedupDetail: q.Detail, BusSeq: m.StreamSeq, Ver: ver(m)}
 	if oncePerDay[q.Code] {
-		r.DedupAt, r.DedupDetail = chTime(tehran.DayStart(q.At)), ""
+		r.DedupAt, r.DedupDetail, r.Ver = chTime(tehran.DayStart(q.At)), "", -r.Ver // keep the first emission
 	}
 	return r
 }

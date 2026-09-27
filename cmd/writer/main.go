@@ -3,10 +3,12 @@
 // (infra/clickhouse/001_schema.sql). One durable batch consumer per stream (writer-md,
 // writer-flow, writer-quality); a batch is acked only after all its rows are inserted.
 //
-// Idempotent: every table is a ReplacingMergeTree keyed on the row's natural key with the bus
-// sequence as version, so a redelivery, a crash between insert and ack, or an engine republish
-// store each row once (read with FINAL). Synthetic data (SYN*, source synthetic or rebase:) is never
-// stored (rule 5), and the writer refuses to run where ALLOW_SYNTHETIC_ON_BUS=1. A message that
+// Idempotent: every table is a ReplacingMergeTree keyed on the row's natural key, versioned by the
+// message's stored time, so a redelivery, a crash between insert and ack, or an engine republish
+// store each row once (read with FINAL). Synthetic data is never stored (rule 5): the writer refuses
+// to run where ALLOW_SYNTHETIC_ON_BUS=1 and STOPS (batch unacked) on the first synthetic message
+// on the bus (SYN*, source synthetic or rebase:), since engine outputs of a re-timed recording
+// carry real instrument codes and no source. A message that
 // cannot be stored is recorded as an UNDECODABLE quality issue and acked; a ClickHouse failure is
 // retried, then the writer exits non-zero with the batch unacked (redelivered to the next run).
 //

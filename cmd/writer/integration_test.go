@@ -167,8 +167,10 @@ func TestRestartAndRedelivery(t *testing.T) {
 		pub(bus.SubjSnapshot("S1"), model.Snapshot{InsCode: "S1", Symbol: "ش۱", Source: "sourcearena",
 			SourceTime: at.Add(time.Duration(i) * 5 * time.Second), IngestTime: at.Add(time.Duration(i)*5*time.Second + time.Second), Volume: int64(i)})
 	}
-	pub(bus.SubjSnapshot("SYN1"), model.Snapshot{InsCode: "SYN1", Source: "synthetic", SourceTime: at})
 	engineOutputs(1)
+	if err := js.PublishID(bus.SubjFlow("S1"), "", map[string]string{"ins_code": "S1", "side": "up"}); err != nil { // undecodable
+		t.Fatal(err)
+	}
 	pub(bus.SubjQuality("S1"), model.QualityIssue{InsCode: "S1", Code: quality.Stale, Detail: "40s", At: at})
 
 	cfg := Config{NATSURL: natsURL, CHURL: ch.base, CHDB: ch.db, CHUser: ch.user, CHKey: ch.pass,
@@ -213,17 +215,20 @@ func TestRestartAndRedelivery(t *testing.T) {
 		t.Fatalf("run 2: %v", err)
 	}
 
-	raw := ch.count(t, "SELECT count() FROM {db}.snapshots")
-	if raw <= 3 {
-		t.Errorf("snapshots stored %d times: the redelivery was not exercised", raw)
+	// Every stream's batch was inserted twice (run 1, then the redelivery), plus the republish.
+	for table, min := range map[string]int{"snapshots": 6, "flow_events": 3, "game_totals": 3, "flow_10m": 3, "quality_issues": 7} {
+		if raw := ch.count(t, "SELECT count() FROM {db}."+table); raw < min {
+			t.Errorf("%s: %d raw rows, want >= %d: the redelivery was not exercised", table, raw, min)
+		}
 	}
 	for q, n := range map[string]int{
-		"snapshots":   3, // SYN1 never stored
+		"snapshots":   3,
 		"flow_events": 1,
 		"game_totals": 1,
 		"flow_10m":    1,
 		"quality_issues FINAL WHERE code = 'DAY_START_MISSED'": 1,
 		"quality_issues FINAL WHERE code = 'STALE'":            1,
+		"quality_issues FINAL WHERE code = 'UNDECODABLE'":      1, // at = stored time: the redelivery collapses
 	} {
 		if !strings.Contains(q, "FINAL") {
 			q += " FINAL"
@@ -237,6 +242,9 @@ func TestRestartAndRedelivery(t *testing.T) {
 	}
 	if v := ch.value(t, "SELECT net_hot, partial, class FROM {db}.flow_10m FINAL"); v != "2\ttrue\tstock" {
 		t.Errorf("flow_10m = %q", v)
+	}
+	if v := ch.value(t, "SELECT detail FROM {db}.quality_issues FINAL WHERE code = 'DAY_START_MISSED'"); v != "late baseline (emission 1)" {
+		t.Errorf("DAY_START_MISSED kept %q, want the first emission (as the engine)", v)
 	}
 	if v := ch.value(t, "SELECT class FROM {db}.flow_events FINAL"); v != "stock" {
 		t.Errorf("flow_events class = %q", v)
@@ -254,5 +262,15 @@ func TestRestartAndRedelivery(t *testing.T) {
 	}
 	if crashes.Load() != int32(len(consumers)) {
 		t.Errorf("crash hook ran %d times, want once per stream", crashes.Load())
+	}
+
+	// Synthetic data on the bus stops the writer; nothing of its batch is stored (rule 5).
+	pub(bus.SubjSnapshot("S1"), model.Snapshot{InsCode: "S1", Source: "sourcearena", SourceTime: at.Add(time.Minute)})
+	pub(bus.SubjSnapshot("SYN1"), model.Snapshot{InsCode: "SYN1", Source: "synthetic", SourceTime: at})
+	if err := run(ctx, cfg, nil); !errors.Is(err, errSynthetic) {
+		t.Errorf("run with synthetic data on the bus = %v, want errSynthetic", err)
+	}
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 3 {
+		t.Errorf("%d snapshots after the synthetic batch, want 3 (the batch is not stored)", n)
 	}
 }

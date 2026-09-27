@@ -50,8 +50,11 @@ func msg(t *testing.T, subject string, seq uint64, v any) bus.Msg {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bus.Msg{Subject: subject, Data: b, StreamSeq: seq}
+	return bus.Msg{Subject: subject, Data: b, StreamSeq: seq, Stored: stored(seq)}
 }
+
+// stored is a message's JetStream stored time in these tests: one second per sequence.
+func stored(seq uint64) time.Time { return tehranAt("09:00").Add(time.Duration(seq) * time.Second) }
 
 func TestRowsCarryPartialClassAndDedupKeys(t *testing.T) {
 	at := tehranAt("09:00")
@@ -94,31 +97,47 @@ func TestRowsCarryPartialClassAndDedupKeys(t *testing.T) {
 }
 
 func TestDayStartMissedReemissionSameKey(t *testing.T) {
-	a := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, Detail: "baseline 09:02", At: tehranAt("09:02")}, 10)
-	b := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, Detail: "baseline 09:07 (replay)", At: tehranAt("09:07")}, 99)
-	if a.Code != b.Code || a.InsCode != b.InsCode || a.Day != b.Day || a.DedupAt != b.DedupAt || a.DedupDetail != b.DedupDetail {
-		t.Errorf("re-emitted DAY_START_MISSED has a different key:\n%+v\n%+v", a, b)
+	first := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, Detail: "baseline 09:02", At: tehranAt("09:02")},
+		bus.Msg{StreamSeq: 10, Stored: stored(10)})
+	again := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, Detail: "baseline 09:07 (replay)", At: tehranAt("09:07")},
+		bus.Msg{StreamSeq: 99, Stored: stored(99)})
+	if first.Code != again.Code || first.InsCode != again.InsCode || first.Day != again.Day || first.DedupAt != again.DedupAt || first.DedupDetail != again.DedupDetail {
+		t.Errorf("re-emitted DAY_START_MISSED has a different key:\n%+v\n%+v", first, again)
 	}
-	c := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, At: tehranAt("09:02").AddDate(0, 0, 1)}, 11)
-	if c.DedupAt == a.DedupAt || c.Day == a.Day {
+	if first.Ver <= again.Ver {
+		t.Errorf("ver %d vs %d: the FIRST emission must win (as in the engine)", first.Ver, again.Ver)
+	}
+	next := qualityRow(model.QualityIssue{InsCode: "S1", Code: quality.DayStartMissed, At: tehranAt("09:02").AddDate(0, 0, 1)},
+		bus.Msg{StreamSeq: 11, Stored: stored(11)})
+	if next.DedupAt == first.DedupAt || next.Day == first.Day {
 		t.Error("the next day's DAY_START_MISSED must be its own row")
+	}
+	// Every other row: the latest publication wins, and the version survives a stream recreation
+	// (sequences restart at 1, stored times keep increasing).
+	old := tenRow(model.TenMinute{InsCode: "S1"}, bus.Msg{StreamSeq: 900000, Stored: stored(5)})
+	recreated := tenRow(model.TenMinute{InsCode: "S1", Partial: true}, bus.Msg{StreamSeq: 12, Stored: stored(6)})
+	if recreated.Ver <= old.Ver {
+		t.Errorf("after a stream recreation the newer row (seq 12) must win over seq 900000: ver %d vs %d", recreated.Ver, old.Ver)
 	}
 }
 
-func TestSyntheticNeverStored(t *testing.T) {
-	s := &fakeSink{}
-	w := &writer{sink: s}
+func TestSyntheticStopsTheWriter(t *testing.T) {
 	at := tehranAt("09:00")
-	msgs := []bus.Msg{
-		msg(t, "md.snap.SYN1", 1, model.Snapshot{InsCode: "SYN1", Source: "synthetic", SourceTime: at}),
-		msg(t, "md.snap.123", 2, model.Snapshot{InsCode: "123", Source: "rebase:replay", SourceTime: at}),
-		msg(t, "flow.game.SYN1", 3, model.GameTotals{InsCode: "SYN1", Day: "2026-09-23"}),
-	}
-	if err := w.handle(context.Background(), msgs); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.rows) != 0 || w.stats.synthetic != 3 {
-		t.Errorf("stored %v, synthetic %d", s.rows, w.stats.synthetic)
+	real := msg(t, "md.snap.123", 1, model.Snapshot{InsCode: "123", Source: "sourcearena", SourceTime: at})
+	for name, m := range map[string]bus.Msg{
+		"SYN snapshot":      msg(t, "md.snap.SYN1", 2, model.Snapshot{InsCode: "SYN1", Source: "synthetic", SourceTime: at}),
+		"rebased recording": msg(t, "md.snap.123", 2, model.Snapshot{InsCode: "123", Source: "rebase:replay", SourceTime: at}),
+		"SYN engine output": msg(t, "flow.game.SYN1", 2, model.GameTotals{InsCode: "SYN1", Day: "2026-09-23"}),
+		"SYN symbol":        msg(t, "flow.event.9", 2, model.FlowEvent{InsCode: "9", Symbol: "SYN9", Side: model.Buy, Band: model.BandHot, Attribution: model.Attributed}),
+	} {
+		s := &fakeSink{}
+		w := &writer{sink: s}
+		if err := w.handle(context.Background(), []bus.Msg{real, m}); !errors.Is(err, errSynthetic) {
+			t.Errorf("%s: %v, want errSynthetic", name, err)
+		}
+		if len(s.rows) != 0 {
+			t.Errorf("%s: stored %v: nothing of the batch may be inserted", name, s.rows)
+		}
 	}
 }
 
@@ -143,6 +162,18 @@ func TestUndecodableRecordedNotBlocking(t *testing.T) {
 	for _, q := range s.rows[tQuality] {
 		if q["code"] != quality.Undecodable || !strings.HasPrefix(q["detail"].(string), "writer: ") {
 			t.Errorf("row %v", q)
+		}
+	}
+	// Redelivered, the same messages give identical rows (at = stored time, not now).
+	s2 := &fakeSink{}
+	if err := (&writer{sink: s2}).handle(context.Background(), msgs); err != nil {
+		t.Fatal(err)
+	}
+	for i := range s.rows[tQuality] {
+		a, _ := json.Marshal(s.rows[tQuality][i])
+		b, _ := json.Marshal(s2.rows[tQuality][i])
+		if string(a) != string(b) {
+			t.Errorf("UNDECODABLE row not idempotent:\n%s\n%s", a, b)
 		}
 	}
 }
