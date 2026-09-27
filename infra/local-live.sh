@@ -4,7 +4,7 @@
 # into the engine). Needs the local stack (make up) and .env with SOURCEARENA_TOKEN, BRSAPI_KEY,
 # CENTRIFUGO_*. Everything binds to 127.0.0.1; secrets stay in .env.
 #
-#   infra/local-live.sh start | stop | restart | status
+#   infra/local-live.sh start | stop | restart | status | score [YYYY-MM-DD]
 #
 # SourceArena quota: LIVE_SA_DAILY_LIMIT (default 40, UNVERIFIED: the token was refused after ~45
 # requests on 2026-09-27; confirm the plan in the vendor panel). LIVE_POLL_INTERVAL defaults to the
@@ -76,7 +76,7 @@ start() {
 	alive engine || launch engine
 	alive gateway || launch gateway
 	alive vendorcmp || launch vendorcmp -watch "${LIVE_CMP_EVERY:-5m}" -brsapi-max "${LIVE_BRSAPI_MAX:-90}" \
-		-sourcearena "$SOURCEARENA_SAVE_LATEST" -out "$L/vendorcmp/latest.md" -log "$L/vendorcmp/runs.ndjson"
+		-sourcearena "$SOURCEARENA_SAVE_LATEST" -out "$L/vendorcmp/latest.md" -log "$L/vendorcmp/runs.ndjson" 		-sa-budget "$SOURCEARENA_BUDGET_FILE" -sa-limit "$SOURCEARENA_DAILY_LIMIT" -brsapi-limit "${BRSAPI_DAILY_LIMIT:-100}"
 	echo "local-live: SourceArena POLL_INTERVAL=$POLL_INTERVAL (limit $SOURCEARENA_DAILY_LIMIT/day, UNVERIFIED), STALE_AFTER=$STALE_AFTER"
 	echo "local-live: dashboard http://$GATEWAY_ADDR/"
 }
@@ -99,5 +99,8 @@ start) start ;;
 stop) stop ;;
 restart) stop; sleep 20; start ;;
 status) status ;;
-*) echo "usage: $0 start|stop|restart|status"; exit 2 ;;
+score) # daily Persian vendor scorecard (also rewritten by vendorcmp after every round)
+	env_up
+	go run ./cmd/vendorcmp -score "${2:-today}" -log "$L/vendorcmp/runs.ndjson" -sa-budget "$SOURCEARENA_BUDGET_FILE" 		-sa-limit "$SOURCEARENA_DAILY_LIMIT" -brsapi-limit "${BRSAPI_DAILY_LIMIT:-100}" ;;
+*) echo "usage: $0 start|stop|restart|status|score [YYYY-MM-DD]"; exit 2 ;;
 esac
