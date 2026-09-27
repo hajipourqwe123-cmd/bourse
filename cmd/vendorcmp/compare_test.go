@@ -171,3 +171,46 @@ func TestClassAndScrub(t *testing.T) {
 		t.Errorf("scrub: %s", got)
 	}
 }
+
+func TestSummarizeCountsOnly(t *testing.T) {
+	brs, _ := parseRows([]byte(`[{"id":"1","l18":"الف","isin":"IRO1AAAA0001","cs_id":27,"py":100,"tvol":50},
+		{"id":"2","l18":"ب","isin":"IRO1BBBB0001","cs_id":27,"py":200,"tvol":10}]`))
+	sa, _ := parseRows([]byte(`[{"instance_code":"1","name":"الف","namad_code":"IRO1AAAA0001","industry_code":"27","yesterday_price":"100","trade_volume":"40"},
+		{"instance_code":"2","name":"ب","namad_code":"IRO1BBBB0001","industry_code":"27","yesterday_price":"201","trade_volume":"10"}]`))
+	s := summarize(compare(brs, sa), brs, sa)
+	// Side fields are absent in these rows: missing data, NOT a SIDE_MISMATCH.
+	if s.Joined != 2 || s.Static["price_yesterday"] != 1 || s.VolumeAhead["brsapi"] != 1 || s.VolumeAhead["equal"] != 1 ||
+		s.Traded["brsapi"] != 2 || s.SideMismatch["sourcearena"] != 0 || s.SideMissing["sourcearena"] != 2 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestSideMismatchAndBothZero(t *testing.T) {
+	brs, _ := parseRows([]byte(`[{"id":"1","l18":"الف","tvol":100,"Buy_I_Volume":60,"Buy_N_Volume":40,"Sell_I_Volume":100,"Sell_N_Volume":0},
+		{"id":"2","l18":"ب","tvol":0,"Buy_I_Volume":0,"Buy_N_Volume":0,"Sell_I_Volume":0,"Sell_N_Volume":0}]`))
+	sa, _ := parseRows([]byte(`[{"instance_code":"1","name":"الف","trade_volume":"100","real_buy_volume":"60","co_buy_volume":"30","real_sell_volume":"100","co_sell_volume":"0"},
+		{"instance_code":"2","name":"ب","trade_volume":"0"}]`))
+	s := summarize(compare(brs, sa), brs, sa)
+	if s.SideMismatch["brsapi"] != 0 || s.SideMismatch["sourcearena"] != 1 || s.Traded["sourcearena"] != 1 ||
+		s.VolumeAhead["both_zero"] != 1 || s.VolumeAhead["equal"] != 1 {
+		t.Fatalf("%+v", s)
+	}
+}
+
+func TestWatchBudgetFailsClosed(t *testing.T) {
+	c := watchConfig{maxBrs: 90, sum: t.TempDir() + "/runs.ndjson"}
+	if c.loadUsed("2026-09-27") != 0 {
+		t.Fatal("no file: nothing used")
+	}
+	c.saveUsed("2026-09-27", 7)
+	if c.loadUsed("2026-09-27") != 7 || c.loadUsed("2026-09-28") != 0 {
+		t.Fatal("count must persist for the day and reset on the next")
+	}
+	os.WriteFile(c.budgetFile(), []byte("{bad"), 0o644)
+	if c.loadUsed("2026-09-27") != 90 {
+		t.Fatal("a corrupt budget file must count as the budget spent")
+	}
+	if c.loadUsed("2026-09-28") != 0 {
+		t.Fatal("a corrupt budget file must block only its own day")
+	}
+}
