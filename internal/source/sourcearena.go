@@ -120,8 +120,13 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	}
 	if msg, ok := saVendorError(body); ok {
 		msg = redact(msg, s.token)
-		if strings.Contains(strings.ToLower(msg), "limit") {
-			// {"Error":"daily request limit reached"} (seen 2026-09-27 after ~45 requests).
+		if dailyQuota(msg) {
+			// {"Error":"daily request limit reached"} (seen 2026-09-27 after ~45 requests): the day's
+			// budget is spent whatever our count says, so a restart does not spend another request.
+			if s.DailyLimit > 0 && s.used < s.DailyLimit {
+				s.used = s.DailyLimit
+				s.saveUsed()
+			}
 			return nil, fmt.Errorf("sourcearena: %w: vendor: %q (%d requests counted on %s)", ErrBudget, msg, s.used, s.day)
 		}
 		return nil, fmt.Errorf("sourcearena: vendor error: %q", msg)
@@ -174,12 +179,22 @@ func (s *SourceArena) loadUsed(day string) int {
 		return 0
 	}
 	var st budgetState
-	if err != nil || json.Unmarshal(b, &st) != nil {
-		log.Printf("sourcearena: budget file unreadable (%v): counting the day's budget as spent", err)
-		if s.DailyLimit > 0 {
-			return s.DailyLimit
+	if err == nil {
+		err = json.Unmarshal(b, &st)
+	}
+	if err != nil {
+		log.Printf("sourcearena: budget file unreadable (%v): counting today's budget as spent", err)
+		if s.DailyLimit <= 0 {
+			return 0
 		}
-		return 0
+		// Rewrite it as spent for THIS day only, so the next day starts again instead of being
+		// refused forever.
+		if b, e := json.Marshal(budgetState{Day: day, Used: s.DailyLimit}); e == nil {
+			if werr := saveAtomic(s.BudgetFile, b); werr != nil {
+				log.Printf("sourcearena: rewrite budget file: %v", werr)
+			}
+		}
+		return s.DailyLimit
 	}
 	if st.Day != day {
 		return 0
@@ -335,4 +350,11 @@ func wholeDecimal(row map[string]json.RawMessage, k string) (int64, bool) {
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
 	return v, err == nil
+}
+
+// dailyQuota reports a vendor error about the DAILY quota. Other limits (per minute, rate) are
+// retryable vendor errors: they must not stop collection for the rest of the day.
+func dailyQuota(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "limit") && (strings.Contains(m, "daily") || strings.Contains(m, "day"))
 }

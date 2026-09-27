@@ -256,3 +256,38 @@ func TestSourceArenaBudgetFilePersists(t *testing.T) {
 		t.Fatalf("corrupt budget file must fail closed: err=%v hits=%d", err, hits)
 	}
 }
+
+func TestSourceArenaQuotaReplies(t *testing.T) {
+	for msg, daily := range map[string]bool{"daily request limit reached": true, "Day limit exceeded": true,
+		"rate limit exceeded": false, "per-minute limit": false, "request timeout or empty response": false} {
+		if dailyQuota(msg) != daily {
+			t.Errorf("dailyQuota(%q) = %v", msg, !daily)
+		}
+	}
+	// A vendor refusal marks the day spent: a restart must not send another request.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{"Error":"daily request limit reached"}`))
+	}))
+	defer srv.Close()
+	file := t.TempDir() + "/budget.json"
+	mk := func() *SourceArena {
+		s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+		s.DailyLimit, s.BudgetFile = 40, file
+		return s
+	}
+	mk().Fetch(context.Background())
+	if _, err := mk().Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 1 {
+		t.Fatalf("after the vendor refusal a restart must not call it again: err=%v hits=%d", err, hits)
+	}
+	// A corrupt file blocks only its day: it is rewritten for today, and another day starts afresh.
+	os.WriteFile(file, []byte("{bad"), 0o600)
+	s := mk()
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrBudget) {
+		t.Fatalf("corrupt file must fail closed today: %v", err)
+	}
+	if got := s.loadUsed("2099-01-01"); got != 0 {
+		t.Fatalf("another day after a corrupt file: used = %d, want 0", got)
+	}
+}
