@@ -35,6 +35,11 @@ type Snapshot struct {
 	PriceMin       int64 `json:"price_min"`
 	PriceMax       int64 `json:"price_max"`
 
+	// Daily permitted price range (دامنه مجاز), rial. 0 = not provided by the source (no real
+	// limit is 0); sources without it list FPriceLimits in Missing. Use HasPriceLimits.
+	PriceLimitMin int64 `json:"price_limit_min,omitempty"`
+	PriceLimitMax int64 `json:"price_limit_max,omitempty"`
+
 	TradeCount int64 `json:"trade_count"`
 	Volume     int64 `json:"volume"`
 	Value      int64 `json:"value"`
@@ -84,7 +89,14 @@ const (
 	FInstSellCount = "inst_sell_count"
 	FBook          = "book"
 	FTradeCount    = "trade_count"
+	FPriceLimits   = "price_limits"
 )
+
+// HasPriceLimits reports a usable permitted price range (older recordings and sources without
+// limits have none).
+func (s *Snapshot) HasPriceLimits() bool {
+	return s.Has(FPriceLimits) && s.PriceLimitMin > 0 && s.PriceLimitMax >= s.PriceLimitMin
+}
 
 // FlowFields are required for any real-person money-flow metric.
 var FlowFields = []string{FPriceLast, FVolume, FValue, FIndBuyVol, FIndSellVol, FIndBuyCount, FIndSellCount}
