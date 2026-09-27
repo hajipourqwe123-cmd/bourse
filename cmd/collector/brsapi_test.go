@@ -109,6 +109,9 @@ func TestDailyBudget(t *testing.T) {
 	if err := dailyBudget("X", 70*time.Second, span, 500); err != nil {
 		t.Fatalf("the named interval must fit: %v", err)
 	}
+	if err := dailyBudget("X", 69*time.Second, span, 500); err == nil { // 34500/69 = 500 exactly → 501 requests
+		t.Fatal("an interval dividing the span exactly needs one more request than span/interval")
+	}
 	if err := dailyBudget("X", time.Second, span, 0); err != nil {
 		t.Fatalf("no limit set: %v", err)
 	}

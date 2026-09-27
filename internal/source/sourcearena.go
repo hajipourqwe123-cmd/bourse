@@ -34,8 +34,11 @@ type SourceArena struct {
 	now    func() time.Time
 
 	// DailyLimit > 0: at most this many requests per Tehran day (plan quota; SOURCEARENA_DAILY_LIMIT).
-	// The counter is in memory (a restart resets it); the vendor enforces the real quota.
+	// The vendor enforces the real quota; its refusal is ErrBudget too.
 	DailyLimit int
+	// BudgetFile, if set, keeps the day's request count across restarts (SOURCEARENA_BUDGET_FILE).
+	// An unreadable or corrupt file counts as the whole budget spent (fail closed).
+	BudgetFile string
 	day        string
 	used       int
 	// SaveLatest, if set, receives each successful raw payload (atomic replace) so a LOCAL
@@ -86,15 +89,14 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if s.token == "" {
 		return nil, fmt.Errorf("sourcearena: SOURCEARENA_TOKEN is not set")
 	}
-	if s.DailyLimit > 0 {
-		if d := tehran.TradingDay(s.now()); d != s.day {
-			s.day, s.used = d, 0
-		}
-		if s.used >= s.DailyLimit {
-			return nil, fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
-		}
-		s.used++ // every attempt counts: the vendor counts failed ones too
+	if d := tehran.TradingDay(s.now()); d != s.day {
+		s.day, s.used = d, s.loadUsed(d)
 	}
+	if s.DailyLimit > 0 && s.used >= s.DailyLimit {
+		return nil, fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
+	}
+	s.used++ // every attempt counts: the vendor counts failed ones too
+	s.saveUsed()
 	u := s.base + "?token=" + url.QueryEscape(s.token) + "&all&type=0"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -116,6 +118,14 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("sourcearena: HTTP %d", resp.StatusCode)
 	}
+	if msg, ok := saVendorError(body); ok {
+		msg = redact(msg, s.token)
+		if strings.Contains(strings.ToLower(msg), "limit") {
+			// {"Error":"daily request limit reached"} (seen 2026-09-27 after ~45 requests).
+			return nil, fmt.Errorf("sourcearena: %w: vendor: %q (%d requests counted on %s)", ErrBudget, msg, s.used, s.day)
+		}
+		return nil, fmt.Errorf("sourcearena: vendor error: %q", msg)
+	}
 	snaps, err := Parse(body, s.now())
 	if err == nil && s.SaveLatest != "" {
 		if werr := saveAtomic(s.SaveLatest, body); werr != nil {
@@ -123,6 +133,68 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 		}
 	}
 	return snaps, err
+}
+
+// Used returns the requests counted on the current Tehran day (quota reporting).
+func (s *SourceArena) Used() (day string, used int) { return s.day, s.used }
+
+// saVendorError recognises the vendor's error object ({"Error": "…"}, sent with HTTP 200).
+func saVendorError(body []byte) (string, bool) {
+	b := bytes.TrimSpace(body)
+	if len(b) == 0 || b[0] != '{' {
+		return "", false
+	}
+	var e map[string]any
+	if json.Unmarshal(b, &e) != nil {
+		return "", false
+	}
+	for _, k := range []string{"Error", "error"} {
+		if v, ok := e[k]; ok {
+			m := fmt.Sprint(v)
+			if len(m) > 200 {
+				m = m[:200]
+			}
+			return m, true
+		}
+	}
+	return "", false
+}
+
+type budgetState struct {
+	Day  string `json:"day"`
+	Used int    `json:"used"`
+}
+
+func (s *SourceArena) loadUsed(day string) int {
+	if s.BudgetFile == "" {
+		return 0
+	}
+	b, err := os.ReadFile(s.BudgetFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	var st budgetState
+	if err != nil || json.Unmarshal(b, &st) != nil {
+		log.Printf("sourcearena: budget file unreadable (%v): counting the day's budget as spent", err)
+		if s.DailyLimit > 0 {
+			return s.DailyLimit
+		}
+		return 0
+	}
+	if st.Day != day {
+		return 0
+	}
+	return st.Used
+}
+
+func (s *SourceArena) saveUsed() {
+	if s.BudgetFile == "" {
+		return
+	}
+	b, _ := json.Marshal(budgetState{Day: s.day, Used: s.used})
+	if err := saveAtomic(s.BudgetFile, b); err != nil {
+		log.Printf("sourcearena: save budget file: %v", err)
+	}
 }
 
 // saveAtomic replaces path with b via a temporary file in the same directory.
