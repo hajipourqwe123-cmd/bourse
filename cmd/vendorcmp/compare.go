@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"bourse/internal/classmap"
 )
 
 type row map[string]json.RawMessage
@@ -407,40 +409,8 @@ func (s *FieldStat) example(p pair, a, b string) {
 	}
 }
 
-// class is the proposed instrument class of a row (docs/source-mapping.md): board by ISIN
-// suffix, funds (sector 68) by name, bonds (69), rights, energy, else stock by market.
-func class(isin, sector, name string) string {
-	switch {
-	case len(isin) == 12 && (isin[8:] == "0002" || isin[8:] == "0003" || isin[8:] == "0004"):
-		return "تابلو غیرعادی (…" + isin[8:] + ")"
-	case strings.HasPrefix(isin, "IRE9"):
-		return "انرژی (IRE9)"
-	case strings.HasPrefix(isin, "IRR"):
-		return "حق تقدم"
-	case sector == "69" || strings.HasPrefix(isin, "IRB"):
-		return "اوراق"
-	case strings.HasPrefix(isin, "IRTK") && strings.Contains(name, "نقره"):
-		return "صندوق نقره"
-	case strings.HasPrefix(isin, "IRTK") || strings.HasPrefix(isin, "IRTE"):
-		return "صندوق طلا/کالا"
-	case sector == "68":
-		n := strings.TrimSpace(name)
-		switch {
-		case strings.HasSuffix(n, "-د") || strings.HasSuffix(n, "ثابت") || strings.Contains(n, "درآمد ثابت") || strings.Contains(n, "درآمدثابت"):
-			return "صندوق درآمد ثابت"
-		case strings.HasSuffix(n, "-س") || strings.HasSuffix(n, "-ب") || strings.Contains(n, "سهام") || strings.Contains(n, "شاخصی") || strings.Contains(n, "بخشی") || strings.Contains(n, "اهرم"):
-			return "صندوق سهامی"
-		}
-		return "سایر صندوق‌ها"
-	case strings.HasPrefix(isin, "IRO1"):
-		return "سهام بورس"
-	case strings.HasPrefix(isin, "IRO3"):
-		return "سهام فرابورس"
-	case strings.HasPrefix(isin, "IRO7") || strings.HasPrefix(isin, "IRO5"):
-		return "بازار پایه/دیگر"
-	}
-	return "نامشخص"
-}
+// class is the proposed instrument group of a row (internal/classmap, docs/source-mapping.md).
+func class(isin, sector, name string) string { return classmap.Group(isin, sector, name) }
 
 func brsClass(r row) string { return class(r.text("isin"), r.text("cs_id"), r.text("l30")) }
 func saClass(r row) string {

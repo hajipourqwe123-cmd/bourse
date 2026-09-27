@@ -54,7 +54,10 @@ type file struct {
 	DefaultClass string               `json:"default_class"`
 	Classes      map[string]fileClass `json:"classes"`
 	Instruments  map[string]string    `json:"instruments"`
-	Holidays     []fileHoliday        `json:"holidays"`
+	// InstrumentsVerified false marks the instrument → class mapping as PROVISIONAL (e.g. derived
+	// from vendor names by internal/classmap); absent means nothing is claimed either way.
+	InstrumentsVerified *bool         `json:"instruments_verified"`
+	Holidays            []fileHoliday `json:"holidays"`
 }
 
 type rule struct {
@@ -66,11 +69,12 @@ type rule struct {
 
 // Calendar answers "is this instrument's market open, and when" for any date.
 type Calendar struct {
-	classes      map[string][]rule // sorted by from, ascending
-	instruments  map[string]string
-	holidays     map[string]string
-	defaultClass string
-	unverified   int
+	classes        map[string][]rule // sorted by from, ascending
+	instruments    map[string]string
+	holidays       map[string]string
+	defaultClass   string
+	unverified     int
+	mapProvisional bool
 }
 
 // Session is one instrument's (or class's) session on one trading day, as absolute times.
@@ -151,7 +155,7 @@ func checkKeys(where string, raw json.RawMessage, allowed ...string) error {
 }
 
 func checkSchema(b []byte) error {
-	if err := checkKeys("top level", b, "default_class", "classes", "instruments", "holidays"); err != nil {
+	if err := checkKeys("top level", b, "default_class", "classes", "instruments", "instruments_verified", "holidays"); err != nil {
 		return err
 	}
 	var top struct {
@@ -256,6 +260,7 @@ func Parse(b []byte) (*Calendar, error) {
 	if _, ok := c.classes[c.defaultClass]; !ok && c.defaultClass != Unknown {
 		return nil, fmt.Errorf("calendar: default_class %q is not a class", c.defaultClass)
 	}
+	c.mapProvisional = f.InstrumentsVerified != nil && !*f.InstrumentsVerified
 	for ins, cl := range f.Instruments {
 		if _, ok := c.classes[cl]; !ok {
 			return nil, fmt.Errorf("calendar: instrument %s: unknown class %q", ins, cl)
@@ -276,6 +281,13 @@ func Parse(b []byte) (*Calendar, error) {
 
 // Unverified is the number of rules and holidays not yet checked against an official source.
 func (c *Calendar) Unverified() int { return c.unverified }
+
+// ClassMapProvisional reports that the instrument → class mapping is marked unverified
+// ("instruments_verified": false): the dashboard must say so («تأییدنشده»).
+func (c *Calendar) ClassMapProvisional() bool { return c.mapProvisional }
+
+// Instruments returns the number of instruments with an explicit class.
+func (c *Calendar) Instruments() int { return len(c.instruments) }
 
 // WithInstruments returns a copy with extra ins_code → class mappings (tests, tools).
 func (c *Calendar) WithInstruments(m map[string]string) *Calendar {

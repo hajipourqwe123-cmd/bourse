@@ -133,6 +133,8 @@ export interface State {
   day: string;
   sessions: SessionInfo[];
   calendar_unverified: boolean;
+  /** instrument → class mapping is provisional (derived from vendor names/ISIN, not an official list) */
+  class_map_unverified?: boolean;
   hot_threshold: number;
   plus_threshold: number;
   stale_after_ms: number;

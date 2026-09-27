@@ -1,0 +1,83 @@
+// Package classmap proposes an instrument's session class from vendor identity fields (ISIN,
+// sector code, full name). PROVISIONAL («تأییدنشده»): the rule (docs/source-mapping.md) is a
+// heuristic on names and ISIN prefixes, not an official instrument list. Its output is stored by
+// ins_code in a sessions file with "instruments_verified": false, never by name (fund names
+// differ between vendors).
+package classmap
+
+import "strings"
+
+// Group labels (Persian, as in docs/vendor-comparison.md). Groups are finer than classes.
+const (
+	GroupAbnormalPrefix = "تابلو غیرعادی (…" // + board suffix + ")"
+	GroupEnergy         = "انرژی (IRE9)"
+	GroupRights         = "حق تقدم"
+	GroupBond           = "اوراق"
+	GroupSilverFund     = "صندوق نقره"
+	GroupGoldFund       = "صندوق طلا/کالا"
+	GroupFixedFund      = "صندوق درآمد ثابت"
+	GroupEquityFund     = "صندوق سهامی"
+	GroupOtherFund      = "سایر صندوق‌ها"
+	GroupBourse         = "سهام بورس"
+	GroupFarabourse     = "سهام فرابورس"
+	GroupBase           = "بازار پایه/دیگر"
+	GroupUnknown        = "نامشخص"
+)
+
+// Group is the proposed group of a row: board by ISIN suffix, funds (sector 68) by name, bonds
+// (69), rights, energy, else stock by market prefix.
+func Group(isin, sector, name string) string {
+	sector = strings.TrimLeft(strings.TrimSpace(sector), "0")
+	switch {
+	case len(isin) == 12 && (isin[8:] == "0002" || isin[8:] == "0003" || isin[8:] == "0004"):
+		return GroupAbnormalPrefix + isin[8:] + ")"
+	case strings.HasPrefix(isin, "IRE9"):
+		return GroupEnergy
+	case strings.HasPrefix(isin, "IRR"):
+		return GroupRights
+	case sector == "69" || strings.HasPrefix(isin, "IRB"):
+		return GroupBond
+	case strings.HasPrefix(isin, "IRTK") && strings.Contains(name, "نقره"):
+		return GroupSilverFund
+	case strings.HasPrefix(isin, "IRTK") || strings.HasPrefix(isin, "IRTE"):
+		return GroupGoldFund
+	case sector == "68":
+		n := strings.TrimSpace(name)
+		switch {
+		case strings.HasSuffix(n, "-د") || strings.HasSuffix(n, "ثابت") || strings.Contains(n, "درآمد ثابت") || strings.Contains(n, "درآمدثابت"):
+			return GroupFixedFund
+		case strings.HasSuffix(n, "-س") || strings.HasSuffix(n, "-ب") || strings.Contains(n, "سهام") || strings.Contains(n, "شاخصی") || strings.Contains(n, "بخشی") || strings.Contains(n, "اهرم"):
+			return GroupEquityFund
+		}
+		return GroupOtherFund
+	case strings.HasPrefix(isin, "IRO1"):
+		return GroupBourse
+	case strings.HasPrefix(isin, "IRO3"):
+		return GroupFarabourse
+	case strings.HasPrefix(isin, "IRO7") || strings.HasPrefix(isin, "IRO5"):
+		return GroupBase
+	}
+	return GroupUnknown
+}
+
+// Class maps a group to a session class of internal/calendar/sessions.json. "" means the
+// instrument stays unmapped (class unknown, excluded from per-class aggregates): abnormal boards
+// (fixed-price, issue/redemption, block), energy products and anything unrecognised must not be
+// counted like a normal-board instrument.
+func Class(group string) string {
+	switch group {
+	case GroupBourse, GroupFarabourse, GroupBase, GroupRights:
+		return "stock"
+	case GroupEquityFund:
+		return "equity_etf"
+	case GroupFixedFund, GroupBond:
+		return "fixed_income"
+	case GroupGoldFund:
+		return "gold"
+	case GroupSilverFund:
+		return "silver"
+	case GroupOtherFund:
+		return "other_fund"
+	}
+	return ""
+}
