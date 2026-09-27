@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { BASIS_LABEL } from "../lib/latency";
 import { applyMode, nextMode, readMode, THEME_LABEL, type ThemeMode } from "../lib/theme";
 import { clock, jalaliDate, num } from "../lib/format";
-import { useMarket, useNow } from "./hooks";
+import { NOT_MOUNTED, useMarket, useNow } from "./hooks";
 import { IconBell, IconBriefcase, IconBuilding, IconFilter, IconGrid, IconPie, IconTarget, IconTheme, IconTrend, IconUser, Logo } from "./icons";
 
 /** Theme toggle: auto (system) → light → dark. */
@@ -162,7 +162,7 @@ export function Header({ query, onQuery }: { query: string; onQuery: (q: string)
     <header className="header">
       <div className="titles desktop-only">
         <h1 className="t-title">داشبورد بازار</h1>
-        <span className="t-label">{jalaliDate(d)}</span>
+        <span className="t-label">{now === 0 ? NOT_MOUNTED : jalaliDate(d)}</span>
       </div>
       <div className="mobile-only" style={{ alignItems: "center", gap: 10 }}>
         <Logo size={28} />
@@ -182,7 +182,7 @@ export function Header({ query, onQuery }: { query: string; onQuery: (q: string)
         </span>
         <LiveChip />
         <span className="clock num desktop-only" aria-label="ساعت تهران">
-          {clock(d)}
+          {now === 0 ? NOT_MOUNTED : clock(d)}
         </span>
         <ThemeToggle />
         <button className="icon-btn" type="button" aria-label="اعلان‌ها (به‌زودی)" title="به‌زودی">

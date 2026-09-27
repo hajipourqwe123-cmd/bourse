@@ -1,7 +1,7 @@
 "use client";
 // Shared building blocks. Every number goes through Num/Money/Pct: missing → «داده در دسترس نیست».
 import { age, arrow, CLASS_LABEL, classFamily, direction, moneyIn, moneyUnit, pct, UNAVAILABLE, UNIT_LABEL, type MoneyUnit } from "../lib/format";
-import { useMarket, useNow } from "./hooks";
+import { NOT_MOUNTED, useMarket, useNow } from "./hooks";
 import type { ClassName } from "../lib/types";
 import { ZERO_TIME } from "../lib/types";
 
@@ -46,7 +46,7 @@ export function Age({ at, prefix = "به‌روز:" }: { at: string | null | und
   if (!at || at === ZERO_TIME) return <span className="t-label">{prefix} {UNAVAILABLE}</span>;
   return (
     <span className="t-label">
-      {prefix} {age(now + store.offsetMs - Date.parse(at))}
+      {prefix} {now === 0 ? NOT_MOUNTED : age(now + store.offsetMs - Date.parse(at))}
     </span>
   );
 }
