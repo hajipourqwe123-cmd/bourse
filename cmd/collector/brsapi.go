@@ -82,21 +82,3 @@ func brsapiIntervalWarning(interval time.Duration) {
 			"10-minute windows will be partial, rows stale, and hot-money bands are not calibrated for it", interval, gap)
 	}
 }
-
-// dailyBudget refuses a polling plan whose requests over the calendar's longest day
-// (⌊span / interval⌋ + 1) exceed the daily quota in env var name; daily <= 0 disables the check.
-func dailyBudget(name string, interval, span time.Duration, daily int64) error {
-	if daily <= 0 {
-		return nil
-	}
-	if interval <= 0 {
-		return fmt.Errorf("POLL_INTERVAL must be positive")
-	}
-	perDay := int64(span/interval) + 1
-	if perDay <= daily {
-		return nil
-	}
-	need := (span/time.Duration(daily) + time.Second).Truncate(time.Second)
-	return fmt.Errorf("POLL_INTERVAL=%s over a %s session window needs %d requests/day; %s=%d. Use POLL_INTERVAL>=%ds or a larger plan",
-		interval, span, perDay, name, daily, need/time.Second)
-}

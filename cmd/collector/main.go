@@ -4,6 +4,7 @@
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
 //	                                         # SOURCEARENA_DAILY_LIMIT=n: refuse an interval over the plan quota
 //	                                         # SOURCEARENA_SAVE_LATEST=path: keep the latest raw payload (local vendorcmp -watch)
+//	                                         # SOURCEARENA_BUDGET_FILE=path: the day's request count survives restarts
 //	SOURCE=brsapi BRSAPI_KEY=… POLL_INTERVAL=…  # BRSAPI_TYPES=1[,4], BRSAPI_DAILY_LIMIT=100, BRSAPI_5MIN_LIMIT=300:
 //	                                         # refuses to start if the interval exceeds the plan's quota
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
@@ -56,7 +57,12 @@ func run() int {
 			config.Str("SOURCEARENA_URL", "https://apis.sourcearena.ir/api/"),
 			os.Getenv("SOURCEARENA_TOKEN"),
 			config.Dur("HTTP_TIMEOUT", 10*time.Second))
-		sa.DailyLimit = int(config.Int("SOURCEARENA_DAILY_LIMIT", 0))
+		limit, err := strictInt("SOURCEARENA_DAILY_LIMIT", 0)
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		sa.DailyLimit = int(limit)
+		sa.BudgetFile = config.Str("SOURCEARENA_BUDGET_FILE", "")
 		sa.SaveLatest = config.Str("SOURCEARENA_SAVE_LATEST", "")
 		src = sa
 	case "brsapi":
