@@ -178,9 +178,9 @@ func TestSummarizeCountsOnly(t *testing.T) {
 	sa, _ := parseRows([]byte(`[{"instance_code":"1","name":"الف","namad_code":"IRO1AAAA0001","industry_code":"27","yesterday_price":"100","trade_volume":"40"},
 		{"instance_code":"2","name":"ب","namad_code":"IRO1BBBB0001","industry_code":"27","yesterday_price":"201","trade_volume":"10"}]`))
 	s := summarize(compare(brs, sa), brs, sa)
-	// Side sums are absent in these rows: every traded row is a SIDE_MISMATCH for both vendors.
+	// Side fields are absent in these rows: missing data, NOT a SIDE_MISMATCH.
 	if s.Joined != 2 || s.Static["price_yesterday"] != 1 || s.VolumeAhead["brsapi"] != 1 || s.VolumeAhead["equal"] != 1 ||
-		s.Traded["brsapi"] != 2 || s.SideMismatch["sourcearena"] != 2 {
+		s.Traded["brsapi"] != 2 || s.SideMismatch["sourcearena"] != 0 || s.SideMissing["sourcearena"] != 2 {
 		t.Fatalf("%+v", s)
 	}
 }
@@ -209,5 +209,8 @@ func TestWatchBudgetFailsClosed(t *testing.T) {
 	os.WriteFile(c.budgetFile(), []byte("{bad"), 0o644)
 	if c.loadUsed("2026-09-27") != 90 {
 		t.Fatal("a corrupt budget file must count as the budget spent")
+	}
+	if c.loadUsed("2026-09-28") != 0 {
+		t.Fatal("a corrupt budget file must block only its own day")
 	}
 }

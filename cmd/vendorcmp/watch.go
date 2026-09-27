@@ -35,7 +35,7 @@ type runSummary struct {
 	Reason       string    `json:"reason,omitempty"`
 	BrsUsedToday int       `json:"brsapi_used_today"`
 
-	SaFileAt time.Time `json:"sa_file_at,omitzero"`
+	SaFileAt *time.Time `json:"sa_file_at,omitempty"`
 	// FetchGapS = BrsApi request start − SourceArena payload write time: how far apart the two
 	// FETCHES are, not how far behind either vendor's data is (neither sends a snapshot time).
 	FetchGapS  float64 `json:"fetch_gap_s,omitempty"`
@@ -57,10 +57,12 @@ type runSummary struct {
 	// VolumeAhead: which vendor shows the larger day volume on a joined row; both_zero and missing
 	// are separate so untraded rows do not inflate "equal".
 	VolumeAhead map[string]int `json:"volume_ahead,omitempty"`
-	// Per vendor, over ALL its rows: traded rows (volume > 0) and traded rows whose
-	// individual + institutional volume differs from the day volume on either side (SIDE_MISMATCH).
+	// Per vendor, over ALL its rows: traded rows (volume > 0); traded rows whose individual +
+	// institutional volume differs from the day volume on either side (SIDE_MISMATCH, the
+	// engine's condition); and traded rows missing a side field (not a mismatch: missing data).
 	Traded       map[string]int `json:"traded,omitempty"`
 	SideMismatch map[string]int `json:"side_mismatch,omitempty"`
+	SideMissing  map[string]int `json:"side_missing,omitempty"`
 }
 
 // staticFields do not change during a trading day (identity, yesterday's price, the permitted
@@ -92,8 +94,12 @@ func (c watchConfig) loadUsed(day string) int {
 		Day  string `json:"day"`
 		Used int    `json:"used"`
 	}
-	if err != nil || json.Unmarshal(b, &st) != nil {
+	if err == nil {
+		err = json.Unmarshal(b, &st)
+	}
+	if err != nil {
 		log.Printf("vendorcmp: watch: BrsApi budget file unreadable (%v): counting today's budget as spent", err)
+		c.saveUsed(day, c.maxBrs) // spent for THIS day only: the next day starts again
 		return c.maxBrs
 	}
 	if st.Day != day {
@@ -214,7 +220,7 @@ func once(c watchConfig, used int) error {
 		return err
 	}
 	s := summarize(rep, a, b)
-	s.Kind, s.At, s.SaFileAt, s.FetchGapS, s.BrsFetchMs, s.BrsUsedToday = "run", start, saAt, gap, took.Milliseconds(), used
+	s.Kind, s.At, s.SaFileAt, s.FetchGapS, s.BrsFetchMs, s.BrsUsedToday = "run", start, &saAt, gap, took.Milliseconds(), used
 	if !staticWindow(start) {
 		s.Static, s.StaticSkipped = nil, "outside 09:00–18:00: the vendors may be on different trading days"
 	}
@@ -229,7 +235,7 @@ func summarize(rep *Report, brs, sa []row) runSummary {
 	s := runSummary{BrsRows: rep.BrsRows, SaRows: rep.SaRows, Joined: len(rep.Pairs), OnlyBrs: len(rep.OnlyBrs),
 		OnlySa: len(rep.OnlySa), BrsDataAt: rep.BrsDataAt, SaDataAt: rep.SaDataAt,
 		Mismatch: map[string]int{}, Static: map[string]int{}, VolumeAhead: map[string]int{},
-		Traded: map[string]int{}, SideMismatch: map[string]int{}}
+		Traded: map[string]int{}, SideMismatch: map[string]int{}, SideMissing: map[string]int{}}
 	for _, f := range rep.Stats {
 		if f.Mismatch == 0 {
 			continue
@@ -273,7 +279,10 @@ func side(s runSummary, vendor string, rows []row, vol, ib, nb, is, ns string) {
 		b, ok2 := r.int(nb)
 		c, ok3 := r.int(is)
 		d, ok4 := r.int(ns)
-		if !ok1 || !ok2 || !ok3 || !ok4 || a+b != v || c+d != v {
+		switch {
+		case !ok1 || !ok2 || !ok3 || !ok4:
+			s.SideMissing[vendor]++
+		case a+b != v || c+d != v:
 			s.SideMismatch[vendor]++
 		}
 	}
