@@ -26,6 +26,9 @@ env_up() {
 	unset ALLOW_SYNTHETIC_ON_BUS REPLAY_REBASE
 	export SOURCE=sourcearena BUS=nats NATS_URL=nats://127.0.0.1:4222
 	local limit="${LIVE_SA_DAILY_LIMIT:-40}" span=34500
+	case $limit in
+	'' | *[!0-9]* | 0) echo "local-live: LIVE_SA_DAILY_LIMIT=$limit: want a positive integer (the plan's daily quota)"; exit 1 ;;
+	esac
 	local secs=$((span / limit + 1))
 	export POLL_INTERVAL="${LIVE_POLL_INTERVAL:-${secs}s}" SOURCEARENA_DAILY_LIMIT="$limit"
 	export SOURCEARENA_SAVE_LATEST="$L/sourcearena-latest.json" SOURCEARENA_BUDGET_FILE="$L/sourcearena-budget.json"
