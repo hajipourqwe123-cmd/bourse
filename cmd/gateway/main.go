@@ -129,7 +129,11 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 		log.Printf("gateway: WARNING: session calendar has %d rules/holidays not verified against an official source (docs/sessions.md)", n)
 	}
 	// Dial only: the gateway never creates or changes streams.
-	js, err := bus.DialJetStream(ctx, cfg.NATSURL, "gateway", bus.DefaultStreams())
+	streams, _, err := bus.StreamsFromEnv()
+	if err != nil {
+		return err
+	}
+	js, err := bus.DialJetStream(ctx, cfg.NATSURL, "gateway", streams)
 	if err != nil {
 		return err
 	}

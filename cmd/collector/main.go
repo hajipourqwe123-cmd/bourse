@@ -76,7 +76,12 @@ func run() int {
 		pub = bus.NewNDJSON(os.Stdout)
 	case "nats":
 		guard = func(s *model.Snapshot) error { return busGuard(s, allowSynthetic) }
-		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", bus.DefaultStreams())
+		streams, profile, err := bus.StreamsFromEnv()
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		log.Printf("collector: stream profile %s", profile)
+		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", streams)
 		if err != nil {
 			log.Fatalf("collector: %v", err)
 		}
