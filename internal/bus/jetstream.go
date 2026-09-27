@@ -51,7 +51,7 @@ const SizedSessionSpan = 9*time.Hour + 35*time.Minute // 08:25–18:00
 // (TestFlowAndQualitySizing). Sum of MaxBytes: 37 GiB (reserved against max_file_store).
 func DefaultStreams() []StreamSpec {
 	return []StreamSpec{
-		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 20 * gib},
+		{Name: StreamMD, Subjects: []string{"md.snap.>", "md.index.>"}, MaxAge: 48 * time.Hour, MaxBytes: 20 * gib},
 		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 10 * gib},
 		{Name: StreamAI, Subjects: []string{"ai.signal.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
 		{Name: StreamQuality, Subjects: []string{"quality.>"}, MaxAge: 48 * time.Hour, MaxBytes: 6 * gib},

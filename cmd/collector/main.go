@@ -5,6 +5,7 @@
 //	                                         # SOURCEARENA_DAILY_LIMIT=n: refuse an interval over the plan quota
 //	                                         # SOURCEARENA_SAVE_LATEST=path: keep the latest raw payload (local vendorcmp -watch)
 //	                                         # SOURCEARENA_BUDGET_FILE=path: the day's request count survives restarts
+//	                                         # INDEX_EVERY=30m: also poll the total index (same quota; time estimated)
 //	SOURCE=brsapi BRSAPI_KEY=… POLL_INTERVAL=…  # BRSAPI_TYPES=1[,4], BRSAPI_DAILY_LIMIT=100, BRSAPI_5MIN_LIMIT=300:
 //	                                         # refuses to start if the interval exceeds the plan's quota
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
@@ -137,10 +138,19 @@ func run() int {
 		}
 		brsapiIntervalWarning(interval)
 	}
+	indexEvery := config.Dur("INDEX_EVERY", 0)
 	if sa, ok := src.(*source.SourceArena); ok {
-		if err := dailyBudget("SOURCEARENA_DAILY_LIMIT", interval, cal.MaxDailySpan(), int64(sa.DailyLimit)); err != nil {
+		var extra int64
+		if indexEvery > 0 {
+			extra = perDay(cal.MaxDailySpan(), indexEvery)
+		}
+		if err := dailyBudget("SOURCEARENA_DAILY_LIMIT", interval, cal.MaxDailySpan(), int64(sa.DailyLimit), extra); err != nil {
 			log.Printf("collector: %v", err)
 			return 1
+		}
+		if indexEvery > 0 {
+			log.Printf("collector: total index every %s (%d requests/day on the same SourceArena quota; source time estimated)", indexEvery, extra)
+			go pollIndex(ctx, sa, pub, cal, indexEvery, retry)
 		}
 		if sa.DailyLimit <= 0 {
 			log.Printf("collector: WARNING: SOURCEARENA_DAILY_LIMIT is not set: nothing stops POLL_INTERVAL=%s from exceeding the plan's daily quota", interval)
@@ -259,6 +269,46 @@ func run() int {
 			return 0
 		}
 	}
+}
+
+// pollIndex publishes the total index every `every` while a session is open (INDEX_EVERY;
+// SOURCE=sourcearena only). It shares the adapter's daily budget; ErrBudget pauses it to the next
+// Tehran day like the snapshot loop. Failures never stop the snapshot collection.
+func pollIndex(ctx context.Context, sa *source.SourceArena, pub bus.Publisher, cal *calendar.Calendar, every time.Duration, retry []time.Duration) {
+	for {
+		now := time.Now()
+		wait := every
+		if u, open := cal.Union(now); open && u.Contains(now) {
+			ix, err := sa.FetchIndex(ctx)
+			switch {
+			case errors.Is(err, source.ErrBudget):
+				log.Printf("collector: index: %v; paused until the next Tehran day", err)
+				wait = tehran.DayStart(now.Add(24 * time.Hour)).Sub(now)
+			case err != nil:
+				log.Printf("collector: index: %v", err)
+			default:
+				subj := bus.SubjIndex(ix.Index)
+				id := fmt.Sprintf("index:%s:%d", ix.Index, ix.IngestTime.UnixNano())
+				if err := bus.Retry(ctx, retry, nil, func() error { return publishIndex(pub, subj, id, &ix) }); err != nil {
+					log.Printf("collector: index publish: %v", err)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+func publishIndex(pub bus.Publisher, subj, id string, ix *model.IndexSnapshot) error {
+	if idp, ok := pub.(interface {
+		PublishID(subject, id string, v any) error
+	}); ok {
+		return idp.PublishID(subj, id, ix)
+	}
+	return pub.Publish(subj, ix)
 }
 
 // outsideWait is the sleep outside the session union: one poll interval, but never past today's

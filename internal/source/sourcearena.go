@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bourse/internal/model"
@@ -39,6 +40,7 @@ type SourceArena struct {
 	// BudgetFile, if set, keeps the day's request count across restarts (SOURCEARENA_BUDGET_FILE).
 	// An unreadable or corrupt file counts as the whole budget spent (fail closed).
 	BudgetFile string
+	mu         sync.Mutex // day, used: Fetch and FetchIndex may run concurrently
 	day        string
 	used       int
 	// SaveLatest, if set, receives each successful raw payload (atomic replace) so a LOCAL
@@ -86,18 +88,54 @@ var fieldMap = map[string]fieldSpec{
 
 // Fetch performs one poll.
 func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
-	if s.token == "" {
-		return nil, fmt.Errorf("sourcearena: SOURCEARENA_TOKEN is not set")
+	body, err := s.get(ctx, "&all&type=0")
+	if err != nil {
+		return nil, err
 	}
+	snaps, err := Parse(body, s.now())
+	if err == nil && s.SaveLatest != "" {
+		if werr := saveAtomic(s.SaveLatest, body); werr != nil {
+			log.Printf("sourcearena: save latest payload: %v", werr)
+		}
+	}
+	return snaps, err
+}
+
+// FetchIndex polls the total index (market=market_bourse). It spends the SAME daily budget as
+// Fetch (one plan quota); the payload has no time (SourceTimeEstimated).
+func (s *SourceArena) FetchIndex(ctx context.Context) (model.IndexSnapshot, error) {
+	body, err := s.get(ctx, "&market=market_bourse")
+	if err != nil {
+		return model.IndexSnapshot{}, err
+	}
+	return ParseSAMarket(body, s.now())
+}
+
+// spend counts one request against the day's budget (safe for concurrent Fetch/FetchIndex).
+func (s *SourceArena) spend() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if d := tehran.TradingDay(s.now()); d != s.day {
 		s.day, s.used = d, s.loadUsed(d)
 	}
 	if s.DailyLimit > 0 && s.used >= s.DailyLimit {
-		return nil, fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
+		return fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
 	}
 	s.used++ // every attempt counts: the vendor counts failed ones too
 	s.saveUsed()
-	u := s.base + "?token=" + url.QueryEscape(s.token) + "&all&type=0"
+	return nil
+}
+
+// get performs one budgeted request with the given query suffix and returns the body, after
+// turning the vendor's error object into ErrBudget (quota) or a vendor error.
+func (s *SourceArena) get(ctx context.Context, query string) ([]byte, error) {
+	if s.token == "" {
+		return nil, fmt.Errorf("sourcearena: SOURCEARENA_TOKEN is not set")
+	}
+	if err := s.spend(); err != nil {
+		return nil, err
+	}
+	u := s.base + "?token=" + url.QueryEscape(s.token) + query
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sourcearena: build request: %w", err) // URL not echoed: it carries the token
@@ -123,25 +161,26 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 		if dailyQuota(msg) {
 			// {"Error":"daily request limit reached"} (seen 2026-09-27 after ~45 requests): the day's
 			// budget is spent whatever our count says, so a restart does not spend another request.
+			s.mu.Lock()
 			if s.DailyLimit > 0 && s.used < s.DailyLimit {
 				s.used = s.DailyLimit
 				s.saveUsed()
 			}
-			return nil, fmt.Errorf("sourcearena: %w: vendor: %q (%d requests counted on %s)", ErrBudget, msg, s.used, s.day)
+			day, used := s.day, s.used
+			s.mu.Unlock()
+			return nil, fmt.Errorf("sourcearena: %w: vendor: %q (%d requests counted on %s)", ErrBudget, msg, used, day)
 		}
 		return nil, fmt.Errorf("sourcearena: vendor error: %q", msg)
 	}
-	snaps, err := Parse(body, s.now())
-	if err == nil && s.SaveLatest != "" {
-		if werr := saveAtomic(s.SaveLatest, body); werr != nil {
-			log.Printf("sourcearena: save latest payload: %v", werr)
-		}
-	}
-	return snaps, err
+	return body, nil
 }
 
 // Used returns the requests counted on the current Tehran day (quota reporting).
-func (s *SourceArena) Used() (day string, used int) { return s.day, s.used }
+func (s *SourceArena) Used() (day string, used int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.day, s.used
+}
 
 // saVendorError recognises the vendor's error object ({"Error": "…"}, sent with HTTP 200).
 func saVendorError(body []byte) (string, bool) {

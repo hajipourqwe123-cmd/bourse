@@ -20,7 +20,7 @@ const LocalTotalCap = 20 * gib
 // collector warns below LocalMinInterval.
 func LocalStreams() []StreamSpec {
 	return []StreamSpec{
-		{Name: StreamMD, Subjects: []string{"md.snap.>"}, MaxAge: 48 * time.Hour, MaxBytes: 11 * gib},
+		{Name: StreamMD, Subjects: []string{"md.snap.>", "md.index.>"}, MaxAge: 48 * time.Hour, MaxBytes: 11 * gib},
 		{Name: StreamFlow, Subjects: []string{"flow.>"}, MaxAge: 48 * time.Hour, MaxBytes: 5 * gib},
 		{Name: StreamAI, Subjects: []string{"ai.signal.>"}, MaxAge: 48 * time.Hour, MaxBytes: 1 * gib},
 		{Name: StreamQuality, Subjects: []string{"quality.>"}, MaxAge: 48 * time.Hour, MaxBytes: 3 * gib},

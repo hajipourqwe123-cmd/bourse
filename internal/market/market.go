@@ -15,6 +15,7 @@
 package market
 
 import (
+	"slices"
 	"sort"
 	"time"
 
@@ -156,6 +157,16 @@ type KPI struct {
 	Series      []Bar      `json:"series"`
 	Secondary   *Secondary `json:"secondary,omitempty"`
 	Note        string     `json:"note,omitempty"`
+	Index       *IndexKPI  `json:"index,omitempty"` // index_total only
+}
+
+// IndexKPI is the total index card: levels in thousandths of a point (no float on the wire).
+type IndexKPI struct {
+	ValueMilli             int64  `json:"value_milli"`
+	ChangeMilli            int64  `json:"change_milli"`
+	EqualWeightMilli       *int64 `json:"equal_weight_milli"` // null when the vendor omitted it
+	EqualWeightChangeMilli *int64 `json:"equal_weight_change_milli"`
+	Source                 string `json:"source"`
 }
 
 // Breadth counts stock-class instruments that traded today by price change vs yesterday.
@@ -268,7 +279,9 @@ type Signal struct {
 // Unavailable metrics of the current data contract (docs/phase1-plan.md D-03).
 var (
 	IndicesUnavailable = Unavailable{Reason: "شاخص‌ها در قرارداد داده فعلی و پاسخ فروشنده نیستند (D-03)"}
-	queuesNoData       = "هیچ نماد سهامی دفتر سفارش و دامنه مجاز ندارد"
+	// IndexNotYet: no index level of today (the collector polls it only with INDEX_EVERY).
+	IndexNotYet  = "شاخص امروز هنوز دریافت نشده است (collector با INDEX_EVERY شاخص را می‌پرسد)"
+	queuesNoData = "هیچ نماد سهامی دفتر سفارش و دامنه مجاز ندارد"
 )
 
 // NoteBlockTrades labels the stock value KPI: trade type is not in the data yet (D-03).
@@ -300,6 +313,7 @@ type series struct {
 type State struct {
 	cfg     Config
 	day     string
+	index   *model.IndexSnapshot // latest total index of the day (nil = none yet)
 	ins     map[string]*inst
 	carried map[string]bool // instruments with only carry-over snapshots so far
 	series  map[string]*series
@@ -493,6 +507,17 @@ func showsTrading(sn *model.Snapshot) bool {
 func (s *State) carryover(sn *model.Snapshot) bool {
 	sess, ok := s.cfg.Sessions.Session(sn.InsCode, sn.SourceTime)
 	return ok && sn.SourceTime.Before(sess.Open) && showsTrading(sn)
+}
+
+// ApplyIndex records the latest total index level of today (older or other-day levels ignored).
+func (s *State) ApplyIndex(ix model.IndexSnapshot) {
+	if ix.ValueMilli <= 0 || tehran.TradingDay(ix.SourceTime) != s.day {
+		return
+	}
+	if s.index == nil || ix.SourceTime.After(s.index.SourceTime) {
+		cp := ix
+		s.index = &cp
+	}
 }
 
 // ApplySnapshot records an instrument's snapshot of today; older snapshots than the latest, and
@@ -973,7 +998,7 @@ func (s *State) Summary() Summary {
 		stock.Secondary.Value = i64(etf.value)
 	}
 	sum.KPIs = []KPI{
-		{ID: "index_total", Reason: IndicesUnavailable.Reason, Series: []Bar{}},
+		s.indexKPI(),
 		stock,
 		kpi("value_fixed", FixedIncome),
 		kpi("value_metals", Gold, Silver),
@@ -1088,4 +1113,20 @@ func Sessions(cal *calendar.Calendar, t time.Time) []SessionInfo {
 		out = append(out, si)
 	}
 	return out
+}
+
+// indexKPI is the total index card: available once a level of today arrived. Its time is the
+// vendor's, or the ingest time flagged est (SourceArena sends none).
+func (s *State) indexKPI() KPI {
+	ix := s.index
+	if ix == nil || tehran.TradingDay(ix.SourceTime) != s.day {
+		return KPI{ID: "index_total", Reason: IndexNotYet, Series: []Bar{}}
+	}
+	k := KPI{ID: "index_total", Available: true, AsOf: ix.SourceTime, Est: ix.SourceTimeEstimated, Series: []Bar{},
+		Index: &IndexKPI{ValueMilli: ix.ValueMilli, ChangeMilli: ix.ChangeMilli, Source: ix.Source}}
+	if !slices.Contains(ix.Missing, "equal_weight") {
+		ew, ewc := ix.EqualWeightMilli, ix.EqualWeightChangeMilli
+		k.Index.EqualWeightMilli, k.Index.EqualWeightChangeMilli = &ew, &ewc
+	}
+	return k
 }

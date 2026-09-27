@@ -1,0 +1,16 @@
+
+{
+    "bourse": {
+        "state": "open",
+        "index": "7,159,333.68",
+        "index_change": "-97708.82",
+        "index_change_percent": "-1.36",
+        "index_h": "1,931,904.92",
+        "index_h_change": "-7116.21",
+        "index_h_change_percent": "-0.36",
+        "market_value": "207,215,418.496B",
+        "trade_number": "280,923",
+        "trade_value": "90,512.541B",
+        "trade_volume": "16.751B"
+    }
+}

@@ -88,8 +88,11 @@ func (n *NDJSON) Publish(subject string, v any) error {
 
 // Subject builders (single source of truth for names).
 func SubjSnapshot(ins string) string { return "md.snap." + ins }
-func SubjFlow(ins string) string     { return "flow.event." + ins }
-func SubjGame(ins string) string     { return "flow.game." + ins }
-func SubjWindow(ins string) string   { return "flow.10m." + ins }
-func SubjQuality(ins string) string  { return "quality." + ins }
-func SubjAI(ins string) string       { return "ai.signal." + ins }
+
+// SubjIndex is a market index level (model.IndexSnapshot), e.g. md.index.bourse_total.
+func SubjIndex(name string) string  { return "md.index." + name }
+func SubjFlow(ins string) string    { return "flow.event." + ins }
+func SubjGame(ins string) string    { return "flow.game." + ins }
+func SubjWindow(ins string) string  { return "flow.10m." + ins }
+func SubjQuality(ins string) string { return "quality." + ins }
+func SubjAI(ins string) string      { return "ai.signal." + ins }

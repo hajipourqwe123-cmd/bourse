@@ -99,20 +99,34 @@ func TestBrsApiConfigTypes(t *testing.T) {
 
 func TestDailyBudget(t *testing.T) {
 	span := 9*time.Hour + 35*time.Minute // 34,500 s
-	if err := dailyBudget("X", 90*time.Second, span, 500); err != nil {
+	if err := dailyBudget("X", 90*time.Second, span, 500, 0); err != nil {
 		t.Fatalf("90 s = 384/day fits 500: %v", err)
 	}
-	err := dailyBudget("X", 60*time.Second, span, 500) // 576/day
+	err := dailyBudget("X", 60*time.Second, span, 500, 0) // 576/day
 	if err == nil || !strings.Contains(err.Error(), "POLL_INTERVAL>=70s") {
 		t.Fatalf("want refusal naming 70s, got %v", err)
 	}
-	if err := dailyBudget("X", 70*time.Second, span, 500); err != nil {
+	if err := dailyBudget("X", 70*time.Second, span, 500, 0); err != nil {
 		t.Fatalf("the named interval must fit: %v", err)
 	}
-	if err := dailyBudget("X", 69*time.Second, span, 500); err == nil { // 34500/69 = 500 exactly → 501 requests
+	if err := dailyBudget("X", 69*time.Second, span, 500, 0); err == nil { // 34500/69 = 500 exactly → 501 requests
 		t.Fatal("an interval dividing the span exactly needs one more request than span/interval")
 	}
-	if err := dailyBudget("X", time.Second, span, 0); err != nil {
+	// Index polls share the quota: 40/day with the index every 30 min (20/day) leaves 20 snapshots.
+	idx := perDay(span, 30*time.Minute) // ⌊34500/1800⌋ + 1 = 20
+	if idx != 20 {
+		t.Fatalf("index polls/day = %d, want 20", idx)
+	}
+	if err := dailyBudget("X", 30*time.Minute, span, 40, idx); err != nil { // 20 + 20 = 40
+		t.Fatalf("20 + 20 fits 40: %v", err)
+	}
+	if err := dailyBudget("X", 20*time.Minute, span, 40, idx); err == nil || !strings.Contains(err.Error(), "POLL_INTERVAL>=1726s") {
+		t.Fatalf("⌊34500/1200⌋+1 = 29 + 20 > 40 must name 34500/20+1 = 1726 s, got %v", err)
+	}
+	if err := dailyBudget("X", time.Hour, span, 20, idx); err == nil {
+		t.Fatal("no request left for snapshots must be refused")
+	}
+	if err := dailyBudget("X", time.Second, span, 0, 0); err != nil {
 		t.Fatalf("no limit set: %v", err)
 	}
 }
