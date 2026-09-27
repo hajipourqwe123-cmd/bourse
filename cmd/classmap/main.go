@@ -77,16 +77,25 @@ type stats struct {
 func build(rows []map[string]any) (map[string]string, stats) {
 	st := stats{rows: len(rows), byClass: map[string]int{}, byGroup: map[string]int{}, unmapped: map[string][]string{}}
 	m := map[string]string{}
+	seen := map[string]int{} // first pass: a code on several rows maps none of them
+	for _, r := range rows {
+		if code := text(r, "instance_code"); code != "" {
+			seen[code]++
+		}
+	}
+	for code, n := range seen {
+		if n > 1 {
+			st.dups = append(st.dups, fmt.Sprintf("%s (×%d)", code, n))
+		}
+	}
+	sort.Strings(st.dups)
 	for _, r := range rows {
 		code := text(r, "instance_code")
 		g := classmap.Group(text(r, "namad_code"), text(r, "industry_code"), text(r, "full_name"), text(r, "name"))
 		if code == "" {
 			g = "بدون کد"
-		}
-		if prev, dup := m[code]; dup && code != "" {
-			st.dups = append(st.dups, code+" ("+prev+")")
-			delete(m, code) // two rows with one code: neither mapping can be trusted
-			g = "کد تکراری"
+		} else if seen[code] > 1 {
+			g = "کد تکراری" // neither mapping can be trusted
 		}
 		st.byGroup[g]++
 		cl := classmap.Class(g)

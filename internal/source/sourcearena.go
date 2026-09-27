@@ -158,7 +158,16 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		set(model.FIndSellCount, &sn.IndSellCount)
 		set(model.FInstBuyCount, &sn.InstBuyCount)
 		set(model.FInstSellCount, &sn.InstSellCount)
-		sn.Missing = append(sn.Missing, model.FBook, model.FPriceLimits) // in the payload, not mapped yet (D-03 report)
+		// Permitted range: decimal strings ("3170.00"). ≤ 1 or ≥ 999,999,999 are the vendor's "no
+		// limit" placeholders (energy products), recorded as missing like BrsApi's (rule 1).
+		lo, okLo := wholeDecimal(row, "daily_price_low")
+		hi, okHi := wholeDecimal(row, "daily_price_high")
+		if okLo && okHi && lo > 1 && hi >= lo && hi < saNoLimit {
+			sn.PriceLimitMin, sn.PriceLimitMax = lo, hi
+		} else {
+			sn.Missing = append(sn.Missing, model.FPriceLimits)
+		}
+		sn.Missing = append(sn.Missing, model.FBook) // in the payload, not mapped yet
 		out = append(out, sn)
 	}
 	return out, nil
@@ -193,4 +202,25 @@ func num(row map[string]json.RawMessage, k string) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// saNoLimit is the vendor's "no upper price limit" placeholder (999999999.00).
+const saNoLimit = 999_999_999
+
+// wholeDecimal parses a rial amount sent as a decimal string ("3170.00"): accepted only when the
+// fraction is zero (a real fraction would be a unit error, never truncated).
+func wholeDecimal(row map[string]json.RawMessage, k string) (int64, bool) {
+	raw, ok := row[k]
+	if !ok {
+		return 0, false
+	}
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		if strings.Trim(s[i+1:], "0") != "" {
+			return 0, false
+		}
+		s = s[:i]
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	return v, err == nil
 }

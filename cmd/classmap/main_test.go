@@ -41,3 +41,14 @@ func TestBuildFromFixture(t *testing.T) {
 		t.Fatalf("provisional=%v n=%d", cal.ClassMapProvisional(), cal.Instruments())
 	}
 }
+
+func TestDuplicateCodesNeverMapped(t *testing.T) {
+	row := func(code, isin string) map[string]any {
+		return map[string]any{"instance_code": code, "namad_code": isin, "industry_code": "27", "name": "x"}
+	}
+	// Three rows share code 1 (the first has no class): none may be mapped; code 2 is fine.
+	m, st := build([]map[string]any{row("1", "IRE9XXXX0001"), row("1", "IRO1AAAA0001"), row("1", "IRO1AAAA0001"), row("2", "IRO1BBBB0001")})
+	if _, ok := m["1"]; ok || m["2"] != "stock" || len(st.dups) != 1 {
+		t.Fatalf("m=%v dups=%v", m, st.dups)
+	}
+}

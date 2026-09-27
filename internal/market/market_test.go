@@ -180,21 +180,35 @@ func TestPreOpenCarryoverIgnored(t *testing.T) {
 
 func TestBreadthLimitPricesExact(t *testing.T) {
 	st := testState()
-	// y = 1000: ceiling 1030, floor 970. y = 12345: ceiling ⌊12715.35⌋ = 12715, floor ⌈11974.65⌉ = 11975.
-	for ins, p := range map[string][2]int64{
-		"S1": {970, 1000}, "S2": {971, 1000}, "S3": {1000, 1000}, "S4": {1029, 1000}, "S5": {1030, 1000},
-		"S6": {12715, 12345}, "S7": {12714, 12345}, "S8": {11975, 12345}, "S9": {11976, 12345},
-	} {
-		st.ApplySnapshot(snap(ins, "09:10:00", p[0], p[1], 1, 1))
+	// Each stock is placed by its OWN permitted range of the day (price_limit_min/max).
+	lim := func(s model.Snapshot, lo, hi int64) model.Snapshot {
+		s.PriceLimitMin, s.PriceLimitMax = lo, hi
+		return s
 	}
-	st.ApplySnapshot(snap("SA", "09:10:00", 0, 1000, 1, 1))    // no last price: missing
-	st.ApplySnapshot(snap("SB", "09:10:00", 1030, 0, 1, 1))    // no yesterday price: missing, not ceil
-	st.ApplySnapshot(snap("SC", "09:10:00", 1030, 1000, 0, 0)) // no trade today: untraded
-	st.ApplySnapshot(snap("E1", "09:10:00", 1100, 1000, 1, 1)) // equity ETF: not in stock breadth
-	st.ApplySnapshot(snap("X9", "09:10:00", 1100, 1000, 1, 1)) // unknown: not in any class aggregate
+	for ins, p := range map[string][4]int64{ // last, yesterday, lo, hi
+		"S1": {970, 1000, 970, 1030},       // at the floor
+		"S2": {971, 1000, 970, 1030},       // down
+		"S3": {1000, 1000, 970, 1030},      // flat
+		"S4": {1029, 1000, 970, 1030},      // up
+		"S5": {1030, 1000, 970, 1030},      // at the ceiling
+		"S6": {1020, 1000, 980, 1020},      // base market ±2 %: ceiling (±3 % would call it "up")
+		"S7": {990, 1000, 990, 1010},       // ±1 %: floor
+		"S8": {12715, 12345, 11975, 12715}, // exchange-rounded ceiling
+	} {
+		st.ApplySnapshot(lim(snap(ins, "09:10:00", p[0], p[1], 1, 1), p[2], p[3]))
+	}
+	noLim := snap("S9", "09:10:00", 1010, 1000, 1, 1)
+	noLim.Missing = []string{model.FPriceLimits}
+	st.ApplySnapshot(noLim)                                                     // source without limits: no_limits, not guessed
+	st.ApplySnapshot(lim(snap("SD", "09:10:00", 1000, 1000, 1, 1), 1000, 1000)) // fixed-price board: no range
+	st.ApplySnapshot(lim(snap("SA", "09:10:00", 0, 1000, 1, 1), 970, 1030))     // no last price: missing
+	st.ApplySnapshot(lim(snap("SB", "09:10:00", 1030, 0, 1, 1), 970, 1030))     // no yesterday price: missing, not ceil
+	st.ApplySnapshot(lim(snap("SC", "09:10:00", 1030, 1000, 0, 0), 970, 1030))  // no trade today: untraded
+	st.ApplySnapshot(lim(snap("E1", "09:10:00", 1100, 1000, 1, 1), 900, 1100))  // equity ETF: not in stock breadth
+	st.ApplySnapshot(lim(snap("X9", "09:10:00", 1100, 1000, 1, 1), 900, 1100))  // unknown: not in any class aggregate
 	b := st.Summary().Breadth
-	want := Breadth{Class: Stock, Instruments: 12, Missing: 2, Untraded: 1,
-		Floor: 2, Down: 2, Flat: 1, Up: 2, Ceil: 2, AsOf: at("09:10:00")}
+	want := Breadth{Class: Stock, Instruments: 13, Missing: 2, Untraded: 1, NoLimits: 2,
+		Floor: 2, Down: 1, Flat: 1, Up: 1, Ceil: 3, AsOf: at("09:10:00")}
 	if b != want {
 		t.Errorf("breadth\n got %+v\nwant %+v", b, want)
 	}

@@ -74,6 +74,8 @@ export interface Breadth {
   missing: number;
   untraded: number;
   awaiting: number;
+  /** traded, but no usable permitted range (source lacks it, or fixed-price board): not in the buckets */
+  no_limits?: number;
   floor: number;
   down: number;
   flat: number;
