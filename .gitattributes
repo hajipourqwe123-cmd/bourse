@@ -1,0 +1,4 @@
+# LF in the working tree on every OS, whatever core.autocrlf says (Git for Windows defaults to
+# true): shell scripts, the Makefile and configs bind-mounted into Linux containers break on CRLF.
+* text=auto eol=lf
+*.png binary

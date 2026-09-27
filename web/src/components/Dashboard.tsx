@@ -37,7 +37,7 @@ export default function Dashboard() {
       domRows: document.querySelectorAll('[data-testid="table-body"] [role="row"]').length,
       // Oldest flow totals behind the rows (engine catch-up; Gate 2 warm-up).
       hotAgeMaxMs: (() => {
-        const now = Date.now() + store.offsetMs;
+        const now = store.serverNow(Date.now());
         let max: number | null = null;
         for (const r of store.rows.values()) if (r.hot_as_of) max = Math.max(max ?? 0, now - Date.parse(r.hot_as_of));
         return max;
@@ -101,7 +101,7 @@ function Body() {
 }
 
 function MobileDate() {
-  const now = useNow();
+  const now = useMarket().serverNow(useNow());
   return (
     <div className="mobile-only" style={{ justifyContent: "space-between", alignItems: "center" }}>
       <span className="t-label">

@@ -58,6 +58,8 @@ SOURCE=replay REPLAY_REBASE=now REPLAY_AT=10:00 bin/collector          # ضبط�
 make gate2                                                             # Gate 2: ۱۵۰۰ نماد، NATS و Centrifugo دورریختنی، Chromium
 ```
 
+وقتی بازار بسته است: `make demo-day` یک روز ساختگی را روی ساعت نمایشی بازپخش می‌کند (پیش‌فرض: آخرین روز معاملاتی، از ۱۱:۴۰، سرعت ۵ برابر، `http://127.0.0.1:8090/`؛ توقف با `make demo-day-stop`). فقط داده ساختگی و فقط loopback؛ جزئیات در `docs/demo-clock.md` (از جمله نکته‌های ویندوز).
+
 برای توسعه رابط: `cd web && NEXT_PUBLIC_GATEWAY_URL=http://127.0.0.1:8080 npm run dev`. گزارش Gate 2 در `gate2-out/report.json` است و تصاویر مرجع طراحی در `docs/design/`.
 
 اگر dockerd سقف فایل باز کمتر از 262144 دارد (خطای `error setting rlimit type 7`)، در `.env` مقدار `CLICKHOUSE_NOFILE` را برابر `ulimit -Hn` بگذارید.

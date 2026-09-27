@@ -141,6 +141,8 @@ export interface State {
   summary: Summary;
   rows: Row[];
   radar: Signal[];
+  /** DEMO_CLOCK only: now, day and sessions come from a virtual clock (synthetic replay). */
+  demo_clock?: { start: string; rate: number };
 }
 
 export interface SymbolsMsg {

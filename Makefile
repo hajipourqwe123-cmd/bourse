@@ -1,4 +1,4 @@
-.PHONY: test vet build synth demo demo-nats env up down ps ddl web gate2
+.PHONY: test vet build synth demo demo-nats demo-day demo-day-stop env up down ps ddl web gate2
 COMPOSE := docker compose --env-file .env -f infra/docker-compose.yml
 
 test: ; go test ./...
@@ -13,6 +13,10 @@ demo-nats: build ; infra/demo-nats.sh
 web: ; cd web && npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && NEXT_TELEMETRY_DISABLED=1 npm run build
 # Needs docker + Chromium. Gate 2: 1500 synthetic symbols, real-time replay, THROWAWAY NATS and Centrifugo.
 gate2: ; infra/gate2.sh
+# Needs docker. Synthetic day on a DEMO CLOCK (default: last trading day from 11:40, x5), THROWAWAY
+# NATS and Centrifugo; dashboard on http://127.0.0.1:8090. Run again to restart the day (docs/demo-clock.md).
+demo-day: ; infra/demo-day.sh start
+demo-day-stop: ; infra/demo-day.sh stop
 
 # Local stack (I-01). `make env` once, then `make up ddl`.
 env: ; infra/gen-env.sh

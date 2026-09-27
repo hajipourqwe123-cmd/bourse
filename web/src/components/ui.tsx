@@ -46,7 +46,7 @@ export function Age({ at, prefix = "به‌روز:" }: { at: string | null | und
   if (!at || at === ZERO_TIME) return <span className="t-label">{prefix} {UNAVAILABLE}</span>;
   return (
     <span className="t-label">
-      {prefix} {age(now + store.offsetMs - Date.parse(at))}
+      {prefix} {age(store.serverNow(now) - Date.parse(at))}
     </span>
   );
 }

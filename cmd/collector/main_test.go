@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestPublishFilterSourceDayChange(t *testing.T) {
 func TestRebaseRefusesClosedTodayUnlessDateGiven(t *testing.T) {
 	cal := calendar.Default()
 	fri, _ := time.ParseInLocation("2006-01-02 15:04", "2026-09-25 10:00", tehran.Loc)
-	src, err := source.NewReplay("/dev/null")
+	src, err := source.NewReplay(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}

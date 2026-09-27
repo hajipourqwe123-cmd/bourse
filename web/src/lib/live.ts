@@ -18,17 +18,19 @@ async function getJSON<T>(path: string): Promise<T> {
 
 export async function syncClock(store: MarketStore): Promise<void> {
   const samples: ClockSample[] = [];
+  let rate = 1; // DEMO_CLOCK: the gateway's clock runs `rate` times faster than real time
   for (let i = 0; i < CLOCK_SAMPLES; i++) {
     const t0 = Date.now();
     try {
-      const { now } = await getJSON<{ now: number }>("/api/v1/time");
-      samples.push({ t0, server: now, t1: Date.now() });
+      const r = await getJSON<{ now: number; rate?: number }>("/api/v1/time");
+      if (r.rate && r.rate > 0) rate = r.rate;
+      samples.push({ t0, server: r.now, t1: Date.now() });
     } catch {
       /* try the next sample */
     }
   }
   const est = estimateOffset(samples);
-  if (est) store.setOffset(est.offset);
+  if (est) store.setOffset(est.offset, rate, est.at);
 }
 
 async function loadState(store: MarketStore): Promise<State> {

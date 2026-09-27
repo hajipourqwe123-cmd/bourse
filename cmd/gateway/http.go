@@ -31,6 +31,11 @@ func serve(cfg Config, h *hub) (*http.Server, string, error) {
 	})
 	mux.HandleFunc("GET /api/v1/time", func(w http.ResponseWriter, _ *http.Request) {
 		// Server wall clock (unix ms) for the browser's clock-offset estimate (NTP-style, RTT/2).
+		// Under DEMO_CLOCK: the demo clock, and its rate so the browser can extrapolate it.
+		if h.cfg.Demo != nil {
+			writeJSON(w, map[string]any{"now": h.now().UnixMilli(), "rate": h.cfg.Demo.Rate})
+			return
+		}
 		writeJSON(w, map[string]int64{"now": h.now().UnixMilli()})
 	})
 	mux.HandleFunc("GET /api/v1/state", func(w http.ResponseWriter, _ *http.Request) {
@@ -52,7 +57,7 @@ func serve(cfg Config, h *hub) (*http.Server, string, error) {
 			http.Error(w, "CENTRIFUGO_SECRET not set", http.StatusServiceUnavailable)
 			return
 		}
-		now := time.Now()
+		now := time.Now() // real time even under DEMO_CLOCK: Centrifugo checks exp against it
 		tok := devToken(cfg.TokenSecret, now)
 		writeJSON(w, map[string]any{"token": tok, "exp": now.Add(tokenTTL).Unix()})
 	})

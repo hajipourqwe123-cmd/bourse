@@ -84,6 +84,7 @@ type hub struct {
 	ready       bool
 	undecodable int
 	synSkipped  bool
+	realSkipped bool            // DEMO_CLOCK: a non-synthetic instrument was dropped (logged once)
 	synIns      map[string]bool // instruments seen with synthetic snapshots
 	loaded      bool            // the stored day totals were read (saving is allowed)
 }
@@ -137,6 +138,14 @@ func (h *hub) synthetic(ins string) bool { return strings.HasPrefix(ins, "SYN") 
 func (h *hub) skipSynthetic(ins string) bool { return h.skip(ins, h.synthetic(ins)) }
 
 func (h *hub) skip(ins string, syn bool) bool {
+	if h.cfg.Demo != nil && !syn {
+		// DEMO_CLOCK: real data must never be shown at a virtual time.
+		if !h.realSkipped {
+			h.realSkipped = true
+			log.Printf("gateway: DEMO_CLOCK: non-synthetic instrument %s ignored (demo shows synthetic data only)", ins)
+		}
+		return true
+	}
 	if h.cfg.AllowSynthetic || !syn {
 		return false
 	}
@@ -419,6 +428,13 @@ type stateMsg struct {
 	Summary            market.Summary       `json:"summary"`
 	Rows               []market.Row         `json:"rows"`
 	Radar              []market.Signal      `json:"radar"`
+	DemoClock          *demoClockMsg        `json:"demo_clock,omitempty"` // DEMO_CLOCK only
+}
+
+// demoClockMsg tells the browser that now, day and sessions come from a virtual clock.
+type demoClockMsg struct {
+	Start time.Time `json:"start"`
+	Rate  float64   `json:"rate"`
 }
 
 // state returns the full state (false until the rebuild is complete). Rows may include changes
@@ -436,5 +452,13 @@ func (h *hub) state(now time.Time) (stateMsg, bool) {
 		HotThreshold:       h.cfg.Market.HotThreshold, PlusThreshold: h.cfg.Market.PlusThreshold,
 		StaleAfterMs: h.cfg.StaleAfter.Milliseconds(), CentrifugoWS: h.cfg.CentrifugoWS, DevToken: h.cfg.DevToken,
 		Summary: h.st.Summary(), Rows: h.st.Rows(), Radar: h.st.Radar(),
+		DemoClock: h.demoClock(),
 	}, true
+}
+
+func (h *hub) demoClock() *demoClockMsg {
+	if h.cfg.Demo == nil {
+		return nil
+	}
+	return &demoClockMsg{Start: h.cfg.Demo.Start, Rate: h.cfg.Demo.Rate}
 }

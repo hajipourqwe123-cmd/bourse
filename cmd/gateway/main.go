@@ -13,6 +13,8 @@
 //	WEB_DIR=web/out                      # static web build served at /
 //	ALLOW_SYNTHETIC_ON_BUS=1             # show SYN* data; disposable local stacks only (rule 5)
 //	HOT_THRESHOLD_RIAL, PLUS_THRESHOLD_RIAL, STALE_AFTER, SESSIONS_FILE: same values as the engine
+//	DEMO_CLOCK, DEMO_CLOCK_RATE, DEMO_CLOCK_ANCHOR   # DEV ONLY: virtual clock for a synthetic replay
+//	                                     # (same values as the collector; docs/demo-clock.md)
 package main
 
 import (
@@ -31,6 +33,7 @@ import (
 	"bourse/internal/bus"
 	"bourse/internal/calendar"
 	"bourse/internal/config"
+	"bourse/internal/democlock"
 	"bourse/internal/market"
 )
 
@@ -48,8 +51,27 @@ type Config struct {
 	AllowSynthetic bool
 	StaleAfter     time.Duration
 	Market         market.Config
-	Tick           time.Duration    // publish period
-	Now            func() time.Time // nil (always, in production) = the wall clock; tests pin it
+	Tick           time.Duration // publish period
+	// Now is the gateway's one clock: nil (always, in production) = the wall clock; DEMO_CLOCK sets
+	// it to the demo clock, tests pin it. Demo only describes DEMO_CLOCK (rate, start, guards).
+	Now  func() time.Time
+	Demo *democlock.Clock
+}
+
+// clock is the gateway's single clock: cfg.Now, or the wall clock.
+func (c Config) clock() func() time.Time {
+	if c.Now != nil {
+		return c.Now
+	}
+	return time.Now
+}
+
+// demoNow is the Config clock for DEMO_CLOCK: the demo clock, or nil (the wall clock) when off.
+func demoNow(d *democlock.Clock) func() time.Time {
+	if d == nil {
+		return nil
+	}
+	return d.Now
 }
 
 func loadConfig() (Config, error) {
@@ -61,6 +83,10 @@ func loadConfig() (Config, error) {
 	m.Sessions = cal
 	m.HotThreshold = config.Int("HOT_THRESHOLD_RIAL", m.HotThreshold)
 	m.PlusThreshold = config.Int("PLUS_THRESHOLD_RIAL", m.PlusThreshold)
+	demo, err := democlock.FromEnv(cal, time.Now())
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		Addr:           config.Str("GATEWAY_ADDR", "127.0.0.1:8080"),
 		NATSURL:        config.Str("NATS_URL", "nats://127.0.0.1:4222"),
@@ -75,6 +101,8 @@ func loadConfig() (Config, error) {
 		StaleAfter:     config.Dur("STALE_AFTER", 30*time.Second),
 		Market:         m,
 		Tick:           time.Second,
+		Demo:           demo,
+		Now:            demoNow(demo),
 	}, nil
 }
 
@@ -115,6 +143,9 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	if err := checkLoopback(cfg.Addr); err != nil {
 		return err
 	}
+	if err := checkDemo(cfg); err != nil {
+		return err
+	}
 	if cfg.LeaseTTL < 3*time.Second {
 		return fmt.Errorf("GATEWAY_LEASE_TTL %s is below 3s", cfg.LeaseTTL)
 	}
@@ -147,13 +178,11 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 		_ = lease.Release(rctx)
 	}()
 
-	now := time.Now
-	if cfg.Now != nil {
-		now = cfg.Now
+	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, cfg.clock())
+	if cfg.Demo == nil { // a demo day must not become anyone's previous-day totals
+		h.store = js
+		h.loadPrevTotals(ctx)
 	}
-	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, now)
-	h.store = js
-	h.loadPrevTotals(ctx)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, 6)
@@ -182,6 +211,26 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	case err := <-errc:
 		return err
 	}
+}
+
+// checkDemo: DEMO_CLOCK only with synthetic data allowed and every endpoint on this machine. The
+// hub then shows synthetic data only (hub.skip).
+func checkDemo(cfg Config) error {
+	if cfg.Demo == nil {
+		return nil
+	}
+	if cfg.Now == nil {
+		return errors.New("DEMO_CLOCK set but the gateway clock is the wall clock (Config.Now unset)")
+	}
+	if !cfg.AllowSynthetic {
+		return errors.New("DEMO_CLOCK needs ALLOW_SYNTHETIC_ON_BUS=1 (it replays synthetic data only)")
+	}
+	if err := democlock.RequireLoopback(cfg.NATSURL, cfg.CentrifugoAPI, cfg.CentrifugoWS); err != nil {
+		return err
+	}
+	log.Printf("gateway: WARNING: DEMO_CLOCK: dashboard runs on a virtual clock from %s; synthetic data only, "+
+		"no totals persisted (local review only; docs/demo-clock.md)", cfg.Demo)
+	return nil
 }
 
 func holder() string {

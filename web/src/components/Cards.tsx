@@ -12,7 +12,7 @@ const FAMILY: Record<string, string> = { fixed: "fam-fixed", stock: "fam-stock",
 /** «جلسه‌های امروز»: one row per session family, from the gateway's calendar sessions. */
 export function SessionStrip({ compact = false }: { compact?: boolean }) {
   const s = useMarket();
-  const now = useNow() + s.offsetMs;
+  const now = s.serverNow(useNow());
   const sessions = s.state?.sessions ?? [];
   const id = useId();
   return (
@@ -69,7 +69,7 @@ const KPI_TITLE: Record<KPI["id"], string> = {
 
 function KpiCard({ k }: { k: KPI }) {
   const s = useMarket();
-  const now = useNow() + s.offsetMs;
+  const now = s.serverNow(useNow());
   if (!k.available) {
     return (
       <section className="card" aria-label={KPI_TITLE[k.id]}>

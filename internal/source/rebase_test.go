@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -117,5 +118,38 @@ func TestRebaseMarksDataNotRealAndShiftsByIngestDay(t *testing.T) {
 	}
 	if slept != 40*time.Minute {
 		t.Errorf("slept %s, want 40m (08:40 on the target day)", slept)
+	}
+}
+
+// DEMO_CLOCK: the rebase follows the injected clock; batches before the demo start are sent at
+// once, later ones wait (in demo time) until the demo clock reaches them.
+func TestRebaseWithDemoClock(t *testing.T) {
+	src := &sliceSource{batches: [][]model.Snapshot{{rec("11:00:00", 0)}, {rec("11:40:05", 0)}}}
+	demoNow := tt("2026-09-23", "11:40:00")
+	r, _ := NewRebase(src, RebaseToday, demoNow, 0)
+	var slept []time.Duration
+	r.SetClock(func() time.Time { return demoNow }, func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil })
+	b1, _ := r.Fetch(context.Background())
+	b2, _ := r.Fetch(context.Background())
+	if r.Shift() != 0 || !b1[0].SourceTime.Equal(tt("2026-09-23", "11:00:00")) || !b2[0].SourceTime.Equal(tt("2026-09-23", "11:40:05")) {
+		t.Fatalf("shift %s, times %s %s: a recording of the demo day must keep its times", r.Shift(), b1[0].SourceTime, b2[0].SourceTime)
+	}
+	if len(slept) != 1 || slept[0] != 5*time.Second {
+		t.Fatalf("slept %v, want [5s] (demo time)", slept)
+	}
+}
+
+func TestSyntheticOnly(t *testing.T) {
+	syn := model.Snapshot{InsCode: "SYNTHETIC0001", Source: "synthetic"}
+	live := model.Snapshot{InsCode: "46348559193224090", Source: "sourcearena"}
+	s := SyntheticOnly{&sliceSource{batches: [][]model.Snapshot{{syn}, {syn, live}}}}
+	if b, err := s.Fetch(context.Background()); err != nil || len(b) != 1 {
+		t.Fatalf("synthetic batch: %v, %v", b, err)
+	}
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrNotSynthetic) {
+		t.Fatalf("real snapshot: %v, want ErrNotSynthetic", err)
+	}
+	if _, err := s.Fetch(context.Background()); err != ErrDone {
+		t.Fatalf("end = %v", err)
 	}
 }
