@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -81,6 +82,10 @@ func run() int {
 			log.Fatalf("collector: %v", err)
 		}
 		log.Printf("collector: stream profile %s", profile)
+		if strings.HasPrefix(profile, "local") && config.Dur("POLL_INTERVAL", 5*time.Second) < bus.LocalMinInterval {
+			log.Printf("collector: WARNING: STREAM_PROFILE=local holds a worst-case day only at POLL_INTERVAL >= %s: "+
+				"at a shorter interval the oldest messages of the day may be discarded (the gateway rebuild would miss them)", bus.LocalMinInterval)
+		}
 		js, err := bus.ConnectJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "collector", streams)
 		if err != nil {
 			log.Fatalf("collector: %v", err)

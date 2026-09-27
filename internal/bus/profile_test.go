@@ -55,3 +55,19 @@ func TestLocalProfileOverrides(t *testing.T) {
 		t.Fatal("unknown profile must be refused")
 	}
 }
+
+func TestStreamEnvRejectsBadValues(t *testing.T) {
+	t.Setenv("STREAM_PROFILE", "local")
+	for k, v := range map[string]string{
+		"STREAM_MD_MAX_GIB":   "8589934592", // would overflow n*GiB into a negative total
+		"STREAM_FLOW_MAX_GIB": "8GiB",       // typo: must not silently fall back
+		"STREAM_MAX_AGE":      "1h",         // shorter than a trading day's replay
+	} {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv(k, v)
+			if _, _, err := StreamsFromEnv(); err == nil {
+				t.Fatalf("%s=%s accepted", k, v)
+			}
+		})
+	}
+}
