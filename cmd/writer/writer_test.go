@@ -192,3 +192,74 @@ func TestInsertFailureRetriedThenLeftUnacked(t *testing.T) {
 		t.Fatal("persistent failure must return an error (batch stays unacked)")
 	}
 }
+
+// Rule 5 ordering: a flow batch is not inserted until writer-md has checked every snapshot that
+// could have produced it; if the writer stops first (synthetic data on MD), nothing is inserted.
+func TestFlowWaitsForTheSnapshotCheck(t *testing.T) {
+	out := msg(t, "flow.10m.S1", 7, model.TenMinute{InsCode: "S1", Class: market.Stock, WindowStart: tehranAt("09:00")})
+	handle := func(g *mdGate, ctx context.Context) (*fakeSink, chan error) {
+		s := &fakeSink{}
+		done := make(chan error, 1)
+		go func() { done <- (&writer{sink: s, gate: g}).handle(ctx, []bus.Msg{out}) }()
+		return s, done
+	}
+	blocked := func(done chan error) bool {
+		select {
+		case <-done:
+			return false
+		case <-time.After(150 * time.Millisecond):
+			return true
+		}
+	}
+
+	// Snapshots checked only up to before the output was stored: wait; the writer stops: nothing stored.
+	g := &mdGate{}
+	g.checked.Store(stored(6).UnixNano())
+	g.drained.Store(time.Now().Add(-time.Hour).UnixNano()) // an empty fetch BEFORE the batch arrived
+	ctx, cancel := context.WithCancel(context.Background())
+	s, done := handle(g, ctx)
+	if !blocked(done) {
+		t.Fatal("flow batch inserted before writer-md checked its snapshots")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) || len(s.rows) != 0 {
+		t.Fatalf("writer stopped: err %v, stored %v; want nothing stored", err, s.rows)
+	}
+
+	// writer-md checks a snapshot stored at or after the output: go.
+	g = &mdGate{}
+	s, done = handle(g, context.Background())
+	if !blocked(done) {
+		t.Fatal("inserted with an empty gate")
+	}
+	g.checked.Store(stored(7).UnixNano())
+	if err := <-done; err != nil || len(s.rows[t10m]) != 1 {
+		t.Fatalf("after the check: %v %v", err, s.rows)
+	}
+
+	// writer-md finds MD empty on a fetch started after the batch arrived: go.
+	g = &mdGate{}
+	s, done = handle(g, context.Background())
+	if !blocked(done) {
+		t.Fatal("inserted with an empty gate")
+	}
+	g.drained.Store(time.Now().UnixNano())
+	if err := <-done; err != nil || len(s.rows[t10m]) != 1 {
+		t.Fatalf("after MD drained: %v %v", err, s.rows)
+	}
+}
+
+// writer-md advances the gate only for a batch it checked and stored.
+func TestSnapshotBatchAdvancesTheGate(t *testing.T) {
+	at := tehranAt("09:00")
+	g := &mdGate{}
+	w := &writer{sink: &fakeSink{}, mark: g}
+	syn := msg(t, "md.snap.123", 9, model.Snapshot{InsCode: "123", Source: "rebase:replay", SourceTime: at})
+	if err := w.handle(context.Background(), []bus.Msg{syn}); !errors.Is(err, errSynthetic) || g.checked.Load() != 0 {
+		t.Fatalf("synthetic batch: err %v, gate %d; the gate must not move", err, g.checked.Load())
+	}
+	ok := msg(t, "md.snap.123", 10, model.Snapshot{InsCode: "123", Source: "sourcearena", SourceTime: at})
+	if err := w.handle(context.Background(), []bus.Msg{ok}); err != nil || g.checked.Load() != stored(10).UnixNano() {
+		t.Fatalf("checked batch: err %v, gate %d", err, g.checked.Load())
+	}
+}

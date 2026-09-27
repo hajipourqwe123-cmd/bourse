@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"bourse/internal/bus"
@@ -133,10 +134,52 @@ func chTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000
 // (code, ins_code, day) however often they are re-emitted (engine recovery).
 var oncePerDay = map[string]bool{quality.DayStartMissed: true, quality.PrevDayCarryover: true}
 
+// mdGate orders the writer's consumers for rule 5: engine outputs carry no source, so a flow or
+// quality batch is inserted only once writer-md has CHECKED (for synthetic data) every snapshot
+// that could have produced it. An output is always stored after its input snapshot, so a batch
+// received at local time h, whose newest message was stored at server time t, may go when
+//   - writer-md has checked a snapshot stored at or after t (server clock vs server clock), or
+//   - writer-md found MD empty on a fetch started after h (local clock vs local clock).
+//
+// The two clocks are never compared with each other.
+type mdGate struct {
+	checked atomic.Int64 // stored time (server, ns) of the newest snapshot writer-md has checked
+	drained atomic.Int64 // local start time (ns) of writer-md's latest empty fetch
+}
+
+func (g *mdGate) open(h, t time.Time) bool {
+	return g.checked.Load() >= t.UnixNano() || g.drained.Load() > h.UnixNano()
+}
+
+// wait blocks until the gate opens for a batch received at h whose newest message was stored at
+// t, keeping the batch's messages in progress; it returns ctx's error if the writer stops first
+// (writer-md found synthetic data: nothing of this batch is inserted).
+func (g *mdGate) wait(ctx context.Context, h, t time.Time, msgs []bus.Msg) error {
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for last := time.Now(); !g.open(h, t); {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case now := <-tick.C:
+			if now.Sub(last) > 5*time.Second {
+				for _, m := range msgs {
+					m.InProgress()
+				}
+				last = now
+			}
+		}
+	}
+	return nil
+}
+
 // writer turns bus messages into rows. It is stateless: idempotency is the tables' job.
 type writer struct {
-	sink  sink
-	retry []time.Duration // insert retries before giving up (the batch then stays unacked)
+	// Exactly one of mark (writer-md: advanced after each checked batch) and gate (writer-flow,
+	// writer-quality: waited on before inserting) is set in production; both nil in unit tests.
+	mark, gate *mdGate
+	sink       sink
+	retry      []time.Duration // insert retries before giving up (the batch then stays unacked)
 	// afterInsert (tests) runs after the rows are inserted and before the batch is acked.
 	afterInsert func() error
 	stats       struct{ rows, undecodable int }
@@ -155,6 +198,7 @@ func (r rows) add(table string, v any) {
 
 // handle converts and inserts one batch; an error leaves the batch unacked (redelivered).
 func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
+	received := time.Now()
 	out := rows{}
 	for _, m := range msgs {
 		err := w.convert(out, m)
@@ -171,6 +215,17 @@ func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
 				Detail: fmt.Sprintf("writer: %s seq %d: %v", m.Subject, m.StreamSeq, err), At: m.Stored}, m))
 		}
 	}
+	newest := msgs[0].Stored
+	for _, m := range msgs {
+		if m.Stored.After(newest) {
+			newest = m.Stored
+		}
+	}
+	if w.gate != nil {
+		if err := w.gate.wait(ctx, received, newest, msgs); err != nil {
+			return err
+		}
+	}
 	for _, t := range []string{tSnapshots, tFlow, tGame, t10m, tQuality} {
 		if len(out[t]) == 0 {
 			continue
@@ -184,6 +239,9 @@ func (w *writer) handle(ctx context.Context, msgs []bus.Msg) error {
 			return fmt.Errorf("insert %d rows into %s: %w", len(out[t]), t, err)
 		}
 		w.stats.rows += len(out[t])
+	}
+	if w.mark != nil { // every snapshot of this batch was checked (none synthetic)
+		w.mark.checked.Store(newest.UnixNano())
 	}
 	if w.afterInsert != nil {
 		return w.afterInsert()

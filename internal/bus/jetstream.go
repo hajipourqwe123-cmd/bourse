@@ -581,6 +581,9 @@ type BatchSpec struct {
 	MaxBatch                int           // default 1000
 	MaxWait                 time.Duration // longest wait to fill a batch; default 1s
 	AckWait                 time.Duration // default 60s; must exceed the handler's worst case
+	// Idle, if set, is called after a fetch that returned no message, with the (local) time the
+	// fetch started: every message stored before then had already been handled and acked.
+	Idle func(fetchStart time.Time)
 }
 
 // ConsumeBatch runs a durable pull consumer (created or updated from spec) and calls fn with each
@@ -615,6 +618,7 @@ func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		start := time.Now()
 		batch, err := c.Fetch(spec.MaxBatch, jetstream.FetchMaxWait(spec.MaxWait))
 		if err != nil {
 			if ctx.Err() != nil {
@@ -639,6 +643,9 @@ func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]
 			log.Printf("jetstream: consumer %s/%s: fetch: %v", spec.Stream, spec.Durable, err)
 		}
 		if len(msgs) == 0 {
+			if spec.Idle != nil {
+				spec.Idle(start)
+			}
 			continue
 		}
 		if err := fn(msgs); err != nil {

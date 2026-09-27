@@ -172,6 +172,10 @@ func TestRestartAndRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub(bus.SubjQuality("S1"), model.QualityIssue{InsCode: "S1", Code: quality.Stale, Detail: "40s", At: at})
+	// A later snapshot: writer-md's check of it covers every output above (mdGate), so the flow and
+	// quality batches can be inserted while the MD batch is still unacked (the crash below).
+	pub(bus.SubjSnapshot("S1"), model.Snapshot{InsCode: "S1", Symbol: "ش۱", Source: "sourcearena",
+		SourceTime: at.Add(20 * time.Second), IngestTime: at.Add(21 * time.Second), Volume: 3})
 
 	cfg := Config{NATSURL: natsURL, CHURL: ch.base, CHDB: ch.db, CHUser: ch.user, CHKey: ch.pass,
 		Batch: 100, MaxWait: 200 * time.Millisecond, AckWait: 2 * time.Second, Retry: []time.Duration{10 * time.Millisecond}}
@@ -196,8 +200,8 @@ func TestRestartAndRedelivery(t *testing.T) {
 	if !errors.Is(err, crash) {
 		t.Fatalf("run 1 = %v, want the simulated crash", err)
 	}
-	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 3 {
-		t.Fatalf("run 1 inserted %d snapshots before crashing, want 3", n)
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 4 {
+		t.Fatalf("run 1 inserted %d snapshots before crashing, want 4", n)
 	}
 
 	// Run 2 (restart): the unacked batches are redelivered and inserted again.
@@ -216,13 +220,13 @@ func TestRestartAndRedelivery(t *testing.T) {
 	}
 
 	// Every stream's batch was inserted twice (run 1, then the redelivery), plus the republish.
-	for table, min := range map[string]int{"snapshots": 6, "flow_events": 3, "game_totals": 3, "flow_10m": 3, "quality_issues": 7} {
+	for table, min := range map[string]int{"snapshots": 8, "flow_events": 3, "game_totals": 3, "flow_10m": 3, "quality_issues": 7} {
 		if raw := ch.count(t, "SELECT count() FROM {db}."+table); raw < min {
 			t.Errorf("%s: %d raw rows, want >= %d: the redelivery was not exercised", table, raw, min)
 		}
 	}
 	for q, n := range map[string]int{
-		"snapshots":   3,
+		"snapshots":   4,
 		"flow_events": 1,
 		"game_totals": 1,
 		"flow_10m":    1,
@@ -254,8 +258,8 @@ func TestRestartAndRedelivery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 3 {
-		t.Errorf("after merge: %d snapshots, want 3", n)
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots"); n != 4 {
+		t.Errorf("after merge: %d snapshots, want 4", n)
 	}
 	if n := ch.count(t, "SELECT count() FROM {db}.quality_issues WHERE code = 'DAY_START_MISSED'"); n != 1 {
 		t.Errorf("after merge: %d DAY_START_MISSED rows, want 1", n)
@@ -270,7 +274,7 @@ func TestRestartAndRedelivery(t *testing.T) {
 	if err := run(ctx, cfg, nil); !errors.Is(err, errSynthetic) {
 		t.Errorf("run with synthetic data on the bus = %v, want errSynthetic", err)
 	}
-	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 3 {
-		t.Errorf("%d snapshots after the synthetic batch, want 3 (the batch is not stored)", n)
+	if n := ch.count(t, "SELECT count() FROM {db}.snapshots FINAL"); n != 4 {
+		t.Errorf("%d snapshots after the synthetic batch, want 4 (the batch is not stored)", n)
 	}
 }

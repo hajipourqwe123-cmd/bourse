@@ -8,7 +8,8 @@
 // store each row once (read with FINAL). Synthetic data is never stored (rule 5): the writer refuses
 // to run where ALLOW_SYNTHETIC_ON_BUS=1 and STOPS (batch unacked) on the first synthetic message
 // on the bus (SYN*, source synthetic or rebase:), since engine outputs of a re-timed recording
-// carry real instrument codes and no source. A message that
+// carry real instrument codes and no source; flow and quality batches wait until writer-md has
+// checked every snapshot that could have produced them (mdGate). A message that
 // cannot be stored is recorded as an UNDECODABLE quality issue and acked; a ClickHouse failure is
 // retried, then the writer exits non-zero with the batch unacked (redelivered to the next run).
 //
@@ -88,9 +89,16 @@ func run(ctx context.Context, cfg Config, hook func(stream string, w *writer)) e
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errc := make(chan error, len(consumers))
+	gate := &mdGate{}
 	for _, spec := range consumers {
 		spec.MaxBatch, spec.MaxWait, spec.AckWait = cfg.Batch, cfg.MaxWait, cfg.AckWait
 		w := &writer{sink: ch, retry: cfg.Retry}
+		if spec.Stream == bus.StreamMD {
+			w.mark = gate
+			spec.Idle = func(start time.Time) { gate.drained.Store(start.UnixNano()) }
+		} else {
+			w.gate = gate // rule 5: never ahead of the synthetic check on MD (mdGate)
+		}
 		if hook != nil {
 			hook(spec.Stream, w)
 		}
