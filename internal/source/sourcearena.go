@@ -7,13 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"bourse/internal/model"
+	"bourse/internal/tehran"
 )
 
 // SourceArena polls the vendor's "all instruments" endpoint (?token=…&all&type=0).
@@ -28,6 +32,15 @@ type SourceArena struct {
 	token  string // never logged
 	client *http.Client
 	now    func() time.Time
+
+	// DailyLimit > 0: at most this many requests per Tehran day (plan quota; SOURCEARENA_DAILY_LIMIT).
+	// The counter is in memory (a restart resets it); the vendor enforces the real quota.
+	DailyLimit int
+	day        string
+	used       int
+	// SaveLatest, if set, receives each successful raw payload (atomic replace) so a LOCAL
+	// comparison (cmd/vendorcmp -watch) can reuse it instead of spending quota. Never commit it.
+	SaveLatest string
 }
 
 // NewSourceArena builds the adapter. token comes from the environment, never from code.
@@ -73,6 +86,15 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if s.token == "" {
 		return nil, fmt.Errorf("sourcearena: SOURCEARENA_TOKEN is not set")
 	}
+	if s.DailyLimit > 0 {
+		if d := tehran.TradingDay(s.now()); d != s.day {
+			s.day, s.used = d, 0
+		}
+		if s.used >= s.DailyLimit {
+			return nil, fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
+		}
+		s.used++ // every attempt counts: the vendor counts failed ones too
+	}
 	u := s.base + "?token=" + url.QueryEscape(s.token) + "&all&type=0"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -94,7 +116,25 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("sourcearena: HTTP %d", resp.StatusCode)
 	}
-	return Parse(body, s.now())
+	snaps, err := Parse(body, s.now())
+	if err == nil && s.SaveLatest != "" {
+		if werr := saveAtomic(s.SaveLatest, body); werr != nil {
+			log.Printf("sourcearena: save latest payload: %v", werr)
+		}
+	}
+	return snaps, err
+}
+
+// saveAtomic replaces path with b via a temporary file in the same directory.
+func saveAtomic(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // redact removes secret from msg, also in its URL-encoded forms (a key in a query string shows

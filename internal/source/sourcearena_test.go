@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -161,5 +162,30 @@ func TestSourceArenaRedirectAndErrors(t *testing.T) {
 	defer vendorErr.Close()
 	if _, err := NewSourceArena(vendorErr.URL+"/api/", saTestToken, time.Second).Fetch(context.Background()); err == nil {
 		t.Fatal("vendor error object accepted as data")
+	}
+}
+
+func TestSourceArenaDailyLimitAndSaveLatest(t *testing.T) {
+	body, err := os.ReadFile("testdata/sourcearena_live_all_type0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write(body)
+	}))
+	defer srv.Close()
+	s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+	s.DailyLimit = 1
+	s.SaveLatest = t.TempDir() + "/latest.json"
+	if _, err := s.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := os.ReadFile(s.SaveLatest); err != nil || len(saved) != len(body) {
+		t.Fatalf("latest payload not saved: %v", err)
+	}
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 1 {
+		t.Fatalf("second request must be refused without calling the vendor: err=%v hits=%d", err, hits)
 	}
 }
