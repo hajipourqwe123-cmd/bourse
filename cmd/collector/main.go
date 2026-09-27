@@ -2,6 +2,9 @@
 //
 //	SOURCE=replay REPLAY_FILE=testdata/synthetic_day.ndjson collector > snaps.ndjson
 //	SOURCE=sourcearena SOURCEARENA_TOKEN=… POLL_INTERVAL=5s collector
+//	                                         # SOURCEARENA_DAILY_LIMIT=n: refuse an interval over the plan quota
+//	                                         # SOURCEARENA_SAVE_LATEST=path: keep the latest raw payload (local vendorcmp -watch)
+//	                                         # SOURCEARENA_BUDGET_FILE=path: the day's request count survives restarts
 //	SOURCE=brsapi BRSAPI_KEY=… POLL_INTERVAL=…  # BRSAPI_TYPES=1[,4], BRSAPI_DAILY_LIMIT=100, BRSAPI_5MIN_LIMIT=300:
 //	                                         # refuses to start if the interval exceeds the plan's quota
 //	BUS=nats NATS_URL=nats://… collector     # publish to JetStream instead of stdout
@@ -50,10 +53,18 @@ func run() int {
 		}
 		src = r
 	case "sourcearena":
-		src = source.NewSourceArena(
+		sa := source.NewSourceArena(
 			config.Str("SOURCEARENA_URL", "https://apis.sourcearena.ir/api/"),
 			os.Getenv("SOURCEARENA_TOKEN"),
 			config.Dur("HTTP_TIMEOUT", 10*time.Second))
+		limit, err := strictInt("SOURCEARENA_DAILY_LIMIT", 0)
+		if err != nil {
+			log.Fatalf("collector: %v", err)
+		}
+		sa.DailyLimit = int(limit)
+		sa.BudgetFile = config.Str("SOURCEARENA_BUDGET_FILE", "")
+		sa.SaveLatest = config.Str("SOURCEARENA_SAVE_LATEST", "")
+		src = sa
 	case "brsapi":
 		cfg, per5, err := brsapiConfig()
 		if err != nil {
@@ -115,11 +126,24 @@ func run() int {
 			"on an unlisted holiday the vendor's previous-day data would be collected as today's (docs/sessions.md)")
 	}
 	_, budgeted := src.(*source.BrsApi)
+	if _, ok := src.(*source.SourceArena); ok {
+		budgeted = true // every attempt costs quota
+	}
 	if b, ok := src.(*source.BrsApi); ok {
 		cfg := b.Config()
 		if err := brsapiBudget(len(cfg.Types), interval, cal.MaxDailySpan(), int64(cfg.DailyLimit), brsPer5); err != nil {
 			log.Printf("collector: %v", err)
 			return 1
+		}
+		brsapiIntervalWarning(interval)
+	}
+	if sa, ok := src.(*source.SourceArena); ok {
+		if err := dailyBudget("SOURCEARENA_DAILY_LIMIT", interval, cal.MaxDailySpan(), int64(sa.DailyLimit)); err != nil {
+			log.Printf("collector: %v", err)
+			return 1
+		}
+		if sa.DailyLimit <= 0 {
+			log.Printf("collector: WARNING: SOURCEARENA_DAILY_LIMIT is not set: nothing stops POLL_INTERVAL=%s from exceeding the plan's daily quota", interval)
 		}
 		brsapiIntervalWarning(interval)
 	}

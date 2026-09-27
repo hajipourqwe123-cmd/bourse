@@ -7,13 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"bourse/internal/model"
+	"bourse/internal/tehran"
 )
 
 // SourceArena polls the vendor's "all instruments" endpoint (?token=…&all&type=0).
@@ -28,6 +32,18 @@ type SourceArena struct {
 	token  string // never logged
 	client *http.Client
 	now    func() time.Time
+
+	// DailyLimit > 0: at most this many requests per Tehran day (plan quota; SOURCEARENA_DAILY_LIMIT).
+	// The vendor enforces the real quota; its refusal is ErrBudget too.
+	DailyLimit int
+	// BudgetFile, if set, keeps the day's request count across restarts (SOURCEARENA_BUDGET_FILE).
+	// An unreadable or corrupt file counts as the whole budget spent (fail closed).
+	BudgetFile string
+	day        string
+	used       int
+	// SaveLatest, if set, receives each successful raw payload (atomic replace) so a LOCAL
+	// comparison (cmd/vendorcmp -watch) can reuse it instead of spending quota. Never commit it.
+	SaveLatest string
 }
 
 // NewSourceArena builds the adapter. token comes from the environment, never from code.
@@ -73,6 +89,14 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if s.token == "" {
 		return nil, fmt.Errorf("sourcearena: SOURCEARENA_TOKEN is not set")
 	}
+	if d := tehran.TradingDay(s.now()); d != s.day {
+		s.day, s.used = d, s.loadUsed(d)
+	}
+	if s.DailyLimit > 0 && s.used >= s.DailyLimit {
+		return nil, fmt.Errorf("sourcearena: %w (%d requests on %s; SOURCEARENA_DAILY_LIMIT=%d)", ErrBudget, s.used, s.day, s.DailyLimit)
+	}
+	s.used++ // every attempt counts: the vendor counts failed ones too
+	s.saveUsed()
 	u := s.base + "?token=" + url.QueryEscape(s.token) + "&all&type=0"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -94,7 +118,110 @@ func (s *SourceArena) Fetch(ctx context.Context) ([]model.Snapshot, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("sourcearena: HTTP %d", resp.StatusCode)
 	}
-	return Parse(body, s.now())
+	if msg, ok := saVendorError(body); ok {
+		msg = redact(msg, s.token)
+		if dailyQuota(msg) {
+			// {"Error":"daily request limit reached"} (seen 2026-09-27 after ~45 requests): the day's
+			// budget is spent whatever our count says, so a restart does not spend another request.
+			if s.DailyLimit > 0 && s.used < s.DailyLimit {
+				s.used = s.DailyLimit
+				s.saveUsed()
+			}
+			return nil, fmt.Errorf("sourcearena: %w: vendor: %q (%d requests counted on %s)", ErrBudget, msg, s.used, s.day)
+		}
+		return nil, fmt.Errorf("sourcearena: vendor error: %q", msg)
+	}
+	snaps, err := Parse(body, s.now())
+	if err == nil && s.SaveLatest != "" {
+		if werr := saveAtomic(s.SaveLatest, body); werr != nil {
+			log.Printf("sourcearena: save latest payload: %v", werr)
+		}
+	}
+	return snaps, err
+}
+
+// Used returns the requests counted on the current Tehran day (quota reporting).
+func (s *SourceArena) Used() (day string, used int) { return s.day, s.used }
+
+// saVendorError recognises the vendor's error object ({"Error": "…"}, sent with HTTP 200).
+func saVendorError(body []byte) (string, bool) {
+	b := bytes.TrimSpace(body)
+	if len(b) == 0 || b[0] != '{' {
+		return "", false
+	}
+	var e map[string]any
+	if json.Unmarshal(b, &e) != nil {
+		return "", false
+	}
+	for _, k := range []string{"Error", "error"} {
+		if v, ok := e[k]; ok {
+			m := fmt.Sprint(v)
+			if len(m) > 200 {
+				m = m[:200]
+			}
+			return m, true
+		}
+	}
+	return "", false
+}
+
+type budgetState struct {
+	Day  string `json:"day"`
+	Used int    `json:"used"`
+}
+
+func (s *SourceArena) loadUsed(day string) int {
+	if s.BudgetFile == "" {
+		return 0
+	}
+	b, err := os.ReadFile(s.BudgetFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	var st budgetState
+	if err == nil {
+		err = json.Unmarshal(b, &st)
+	}
+	if err != nil {
+		log.Printf("sourcearena: budget file unreadable (%v): counting today's budget as spent", err)
+		if s.DailyLimit <= 0 {
+			return 0
+		}
+		// Rewrite it as spent for THIS day only, so the next day starts again instead of being
+		// refused forever.
+		if b, e := json.Marshal(budgetState{Day: day, Used: s.DailyLimit}); e == nil {
+			if werr := saveAtomic(s.BudgetFile, b); werr != nil {
+				log.Printf("sourcearena: rewrite budget file: %v", werr)
+			}
+		}
+		return s.DailyLimit
+	}
+	if st.Day != day {
+		return 0
+	}
+	return st.Used
+}
+
+func (s *SourceArena) saveUsed() {
+	if s.BudgetFile == "" {
+		return
+	}
+	b, _ := json.Marshal(budgetState{Day: s.day, Used: s.used})
+	if err := saveAtomic(s.BudgetFile, b); err != nil {
+		log.Printf("sourcearena: save budget file: %v", err)
+	}
+}
+
+// saveAtomic replaces path with b via a temporary file in the same directory.
+func saveAtomic(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // redact removes secret from msg, also in its URL-encoded forms (a key in a query string shows
@@ -223,4 +350,11 @@ func wholeDecimal(row map[string]json.RawMessage, k string) (int64, bool) {
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
 	return v, err == nil
+}
+
+// dailyQuota reports a vendor error about the DAILY quota. Other limits (per minute, rate) are
+// retryable vendor errors: they must not stop collection for the rest of the day.
+func dailyQuota(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "limit") && (strings.Contains(m, "daily") || strings.Contains(m, "day"))
 }

@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -185,5 +186,108 @@ func TestSourceArenaPriceLimits(t *testing.T) {
 		if s.HasPriceLimits() || !slices.Contains(s.Missing, model.FPriceLimits) {
 			t.Errorf("%s: placeholder, fraction or absent range must be missing: %+v", s.Symbol, s)
 		}
+	}
+}
+
+func TestSourceArenaDailyLimitAndSaveLatest(t *testing.T) {
+	body, err := os.ReadFile("testdata/sourcearena_live_all_type0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write(body)
+	}))
+	defer srv.Close()
+	s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+	s.DailyLimit = 1
+	s.SaveLatest = t.TempDir() + "/latest.json"
+	if _, err := s.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := os.ReadFile(s.SaveLatest); err != nil || len(saved) != len(body) {
+		t.Fatalf("latest payload not saved: %v", err)
+	}
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 1 {
+		t.Fatalf("second request must be refused without calling the vendor: err=%v hits=%d", err, hits)
+	}
+}
+
+func TestSourceArenaVendorLimitIsBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Error":"daily request limit reached"}`)) // live body, 2026-09-27, HTTP 200
+	}))
+	defer srv.Close()
+	s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrBudget) || !strings.Contains(err.Error(), "daily request limit") {
+		t.Fatalf("want ErrBudget with the vendor message, got %v", err)
+	}
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"Error":"request timeout or empty response"}`))
+	}))
+	defer other.Close()
+	s = NewSourceArena(other.URL+"/", "tok", time.Second)
+	if _, err := s.Fetch(context.Background()); err == nil || errors.Is(err, ErrBudget) || !strings.Contains(err.Error(), "vendor error") {
+		t.Fatalf("want a non-budget vendor error, got %v", err)
+	}
+}
+
+func TestSourceArenaBudgetFilePersists(t *testing.T) {
+	body, _ := os.ReadFile("testdata/sourcearena_live_all_type0.json")
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write(body) }))
+	defer srv.Close()
+	file := t.TempDir() + "/budget.json"
+	mk := func() *SourceArena {
+		s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+		s.DailyLimit, s.BudgetFile = 2, file
+		return s
+	}
+	a := mk()
+	a.Fetch(context.Background())
+	b := mk() // a restart
+	b.Fetch(context.Background())
+	if _, err := mk().Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 2 {
+		t.Fatalf("restart must not reset the day's count: err=%v hits=%d", err, hits)
+	}
+	os.WriteFile(file, []byte("{corrupt"), 0o600)
+	if _, err := mk().Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 2 {
+		t.Fatalf("corrupt budget file must fail closed: err=%v hits=%d", err, hits)
+	}
+}
+
+func TestSourceArenaQuotaReplies(t *testing.T) {
+	for msg, daily := range map[string]bool{"daily request limit reached": true, "Day limit exceeded": true,
+		"rate limit exceeded": false, "per-minute limit": false, "request timeout or empty response": false} {
+		if dailyQuota(msg) != daily {
+			t.Errorf("dailyQuota(%q) = %v", msg, !daily)
+		}
+	}
+	// A vendor refusal marks the day spent: a restart must not send another request.
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{"Error":"daily request limit reached"}`))
+	}))
+	defer srv.Close()
+	file := t.TempDir() + "/budget.json"
+	mk := func() *SourceArena {
+		s := NewSourceArena(srv.URL+"/", "tok", time.Second)
+		s.DailyLimit, s.BudgetFile = 40, file
+		return s
+	}
+	mk().Fetch(context.Background())
+	if _, err := mk().Fetch(context.Background()); !errors.Is(err, ErrBudget) || hits != 1 {
+		t.Fatalf("after the vendor refusal a restart must not call it again: err=%v hits=%d", err, hits)
+	}
+	// A corrupt file blocks only its day: it is rewritten for today, and another day starts afresh.
+	os.WriteFile(file, []byte("{bad"), 0o600)
+	s := mk()
+	if _, err := s.Fetch(context.Background()); !errors.Is(err, ErrBudget) {
+		t.Fatalf("corrupt file must fail closed today: %v", err)
+	}
+	if got := s.loadUsed("2099-01-01"); got != 0 {
+		t.Fatalf("another day after a corrupt file: used = %d, want 0", got)
 	}
 }
