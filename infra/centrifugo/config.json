@@ -1,6 +1,6 @@
 {
   "health": true,
-  "allowed_origins": ["http://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1:3000", "http://localhost:3000"],
+  "allowed_origins": ["http://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1:8088", "http://localhost:8088", "http://127.0.0.1:3000", "http://localhost:3000"],
   "namespaces": [
     { "name": "mkt",   "history_size": 20,  "history_ttl": "300s", "force_recovery": true, "allow_subscribe_for_client": true },
     { "name": "radar", "history_size": 50,  "history_ttl": "600s", "force_recovery": true, "allow_subscribe_for_client": true },
