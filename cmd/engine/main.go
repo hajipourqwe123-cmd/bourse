@@ -59,7 +59,12 @@ func main() {
 			log.Fatalf("engine: ENGINE_LEASE_TTL %s is below 3s", ttl)
 		}
 		// Dial only: streams are ensured after the lease is taken (a refused engine changes nothing).
-		js, err := bus.DialJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "engine", bus.DefaultStreams())
+		streams, profile, err := bus.StreamsFromEnv()
+		if err != nil {
+			log.Fatalf("engine: %v", err)
+		}
+		log.Printf("engine: stream profile %s", profile)
+		js, err := bus.DialJetStream(ctx, config.Str("NATS_URL", "nats://127.0.0.1:4222"), "engine", streams)
 		if err != nil {
 			log.Fatalf("engine: %v", err)
 		}

@@ -145,6 +145,12 @@ func redactURL(msg, rawURL string) string {
 // Idempotent.
 func (j *JetStream) EnsureStreams(ctx context.Context) error {
 	for _, s := range j.streams {
+		if st, err := j.js.Stream(ctx, s.Name); err == nil {
+			if c := st.CachedInfo().Config; c.MaxBytes != s.MaxBytes || c.MaxAge != s.MaxAge {
+				log.Printf("jetstream: WARNING: stream %s limits change from %d B / %s to %d B / %s: "+
+					"collector, engine and gateway must use the same STREAM_PROFILE", s.Name, c.MaxBytes, c.MaxAge, s.MaxBytes, s.MaxAge)
+			}
+		}
 		_, err := j.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 			Name:       s.Name,
 			Subjects:   s.Subjects,
