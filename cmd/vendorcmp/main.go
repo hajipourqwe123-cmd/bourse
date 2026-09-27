@@ -6,7 +6,9 @@
 //
 //	BRSAPI_KEY=… SOURCEARENA_TOKEN=… go run ./cmd/vendorcmp -out docs/vendor-comparison.md
 //	go run ./cmd/vendorcmp -brsapi saved.json -sourcearena saved.json -out report.md
-//	BRSAPI_KEY=… go run ./cmd/vendorcmp -watch 5m -sourcearena .local/sourcearena-latest.json //	    -out .local/vendorcmp/latest.md     # LOCAL: every 5 min vs the collector's latest payload
+//	BRSAPI_KEY=… go run ./cmd/vendorcmp -watch 5m -sourcearena .local/sourcearena-latest.json
+//	    # LOCAL: every 5 min vs the collector's latest payload → .local/vendorcmp/{latest.md,runs.ndjson}
+//	go run ./cmd/vendorcmp -score 2026-09-27   # daily Persian vendor scorecard from runs.ndjson
 //
 // Compare payloads of the same moment: with the market open the vendors lag each other by an
 // unmeasured amount (pre-open recording of 2026-09-26), so closed-market payloads give the fair
@@ -25,6 +27,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"bourse/internal/tehran"
 )
 
 func main() {
@@ -37,7 +41,28 @@ func main() {
 	maxBrs := flag.Int("brsapi-max", 90, "watch: BrsApi requests allowed per Tehran day (free plan: 100 AllSymbols/day)")
 	fresh := flag.Duration("fresh", 5*time.Minute, "watch: skip (no BrsApi request) when the SourceArena payload is older than this")
 	sum := flag.String("log", ".local/vendorcmp/runs.ndjson", "watch: NDJSON summary log (counts only)")
+	scoreDay := flag.String("score", "", "write the daily vendor scorecard for this Tehran day (YYYY-MM-DD, or \"today\") from -log")
+	saBudget := flag.String("sa-budget", ".local/sourcearena-budget.json", "score: the collector's SOURCEARENA_BUDGET_FILE")
+	brsLimit := flag.Int("brsapi-limit", 100, "score: BrsApi plan quota per day")
+	saLimit := flag.Int("sa-limit", 0, "score: SourceArena plan quota per day (0 = unknown)")
 	flag.Parse()
+
+	if *scoreDay != "" {
+		day := *scoreDay
+		if day == "today" {
+			day = tehran.TradingDay(time.Now())
+		}
+		watchEvery := *every
+		if watchEvery == 0 {
+			watchEvery = 5 * time.Minute
+		}
+		path, err := writeScore(day, *sum, *brsLimit, *saLimit, *saBudget, watchEvery)
+		if err != nil {
+			log.Fatalf("vendorcmp: score: %v", err)
+		}
+		log.Printf("vendorcmp: scorecard -> %s", path)
+		return
+	}
 
 	if *every > 0 {
 		explicit := false
@@ -52,7 +77,8 @@ func main() {
 			log.Fatalf("vendorcmp: -watch %s: at least 5m (BrsApi free plan)", *every)
 		}
 		log.Printf("vendorcmp: watch every %s, BrsApi <= %d/day, report %s, log %s", *every, *maxBrs, *out, *sum)
-		watch(watchConfig{every: *every, maxBrs: *maxBrs, saFile: *saFile, fresh: *fresh, out: *out, sum: *sum})
+		watch(watchConfig{every: *every, maxBrs: *maxBrs, saFile: *saFile, fresh: *fresh, out: *out, sum: *sum,
+			saBudget: *saBudget, brsLimit: *brsLimit, saLimit: *saLimit})
 		return
 	}
 

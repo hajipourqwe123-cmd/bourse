@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture(t *testing.T, name string) []row {
@@ -212,5 +213,32 @@ func TestWatchBudgetFailsClosed(t *testing.T) {
 	}
 	if c.loadUsed("2026-09-28") != 0 {
 		t.Fatal("a corrupt budget file must block only its own day")
+	}
+}
+
+func TestScorecardCounts(t *testing.T) {
+	dir := t.TempDir()
+	log := dir + "/runs.ndjson"
+	lines := `{"kind":"run","at":"2026-09-27T10:00:00+03:30","fetch_gap_s":10,"brs_rows":10,"sa_rows":9,"joined":9,"only_brs":1,"volume_ahead":{"brsapi":3,"equal":5,"both_zero":1},"traded":{"brsapi":8,"sourcearena":8},"side_mismatch":{"brsapi":2,"sourcearena":6},"brsapi_used_today":1}
+{"kind":"skip","at":"2026-09-27T10:05:00+03:30","reason":"sourcearena_stale 6m0s","brsapi_used_today":1}
+{"kind":"error","at":"2026-09-27T10:10:00+03:30","reason":"brsapi: HTTP 500","brsapi_used_today":2}
+{"at":"2026-09-26T10:00:00+03:30","joined":5,"volume_ahead":{"sourcearena":5}}
+`
+	os.WriteFile(log, []byte(lines), 0o644)
+	os.WriteFile(dir+"/sa.json", []byte(`{"day":"2026-09-27","used":44}`), 0o644)
+	sc, err := score("2026-09-27", log, dir+"/none.json", dir+"/sa.json", 100, 0, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, s := sc.V["brsapi"], sc.V["sourcearena"]
+	if sc.Runs != 1 || sc.Skips != 1 || sc.Errors != 1 || b.Ahead != 3 || s.Ahead != 0 || b.SideMismatch != 2 ||
+		s.SideMismatch != 6 || s.Outages != 1 || b.Errors != 1 || s.QuotaUsed != 44 || b.QuotaUsed != 1 {
+		t.Fatalf("%+v brs=%+v sa=%+v", sc, *b, *s)
+	}
+	md := sc.Markdown()
+	for _, want := range []string{"25.0٪", "75.0٪", "44 از نامعلوم"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("scorecard lacks %q", want)
+		}
 	}
 }

@@ -25,6 +25,9 @@ type watchConfig struct {
 	saFile   string
 	fresh    time.Duration
 	out, sum string
+	// scorecard, rewritten after every round (owner request B)
+	saBudget          string
+	brsLimit, saLimit int
 }
 
 // runSummary is one NDJSON line of the watch log. Kind "run" is a comparison; "skip" and
@@ -167,6 +170,9 @@ func watch(c watchConfig) {
 			if err := once(c, used); err != nil {
 				c.event("error", err.Error(), used)
 			}
+		}
+		if _, err := writeScore(day, c.sum, c.brsLimit, c.saLimit, c.saBudget, c.every); err != nil {
+			log.Printf("vendorcmp: watch: scorecard: %v", err)
 		}
 		time.Sleep(c.every)
 	}
