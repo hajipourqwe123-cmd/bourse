@@ -128,6 +128,10 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 	if n := cfg.Market.Sessions.Unverified(); n > 0 {
 		log.Printf("gateway: WARNING: session calendar has %d rules/holidays not verified against an official source (docs/sessions.md)", n)
 	}
+	if cfg.Market.Sessions.ClassMapProvisional() {
+		log.Printf("gateway: WARNING: the instrument → class mapping (%d instruments) is PROVISIONAL (instruments_verified=false): per-class figures are shown as unverified",
+			cfg.Market.Sessions.Instruments())
+	}
 	// Dial only: the gateway never creates or changes streams.
 	streams, _, err := bus.StreamsFromEnv()
 	if err != nil {

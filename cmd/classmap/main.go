@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,7 +41,9 @@ func main() {
 		log.Fatalf("classmap: %v", err)
 	}
 	var rows []map[string]any
-	if err := json.Unmarshal(body, &rows); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber() // a 17-digit instance_code sent as a JSON number must not lose precision
+	if err := dec.Decode(&rows); err != nil {
 		log.Fatalf("classmap: payload is not a JSON array: %v", err)
 	}
 	m, st := build(rows)
@@ -66,6 +69,7 @@ type stats struct {
 	byClass  map[string]int
 	byGroup  map[string]int
 	unmapped map[string][]string // group → sample symbols
+	dups     []string            // instrument codes seen on more than one row (left unmapped)
 }
 
 // build proposes a class per instrument. Rows without instance_code cannot be keyed and are
@@ -75,9 +79,14 @@ func build(rows []map[string]any) (map[string]string, stats) {
 	m := map[string]string{}
 	for _, r := range rows {
 		code := text(r, "instance_code")
-		g := classmap.Group(text(r, "namad_code"), text(r, "industry_code"), text(r, "full_name"))
+		g := classmap.Group(text(r, "namad_code"), text(r, "industry_code"), text(r, "full_name"), text(r, "name"))
 		if code == "" {
 			g = "بدون کد"
+		}
+		if prev, dup := m[code]; dup && code != "" {
+			st.dups = append(st.dups, code+" ("+prev+")")
+			delete(m, code) // two rows with one code: neither mapping can be trusted
+			g = "کد تکراری"
 		}
 		st.byGroup[g]++
 		cl := classmap.Class(g)
@@ -108,6 +117,9 @@ func (s stats) String() string {
 		}
 		fmt.Fprintf(&b, "  %5d  %s -> %s\n", s.byGroup[k], k, cl)
 	}
+	if len(s.dups) > 0 {
+		fmt.Fprintf(&b, "DUPLICATE instance_code (left unmapped): %s\n", strings.Join(s.dups, ", "))
+	}
 	b.WriteString("unmapped (sample symbols):\n")
 	for _, k := range sortedKeys(s.unmapped) {
 		fmt.Fprintf(&b, "  %s: %s\n", k, strings.Join(s.unmapped[k], "، "))
@@ -134,8 +146,8 @@ func text(r map[string]any, k string) string {
 	switch v := r[k].(type) {
 	case string:
 		return strings.TrimSpace(v)
-	case float64:
-		return fmt.Sprintf("%.0f", v)
+	case json.Number:
+		return v.String()
 	}
 	return ""
 }

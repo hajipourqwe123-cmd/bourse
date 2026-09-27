@@ -15,6 +15,7 @@ const (
 	GroupBond           = "اوراق"
 	GroupSilverFund     = "صندوق نقره"
 	GroupGoldFund       = "صندوق طلا/کالا"
+	GroupOtherCommodity = "صندوق کالایی دیگر (پلاتین، زعفران)"
 	GroupFixedFund      = "صندوق درآمد ثابت"
 	GroupEquityFund     = "صندوق سهامی"
 	GroupOtherFund      = "سایر صندوق‌ها"
@@ -25,13 +26,20 @@ const (
 )
 
 // Group is the proposed group of a row: board by ISIN suffix, funds (sector 68) by name, bonds
-// (69), rights, energy, else stock by market prefix.
+// (69), rights, energy, else stock by market prefix. symbol is the ticker (BrsApi l18,
+// SourceArena name), name the full name (l30, full_name).
 //
 // Names are folded to Persian yeh/kaf first (SourceArena's full_name uses Arabic ي/ك). IRTE
 // ("مبتنی بر کالا") funds are NOT gold: the one live example (2026-09-27) trades in the morning.
-func Group(isin, sector, name string) string {
+// Commodity funds (IRTK) are gold unless the name says «نقره» or the ticker starts with «نقر» or
+// «سیلو» (silver: SourceArena's full names are «صندوق س. کالای …» without the metal), or the
+// ticker is a known non-gold fund (پلاتا platinum, سافرون saffron: no class of their own, so
+// unknown). Live check 2026-09-27: 10 of 48 IRTK funds were not gold by name alone.
+func Group(isin, sector, name, symbol string) string {
 	sector = strings.TrimLeft(strings.TrimSpace(sector), "0")
+	fold := strings.NewReplacer("ي", "ی", "ى", "ی", "ك", "ک", "‌", "", " ", "")
 	name = strings.NewReplacer("ي", "ی", "ى", "ی", "ك", "ک").Replace(name)
+	symbol = fold.Replace(strings.TrimSpace(symbol))
 	switch {
 	case len(isin) == 12 && (isin[8:] == "0002" || isin[8:] == "0003" || isin[8:] == "0004"):
 		return GroupAbnormalPrefix + isin[8:] + ")"
@@ -39,9 +47,11 @@ func Group(isin, sector, name string) string {
 		return GroupEnergy
 	case strings.HasPrefix(isin, "IRR"):
 		return GroupRights
-	case sector == "69" || strings.HasPrefix(isin, "IRB"):
-		return GroupBond
-	case strings.HasPrefix(isin, "IRTK") && strings.Contains(name, "نقره"):
+	case sector == "69" || (len(isin) > 3 && strings.HasPrefix(isin, "IRB") && isin[3] >= '0' && isin[3] <= '9'):
+		return GroupBond // not IRBZ… (capacity certificates)
+	case strings.HasPrefix(isin, "IRTK") && (symbol == "پلاتا" || symbol == "سافرون" || strings.Contains(name, "زعفران")):
+		return GroupOtherCommodity
+	case strings.HasPrefix(isin, "IRTK") && (strings.Contains(name, "نقره") || strings.HasPrefix(symbol, "نقر") || strings.HasPrefix(symbol, "سیلو")):
 		return GroupSilverFund
 	case strings.HasPrefix(isin, "IRTK"):
 		return GroupGoldFund

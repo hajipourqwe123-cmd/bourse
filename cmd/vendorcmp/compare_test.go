@@ -163,7 +163,7 @@ func TestClassAndScrub(t *testing.T) {
 		{"IRR3ARFZ0101", "27", "", "حق تقدم"},
 		{"IRB3TR3307B1", "69", "", "اوراق"},
 	} {
-		if got := class(tc.isin, tc.sector, tc.name); got != tc.want {
+		if got := class(tc.isin, tc.sector, tc.name, ""); got != tc.want {
 			t.Errorf("class(%s) = %s, want %s", tc.isin, got, tc.want)
 		}
 	}

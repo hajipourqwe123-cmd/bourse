@@ -410,11 +410,15 @@ func (s *FieldStat) example(p pair, a, b string) {
 }
 
 // class is the proposed instrument group of a row (internal/classmap, docs/source-mapping.md).
-func class(isin, sector, name string) string { return classmap.Group(isin, sector, name) }
+func class(isin, sector, name, symbol string) string {
+	return classmap.Group(isin, sector, name, symbol)
+}
 
-func brsClass(r row) string { return class(r.text("isin"), r.text("cs_id"), r.text("l30")) }
+func brsClass(r row) string {
+	return class(r.text("isin"), r.text("cs_id"), r.text("l30"), r.text("l18"))
+}
 func saClass(r row) string {
-	return class(r.text("namad_code"), strings.TrimLeft(r.text("industry_code"), "0"), r.text("full_name"))
+	return class(r.text("namad_code"), strings.TrimLeft(r.text("industry_code"), "0"), r.text("full_name"), r.text("name"))
 }
 
 func classes(brs, sa []row, pairs []pair, diff map[string]int) []classCount {
