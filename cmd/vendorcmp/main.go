@@ -40,6 +40,11 @@ func main() {
 	flag.Parse()
 
 	if *every > 0 {
+		explicit := false
+		flag.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "out" })
+		if !explicit { // never overwrite the committed docs/vendor-comparison.md every 5 minutes
+			*out = ".local/vendorcmp/latest.md"
+		}
 		if *saFile == "" || *brsFile != "" {
 			log.Fatalf("vendorcmp: -watch needs -sourcearena <collector latest payload> and a live BrsApi (BRSAPI_KEY), not -brsapi")
 		}
