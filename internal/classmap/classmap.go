@@ -26,8 +26,12 @@ const (
 
 // Group is the proposed group of a row: board by ISIN suffix, funds (sector 68) by name, bonds
 // (69), rights, energy, else stock by market prefix.
+//
+// Names are folded to Persian yeh/kaf first (SourceArena's full_name uses Arabic ي/ك). IRTE
+// ("مبتنی بر کالا") funds are NOT gold: the one live example (2026-09-27) trades in the morning.
 func Group(isin, sector, name string) string {
 	sector = strings.TrimLeft(strings.TrimSpace(sector), "0")
+	name = strings.NewReplacer("ي", "ی", "ى", "ی", "ك", "ک").Replace(name)
 	switch {
 	case len(isin) == 12 && (isin[8:] == "0002" || isin[8:] == "0003" || isin[8:] == "0004"):
 		return GroupAbnormalPrefix + isin[8:] + ")"
@@ -39,7 +43,7 @@ func Group(isin, sector, name string) string {
 		return GroupBond
 	case strings.HasPrefix(isin, "IRTK") && strings.Contains(name, "نقره"):
 		return GroupSilverFund
-	case strings.HasPrefix(isin, "IRTK") || strings.HasPrefix(isin, "IRTE"):
+	case strings.HasPrefix(isin, "IRTK"):
 		return GroupGoldFund
 	case sector == "68":
 		n := strings.TrimSpace(name)

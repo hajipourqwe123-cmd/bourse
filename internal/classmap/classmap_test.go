@@ -24,6 +24,8 @@ func TestGroupAndClass(t *testing.T) {
 		{"IRTKABCD0001", "68", "صندوق نقره فلان", GroupSilverFund, "silver"},
 		{"IRTKABCD0001", "68", "صندوق طلا", GroupGoldFund, "gold"},
 		{"IRB3ABCD0001", "69", "", GroupBond, "fixed_income"},
+		{"IRTEETFD0001", "68", "ص.س. مبتني بر كالاي فارابي", GroupOtherFund, "other_fund"}, // trades in the morning
+		{"IRT1ABCD0001", "68", "صندوق شاخصي فلان", GroupEquityFund, "equity_etf"},          // Arabic yeh folded
 		{"", "", "", GroupUnknown, ""},
 	}
 	for _, c := range cases {
