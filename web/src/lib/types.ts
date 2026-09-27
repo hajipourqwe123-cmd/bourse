@@ -66,6 +66,8 @@ export interface KPI {
   series: Bar[];
   secondary?: { class: ClassName; value: number | null; instruments: number; missing: number; awaiting: number };
   note?: string;
+  /** index_total only: levels in thousandths of a point */
+  index?: { value_milli: number; change_milli: number; equal_weight_milli: number | null; equal_weight_change_milli: number | null; source: string };
 }
 
 export interface Breadth {

@@ -89,7 +89,8 @@ type hub struct {
 }
 
 func newHub(cfg Config, pub publisher, valid func() error, now func() time.Time) *hub {
-	h := &hub{cfg: cfg, pub: pub, valid: valid, now: now, st: market.New(cfg.Market), pending: 4, synIns: map[string]bool{}}
+	h := &hub{cfg: cfg, pub: pub, valid: valid, now: now, st: market.New(cfg.Market), synIns: map[string]bool{}}
+	h.pending = len(h.tails()) // one caught-up signal per tail
 	h.st.SetSynthetic(h.synthetic, cfg.AllowSynthetic)
 	h.st.Advance(tehran.TradingDay(h.now()))
 	return h
@@ -102,7 +103,7 @@ type tail struct {
 	caughtUp       func()
 }
 
-// tails lists the four streams the gateway follows, each from today's Tehran midnight (store
+// tails lists the subjects the gateway follows (four streams; MD for snapshots and indices), each from today's Tehran midnight (store
 // time), so the state of the whole trading day is rebuilt on start.
 func (h *hub) tails() []tail {
 	start := tehran.DayStart(h.now())
@@ -113,6 +114,7 @@ func (h *hub) tails() []tail {
 	}
 	return []tail{
 		mk(bus.StreamMD, "md.snap.>", h.onSnapshot),
+		mk(bus.StreamMD, "md.index.>", h.onIndex),
 		mk(bus.StreamFlow, "flow.>", h.onFlow),
 		mk(bus.StreamAI, "ai.signal.>", h.onSignal),
 		mk(bus.StreamQuality, "quality.>", h.onIssue),
@@ -167,6 +169,16 @@ func (h *hub) onSnapshot(m bus.Msg) {
 		return
 	}
 	h.st.ApplySnapshot(s)
+}
+
+// onIndex applies a market index level (md.index.*); the summary carries it (KPI index_total).
+func (h *hub) onIndex(m bus.Msg) {
+	var ix model.IndexSnapshot
+	if err := json.Unmarshal(m.Data, &ix); err != nil || ix.Index == "" || ix.ValueMilli <= 0 {
+		h.bad(m, err)
+		return
+	}
+	h.st.ApplyIndex(ix)
 }
 
 func (h *hub) onFlow(m bus.Msg) {

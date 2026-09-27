@@ -73,7 +73,7 @@ func TestFlushWaitsForRebuild(t *testing.T) {
 	if err := h.flush(context.Background()); err != nil || len(p.pubs) != 0 {
 		t.Fatalf("published %d before the rebuild completed", len(p.pubs))
 	}
-	for i := 0; i < 4; i++ {
+	for range h.tails() {
 		h.caughtUp()
 	}
 	_ = h.flush(context.Background())
@@ -91,7 +91,7 @@ func TestFlushWaitsForRebuild(t *testing.T) {
 }
 
 func ready(h *hub) {
-	for i := 0; i < 4; i++ {
+	for range h.tails() {
 		h.caughtUp()
 	}
 }

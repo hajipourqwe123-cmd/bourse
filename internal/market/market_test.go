@@ -883,3 +883,28 @@ func TestQueuesFromLevelOne(t *testing.T) {
 		t.Errorf("no data must be unavailable with a reason: %+v", q)
 	}
 }
+
+func TestIndexKPI(t *testing.T) {
+	st := testState()
+	if k := st.Summary().KPIs[0]; k.ID != "index_total" || k.Available || k.Reason == "" {
+		t.Fatalf("no index yet: must be unavailable with a reason: %+v", k)
+	}
+	ix := model.IndexSnapshot{Index: "bourse_total", Source: "sourcearena", SourceTime: at("10:00:00"), IngestTime: at("10:00:00"),
+		SourceTimeEstimated: true, ValueMilli: 7_159_333_680, ChangeMilli: -97_708_820, Missing: []string{"equal_weight"}}
+	st.ApplyIndex(ix)
+	older := ix
+	older.SourceTime, older.ValueMilli = at("09:00:00"), 1
+	st.ApplyIndex(older) // older level: ignored
+	k := st.Summary().KPIs[0]
+	if !k.Available || k.Index == nil || k.Index.ValueMilli != 7_159_333_680 || k.Index.ChangeMilli != -97_708_820 ||
+		!k.Est || !k.AsOf.Equal(at("10:00:00")) || k.Index.EqualWeightMilli != nil {
+		t.Fatalf("index KPI: %+v %+v", k, k.Index)
+	}
+	yesterday := ix
+	yesterday.SourceTime = at("10:00:00").Add(-24 * time.Hour)
+	st2 := testState()
+	st2.ApplyIndex(yesterday)
+	if st2.Summary().KPIs[0].Available {
+		t.Error("a level of another day must not show as today's")
+	}
+}

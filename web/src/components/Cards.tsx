@@ -79,6 +79,7 @@ function KpiCard({ k }: { k: KPI }) {
       </section>
     );
   }
+  if (k.index) return <IndexCard k={k} />;
   const rs = rowSession(s.state?.sessions ?? [], k.classes ?? []);
   const st = statusText(rs, now);
   const bars = k.series.slice(-8);
@@ -112,6 +113,47 @@ function KpiCard({ k }: { k: KPI }) {
         {k.missing > 0 && <span className="chip chip-muted">داده ناقص: {num(k.missing)} نماد</span>}
         {k.awaiting > 0 && <span className="chip chip-warn">در انتظار بازنشانی منبع: {num(k.awaiting)} نماد</span>}
         {k.note && <span className="chip chip-warn">{k.note}</span>}
+      </div>
+    </section>
+  );
+}
+
+/** Total index: level, change vs yesterday, equal-weight index; «زمان تقریبی» when the vendor sent no time. */
+function IndexCard({ k }: { k: KPI }) {
+  const ix = k.index!;
+  const pts = (m: number) => num(m / 1000, 2);
+  const chg = (level: number, change: number) => {
+    const prev = level - change;
+    const pctv = prev > 0 ? (100 * change) / prev : 0;
+    return (
+      <span className={change > 0 ? "up" : change < 0 ? "down" : undefined}>
+        <span className="num">{signedNum(change / 1000, 2)}</span> (<span className="num">{signedNum(pctv, 2)}٪</span>)
+      </span>
+    );
+  };
+  return (
+    <section className="card" aria-label={KPI_TITLE[k.id]} data-testid={`kpi-${k.id}`}>
+      <div className="card-head">
+        <h2 className="t-label" style={{ margin: 0 }}>{KPI_TITLE[k.id]}</h2>
+        <span className="end"><MethodLink anchor="kpi" /></span>
+      </div>
+      <div className="kpi-value">
+        <span className="t-kpi num">{pts(ix.value_milli)}</span>
+      </div>
+      <span className="t-label">{chg(ix.value_milli, ix.change_milli)}</span>
+      <span className="t-label">
+        هم‌وزن:{" "}
+        {ix.equal_weight_milli === null || ix.equal_weight_change_milli === null ? (
+          <NA />
+        ) : (
+          <>
+            <span className="num">{pts(ix.equal_weight_milli)}</span> {chg(ix.equal_weight_milli, ix.equal_weight_change_milli)}
+          </>
+        )}
+      </span>
+      <div className="card-foot">
+        <Age at={k.as_of} />
+        {k.est && <span className="chip chip-muted" title="فروشنده زمان شاخص را نمی‌فرستد؛ زمان دریافت نمایش داده می‌شود">زمان تقریبی</span>}
       </div>
     </section>
   );

@@ -3,6 +3,7 @@
 | موضوع (NATS subject) | محتوا (نوع Go) | تولیدکننده | مصرف‌کننده |
 | --- | --- | --- | --- |
 | `md.snap.<ins_code>` | `model.Snapshot` | collector | engine، writer ClickHouse |
+| `md.index.<name>` (مثلاً `md.index.bourse_total`) | `model.IndexSnapshot` (سطح شاخص × ۱۰۰۰، بدون float) | collector (`INDEX_EVERY`) | gateway |
 | `flow.event.<ins_code>` | `model.FlowEvent` | engine | gateway، alerts، writer |
 | `flow.game.<ins_code>` | `model.GameTotals` | engine | gateway، writer |
 | `flow.10m.<ins_code>` | `model.TenMinute` | engine | gateway، writer |
@@ -19,7 +20,7 @@
 
 | جریان | موضوع‌ها | نگهداری | سقف حجم | هنگام پر شدن |
 | --- | --- | --- | --- | --- |
-| `MD` | `md.snap.>` | ۴۸ ساعت | 20 GiB | حذف قدیمی‌ترین (`DiscardOld`) + ثبت در لاگ |
+| `MD` | `md.snap.>`، `md.index.>` | ۴۸ ساعت | 20 GiB | حذف قدیمی‌ترین (`DiscardOld`) + ثبت در لاگ |
 | `FLOW` | `flow.>` | ۴۸ ساعت | 10 GiB | همان |
 | `AI` | `ai.signal.>` | ۴۸ ساعت | 1 GiB | همان |
 | `QUALITY` | `quality.>` | ۴۸ ساعت | 6 GiB | همان |
