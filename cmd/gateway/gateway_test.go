@@ -172,7 +172,11 @@ func TestGatewayEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer js.Close()
-	now := time.Now()
+	// The gateway's clock is pinned inside the stock session (advancing in real time): on the wall
+	// clock the pre-open carryover rule dropped every snapshot when CI ran before the open.
+	start := time.Now()
+	clock := func() time.Time { return tehranAt("10:00").Add(time.Since(start)) }
+	now := clock()
 	for _, s := range []model.Snapshot{snapAt("S1", now.Add(-2*time.Minute), 1010, 5_000), snapAt("S2", now.Add(-2*time.Minute), 1000, 7_000),
 		snapAt("SYNTHETIC0001", now.Add(-2*time.Minute), 1, 1)} {
 		if err := js.Publish(bus.SubjSnapshot(s.InsCode), s); err != nil {
@@ -191,6 +195,7 @@ func TestGatewayEndToEnd(t *testing.T) {
 	cs := httptest.NewServer(cent)
 	defer cs.Close()
 	cfg := testConfig(natsURL, cs.URL)
+	cfg.Now = clock
 	ready := make(chan string, 1)
 	errc := make(chan error, 1)
 	gctx, gcancel := context.WithCancel(ctx)
