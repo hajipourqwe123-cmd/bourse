@@ -23,7 +23,7 @@ var devOrigins = map[string]bool{"http://localhost:3000": true, "http://127.0.0.
 func serve(cfg Config, h *hub) (*http.Server, string, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if _, ok := h.state(time.Now()); !ok {
+		if _, ok := h.state(h.now()); !ok {
 			http.Error(w, "rebuilding state", http.StatusServiceUnavailable)
 			return
 		}
@@ -31,10 +31,10 @@ func serve(cfg Config, h *hub) (*http.Server, string, error) {
 	})
 	mux.HandleFunc("GET /api/v1/time", func(w http.ResponseWriter, _ *http.Request) {
 		// Server wall clock (unix ms) for the browser's clock-offset estimate (NTP-style, RTT/2).
-		writeJSON(w, map[string]int64{"now": time.Now().UnixMilli()})
+		writeJSON(w, map[string]int64{"now": h.now().UnixMilli()})
 	})
 	mux.HandleFunc("GET /api/v1/state", func(w http.ResponseWriter, _ *http.Request) {
-		st, ok := h.state(time.Now())
+		st, ok := h.state(h.now())
 		if !ok {
 			http.Error(w, "rebuilding state", http.StatusServiceUnavailable)
 			return

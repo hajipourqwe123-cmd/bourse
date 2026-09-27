@@ -48,7 +48,8 @@ type Config struct {
 	AllowSynthetic bool
 	StaleAfter     time.Duration
 	Market         market.Config
-	Tick           time.Duration // publish period
+	Tick           time.Duration    // publish period
+	Now            func() time.Time // nil (always, in production) = the wall clock; tests pin it
 }
 
 func loadConfig() (Config, error) {
@@ -146,7 +147,11 @@ func run(ctx context.Context, cfg Config, ready chan<- string) error {
 		_ = lease.Release(rctx)
 	}()
 
-	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, time.Now)
+	now := time.Now
+	if cfg.Now != nil {
+		now = cfg.Now
+	}
+	h := newHub(cfg, newCentrifugo(cfg.CentrifugoAPI, cfg.CentrifugoKey), lease.Valid, now)
 	h.store = js
 	h.loadPrevTotals(ctx)
 	ctx, cancel := context.WithCancel(ctx)
