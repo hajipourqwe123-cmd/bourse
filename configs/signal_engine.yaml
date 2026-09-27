@@ -1,0 +1,208 @@
+# Radar signal engine — default configuration.
+# Spec: docs/signal-engine-spec.md (v1.0) · Decision: docs/adr/0006-signal-engine.md
+#
+# Every threshold below is an INITIAL CALIBRATION VALUE, not a validated result.
+# Rule codes (U1, G1, X3, ...) refer to the spec. Money is rial (int64). Percents are plain
+# numbers (5 = 5%). Percentiles are 0..100. Day counts are trading days.
+# The loader is fail-closed: unknown key, missing key or out-of-range value => engine refuses to start.
+# config_hash (content hash of this file) is stamped on every feature row, signal, outcome and trial.
+
+meta:
+  config_version: "1.0.0"
+  spec_version: "1.0"
+  trading_days_per_year: 240
+
+strategies:
+  S1: {enabled: true, horizon_days: 10}   # swing; primary MVP strategy
+  S2: {enabled: false, horizon_days: 40}  # wave; enable only after S1 passes gate SG-G1
+
+costs:                                    # L5, B10 — verify against the broker's current schedule (Q-SG8)
+  buy_pct: 0.3712                         # TODO(verify)
+  sell_pct: 0.8812                        # TODO(verify) includes sell tax
+  slippage_pct: 0.10
+
+session:                                  # J1 — Tehran time; verify current exchange hours (Q-SG8)
+  open: "09:00"
+  close: "12:30"
+  no_entry_first_min: 15
+  no_entry_last_min: 10
+
+data:
+  history_min_days: 480                   # SG-G0
+  second_source_enabled: false            # D2 is reported as "suspended" until true
+  reconcile_tolerance_pct: 0.5            # D2
+  adjustment_method: capital_and_dividend # D4: capital_only | capital_and_dividend
+  bar_minutes: 1                          # D3
+  price_limit_source: feed                # D5: feed | rules_table (never guessed)
+
+universe:
+  lookback_days: 60                       # U1
+  min_trading_days: 45                    # U1
+  min_value_pctile: 40                    # U2: ADV20 percentile among symbols traded in the last 20 days
+  min_free_float_pct: 15                  # U3
+  halt_min_days: 10                       # U4: a halt at least this long triggers the cooldown
+  post_halt_cooldown_days: 3              # U4
+  event_blackout_days_s1: 5               # U5
+
+regime:
+  inputs:
+    R1: {enabled: true, ma_days: 50, up_pct: 55, down_pct: 40}
+    R2: {enabled: true, windows: [5, 20]}
+    R3: {enabled: true, ma_days: 50, slope_days: 10}
+    R4: {enabled: false, window_days: 10, deadband_pct: 0.1}          # needs fund module (Sprint 4)
+    R5: {enabled: false, window_days: 20, direction_verified: false}  # needs FX + bond-yield feed
+  risk_on_min_score: 0.6                  # score = sum(enabled inputs) / count(enabled inputs)
+  risk_off_max_score: -0.6
+  upgrade_confirm_days: 2                 # R6: upgrades need N consecutive days; downgrades are immediate
+  states:                                 # "unknown" (an enabled input is missing) => no new entries
+    risk_on:  {max_positions: 8, risk_per_trade_pct: 0.5,  size_mult: 1.0, patterns: [G1, G2, G3, G4, G5]}
+    neutral:  {max_positions: 4, risk_per_trade_pct: 0.35, size_mult: 1.0, patterns: [G1, G2, G5]}
+    risk_off: {max_positions: 2, risk_per_trade_pct: 0.35, size_mult: 0.5, patterns: [G4], requires_improving_days: 2}
+
+industry:
+  grouping: driver_group                  # D7: official | driver_group
+  min_active_members: 3                   # I3
+  rs_windows: [20, 60]                    # I1
+  flow_window_days: 5                     # I1
+  allowed_min_igr: 70                     # I2
+  rotation_delta: 25                      # I2
+  rotation_window_days: 10                # I2
+  leaders_per_group: 2                    # I4
+  leader_rank_window_days: 10             # I4
+
+features:
+  adv_window_days: 20                     # ADV20 excludes day t
+  flow:
+    window_days: 5                        # F1, F3
+    min_valid_days: 4                     # F1: fewer valid days in the window => missing
+    persistence_buyer_power: 1.2          # F3
+    f4_enabled: false                     # F4: only after task Q-02 measures hot-money accuracy on real data
+  reaction:
+    rvol_baseline_days: 20                # P1
+    rvol_min_valid_days: 15               # P1
+    ad_window_days: 65                    # P4
+    ad_min_valid_days: 50                 # P4
+    er_window_days: 5                     # P5
+  trend:
+    rs_weights:                           # T1: horizon (days) -> weight; weights sum to 1
+      S1: {"20": 0.5, "60": 0.3, "120": 0.2}
+      S2: {"60": 0.4, "120": 0.2, "180": 0.2, "240": 0.2}
+    gate_S1: {fast_ma: 20, slow_ma: 50, slope_days: 10}
+    gate_S2: {ma_short: 50, ma_mid: 150, ma_long: 200, long_slope_days: 20,
+              min_above_low_pct: 30, max_below_high_pct: 25, min_rs_pctile: 70, range_days: 240}
+    atr_short: 10                         # T3
+    atr_long: 50                          # T3
+    vol_short: 10                         # T3
+    vol_long: 50                          # T3
+    high_windows: [60, 240]               # T4
+    atr_risk: 14                          # K1, J2, Z1, X1..X5
+  event:
+    surprise_base_months: 3               # E1
+    e3_enabled: false                     # E3 needs a fundamentals source
+
+normalization:
+  min_cross_section: 80                   # C1: fewer symbols with a value => no percentile that day
+  winsor_pct: [1, 99]                     # C1: raw aggregates and model export only (ranks are unaffected)
+
+combine:
+  families:                               # C2: a family is missing if ANY configured member is missing
+    flow:     [F1_nrf_5d, F2_buyer_power, F3_flow_persistence]   # add F4_large_flow_rel after Q-02
+    reaction: [P1_rvol_day, P2_clv, P3_last_vs_final, P4_ad_rating]
+    trend:    [T1_rs_rating, T3_contraction, T4_dist_high]
+    event:    [E1_sales_surprise]
+  required_families: [flow, reaction, trend]   # C3
+  family_min_pctile: 60                        # C3
+  ranking: geometric_mean                      # C4
+  ev_rule: {enabled: false, min_net_pct: {S1: 1.0, S2: 2.5}}  # C5: only after AI-04 (ADR-0005 tier 2)
+  max_per_driver_group: 2                      # C7
+
+patterns:
+  G1:                                     # accumulation breakout
+    enabled: true
+    strategy: S1
+    size_mult: 1.0
+    setup: {ad_min_pctile: 70, persistence_min: 3, atr_ratio_max: 0.75, vol_dryup_max: 0.9, ret_5d_max_pct: 8}
+    trigger: {level_days: 20, rvol_slot_min: 1.5, require_last_above_final: true}
+  G2:                                     # breakout with the industry
+    enabled: true
+    strategy: S1
+    size_mult: 1.0
+    setup: {igr_min: 70, rs_min_pctile: 80}
+    trigger: {level_days: 60, rvol_slot_min: 2.0, clv_min: 0.6, max_entry_above_level_atr: 1.0}
+  G3:                                     # laggard of a leading group
+    enabled: false                        # needs driver groups (D7) and leader tags (I4)
+    strategy: S1
+    size_mult: 0.75
+    setup: {igr_min: 80, leaders_ret_10d_min_pct: 10, laggard_max_rs_pctile_in_group: 50,
+            above_ma: 50, flow_min_pctile: 60, flow_rising_days: 3}
+    trigger: {require_last_above_final: true, require_above_prev_high: true}
+  G4:                                     # sell-queue reversal
+    enabled: false                        # needs an order-book source (Q-SG6)
+    strategy: S1
+    size_mult: 0.5
+    setup: {down_lock_days_min: 2, down_lock_window_days: 5, drawdown_pct: 15, drawdown_days: 10}
+    trigger: {queue_shrink_max_ratio: 0.3, buyer_power_min: 1.5, clv_min: 0.5, require_last_above_final: true}
+  G5:                                     # reaction to a monthly-report surprise
+    enabled: false                        # needs Codal reports with publish time (Q-SG5) and S2
+    strategy: S2
+    size_mult: 0.75
+    setup: {surprise_min_pctile: 85, max_days_since_publish: 2, flow_nrf_min_pctile: 70}
+    trigger: {first_executable_bar: true}
+
+anti_manipulation:
+  M1: {free_float_max_pct: 25, rvol_day_min: 5, ret_3d_min_pct: 10}
+  M2: {nrf_5d_min_pctile: 70, er_5d_max_pct: 0, ai02_window_days: 2, ai02_absorption_min: 2}
+  M3: {seller_count_growth_min: 1.2, seller_baseline_days: 5, buyer_power_min: 1.5, weak_days: 2}
+  M4: {enabled: false, block_share_max_pct: 30}       # needs block/negotiated-trade data (Q-SG7)
+  M5: {veto_no_real_flow_with_market_maker: true}
+  M6: {alert_window_min: 30, max_move_atr: 0.5, pullback_atr: 0.25}  # own published alerts only (repo rule 6)
+
+execution:
+  limit_ceiling_atr: 0.5                  # J2
+  tranche_split: [0.6, 0.4]               # J3
+  armed_expiry_days: {S1: 1, S2: 3}       # J4
+
+sizing:
+  risk_tail_pct: 1.5                      # Z1
+  gap_days: 3                             # Z1: g = gap_days × daily lower-limit percent
+  liquidity_cap_adv_pct: 5                # Z1
+  max_open_risk_pct: 3.0                  # Z2
+  max_group_capital_pct: 30               # Z2
+  min_order_value_rial: 0                 # Z3: 0 = off; TODO set with the product owner
+
+exits:
+  stop_lookback_days: 5                   # X1
+  max_stop_atr: 2.5                       # X1
+  time_stop_days: {S1: 5, S2: 15}         # X2
+  time_stop_min_r: 1.0                    # X2
+  flow_reversal: {days: 2, buyer_power_max: 0.8}   # X3
+  queue_collapse_ratio: 0.4               # X4 (needs order book)
+  partial_at_r: 2.0                       # X5
+  partial_fraction: 0.333                 # X5
+  trail_ma: {S1: 10, S2: 20}              # X5
+  trail_atr: 2.5                          # X5
+  regime_off_min_r: 1.0                   # X7
+
+labeling:
+  target_r: 2.0                           # L2
+  stop_r: 1.0                             # L2
+  both_hit_same_day: stop_first           # L3
+
+backtest:
+  train_months: 24                        # B4
+  test_months: 3                          # B4
+  embargo: horizon                        # B4: embargo = strategy horizon H
+  holdout_months: 6                       # B5
+  baseline: rs_rvol                       # B7
+  benchmark: fixed_income_funds           # B10: excess return is measured against this
+
+scoreboard:
+  window_signals: 30                      # S1
+  suspend_expectancy_r_below: 0.0         # S3
+  suspend_z_below: -2.0                   # S3
+  reactivate_paper_signals: 20            # S4
+
+output:
+  show_probability: false                 # O2: true only after AI-04 passes the ADR-0005 shadow period
+  near_miss_min_family_pctile: 50         # O4
+  publish_to_users: false                 # O5: requires gate SG-G2 and legal clearance (O-4)
