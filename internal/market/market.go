@@ -165,11 +165,12 @@ type Breadth struct {
 	Missing     int       `json:"missing"`     // no last price or no yesterday price
 	Untraded    int       `json:"untraded"`    // no trade today: not in the buckets
 	Awaiting    int       `json:"awaiting"`    // awaiting a source reset: not in the buckets
-	Floor       int       `json:"floor"`       // last ≤ the −3 % limit price  («در کف دامنه»)
+	NoLimits    int       `json:"no_limits"`   // traded, but no usable permitted range: not in the buckets
+	Floor       int       `json:"floor"`       // last ≤ the day's lower limit price  («در کف دامنه»)
 	Down        int       `json:"down"`        // below yesterday, above the floor
 	Flat        int       `json:"flat"`        // last = yesterday
 	Up          int       `json:"up"`          // above yesterday, below the ceiling
-	Ceil        int       `json:"ceil"`        // last ≥ the +3 % limit price  («در سقف دامنه»)
+	Ceil        int       `json:"ceil"`        // last ≥ the day's upper limit price  («در سقف دامنه»)
 	AsOf        time.Time `json:"as_of"`
 	Est         bool      `json:"est,omitempty"`
 }
@@ -757,20 +758,18 @@ func later(a, b time.Time) time.Time {
 	return a
 }
 
-// bucket places a traded stock in the breadth buckets. The ±3 % limit prices are rounded to the
-// rial like the exchange's (ceiling ⌊1.03·y⌋, floor ⌈0.97·y⌉), so an instrument sitting at its
-// limit price counts as at the limit; exact integer arithmetic, no float edges.
-func (b *Breadth) bucket(last, y int64) {
-	ceilP := 103 * y / 100
-	floorP := (97*y + 99) / 100
+// bucket places a traded stock in the breadth buckets relative to its own permitted range
+// [lo, hi] of the day (the vendor's دامنه مجاز, rial): at the ceiling when last ≥ hi, at the
+// floor when last ≤ lo, otherwise by the sign of last − yesterday. Exact integers.
+func (b *Breadth) bucket(last, y, lo, hi int64) {
 	switch {
 	case last == y:
 		b.Flat++
-	case last > y && last >= ceilP:
+	case last > y && last >= hi:
 		b.Ceil++
 	case last > y:
 		b.Up++
-	case last <= floorP:
+	case last <= lo:
 		b.Floor++
 	default:
 		b.Down++
@@ -866,8 +865,8 @@ func (s *State) Summary() Summary {
 				}
 			}
 		}
-		// Breadth: stock class only (other classes have different daily price limits); only
-		// instruments that traded today.
+		// Breadth: stock class only; only instruments that traded today; each placed by its OWN
+		// permitted range of the day (base market and rights have other limits than ±3 %).
 		if in.class == Stock {
 			br.Instruments++
 			switch {
@@ -875,8 +874,10 @@ func (s *State) Summary() Summary {
 				br.Missing++
 			case !in.everTraded:
 				br.Untraded++
+			case !sn.HasPriceLimits() || sn.PriceLimitMax <= sn.PriceLimitMin:
+				br.NoLimits++ // no usable range (source lacks it, or a fixed-price board): no guess
 			default:
-				br.bucket(sn.PriceLast, sn.PriceYesterday)
+				br.bucket(sn.PriceLast, sn.PriceYesterday, sn.PriceLimitMin, sn.PriceLimitMax)
 				br.AsOf = later(br.AsOf, sn.SourceTime)
 				br.Est = br.Est || sn.SourceTimeEstimated
 			}

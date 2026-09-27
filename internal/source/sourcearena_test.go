@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -109,8 +110,11 @@ func TestParseLiveSample(t *testing.T) {
 		f.IndBuyCount != 2232 || f.InstBuyCount != 24 || f.IndSellCount != 4728 || f.InstSellCount != 27 {
 		t.Fatalf("فولاد mapping: %+v", f)
 	}
-	// Book and price limits are in the payload but not mapped yet: reported missing, never zero.
-	if f.Has(model.FBook) || f.Has(model.FPriceLimits) || !f.SourceTimeEstimated {
+	// Price limits are mapped from the decimal strings; the book is not mapped yet: missing, never zero.
+	if !f.HasPriceLimits() || f.PriceLimitMin != 3170 || f.PriceLimitMax != 3350 {
+		t.Errorf("فولاد limits: %d..%d", f.PriceLimitMin, f.PriceLimitMax)
+	}
+	if f.Has(model.FBook) || !f.SourceTimeEstimated {
 		t.Errorf("فولاد flags: %v", f.Missing)
 	}
 	// A suspended instrument and one with no trade date still parse (by instance_code).
@@ -161,5 +165,25 @@ func TestSourceArenaRedirectAndErrors(t *testing.T) {
 	defer vendorErr.Close()
 	if _, err := NewSourceArena(vendorErr.URL+"/api/", saTestToken, time.Second).Fetch(context.Background()); err == nil {
 		t.Fatal("vendor error object accepted as data")
+	}
+}
+
+func TestSourceArenaPriceLimits(t *testing.T) {
+	body := []byte(`[
+		{"instance_code":"1","name":"a","daily_price_low":"3170.00","daily_price_high":"3350.00","trade_volume":"1"},
+		{"instance_code":"2","name":"energy","daily_price_low":"1.00","daily_price_high":"999999999.00","trade_volume":"1"},
+		{"instance_code":"3","name":"frac","daily_price_low":"3170.50","daily_price_high":"3350.00","trade_volume":"1"},
+		{"instance_code":"4","name":"none","trade_volume":"1"}]`)
+	snaps, err := Parse(body, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := snaps[0]; !s.HasPriceLimits() || s.PriceLimitMin != 3170 || s.PriceLimitMax != 3350 {
+		t.Fatalf("limits not mapped: %+v", s)
+	}
+	for _, s := range snaps[1:] {
+		if s.HasPriceLimits() || !slices.Contains(s.Missing, model.FPriceLimits) {
+			t.Errorf("%s: placeholder, fraction or absent range must be missing: %+v", s.Symbol, s)
+		}
 	}
 }

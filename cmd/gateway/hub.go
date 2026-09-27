@@ -411,6 +411,7 @@ type stateMsg struct {
 	Day                string               `json:"day"`
 	Sessions           []market.SessionInfo `json:"sessions"`
 	CalendarUnverified bool                 `json:"calendar_unverified"`
+	ClassMapUnverified bool                 `json:"class_map_unverified"`
 	HotThreshold       int64                `json:"hot_threshold"`
 	PlusThreshold      int64                `json:"plus_threshold"`
 	StaleAfterMs       int64                `json:"stale_after_ms"`
@@ -433,6 +434,7 @@ func (h *hub) state(now time.Time) (stateMsg, bool) {
 		Seq: h.seq, Now: now, Day: h.st.Day(),
 		Sessions:           market.Sessions(h.cfg.Market.Sessions, now),
 		CalendarUnverified: h.cfg.Market.Sessions.Unverified() > 0,
+		ClassMapUnverified: h.cfg.Market.Sessions.ClassMapProvisional(),
 		HotThreshold:       h.cfg.Market.HotThreshold, PlusThreshold: h.cfg.Market.PlusThreshold,
 		StaleAfterMs: h.cfg.StaleAfter.Milliseconds(), CentrifugoWS: h.cfg.CentrifugoWS, DevToken: h.cfg.DevToken,
 		Summary: h.st.Summary(), Rows: h.st.Rows(), Radar: h.st.Radar(),

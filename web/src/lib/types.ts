@@ -74,6 +74,8 @@ export interface Breadth {
   missing: number;
   untraded: number;
   awaiting: number;
+  /** traded, but no usable permitted range (source lacks it, or fixed-price board): not in the buckets */
+  no_limits?: number;
   floor: number;
   down: number;
   flat: number;
@@ -133,6 +135,8 @@ export interface State {
   day: string;
   sessions: SessionInfo[];
   calendar_unverified: boolean;
+  /** instrument → class mapping is provisional (derived from vendor names/ISIN, not an official list) */
+  class_map_unverified?: boolean;
   hot_threshold: number;
   plus_threshold: number;
   stale_after_ms: number;

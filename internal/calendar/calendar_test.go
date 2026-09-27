@@ -1,6 +1,7 @@
 package calendar
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -185,5 +186,25 @@ func TestSpanAndHolidays(t *testing.T) {
 	}
 	if Default().HolidaysBetween(at("2026-01-01", "00:00:00"), at("2027-12-31", "00:00:00")) != 0 {
 		t.Fatal("embedded calendar gained holidays: update docs/sessions.md")
+	}
+}
+
+func TestClassMapProvisional(t *testing.T) {
+	if Default().ClassMapProvisional() {
+		t.Fatal("embedded calendar claims nothing about its mapping: not provisional")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(EmbeddedJSON(), &m); err != nil {
+		t.Fatal(err)
+	}
+	m["instruments_verified"] = false
+	m["instruments"] = map[string]string{"123": "stock"}
+	b, _ := json.Marshal(m)
+	c, err := Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ClassMapProvisional() || c.Class("123") != "stock" || c.Instruments() != 1 {
+		t.Fatalf("provisional=%v class=%s n=%d", c.ClassMapProvisional(), c.Class("123"), c.Instruments())
 	}
 }

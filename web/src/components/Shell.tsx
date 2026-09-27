@@ -114,6 +114,11 @@ export function DataHealth() {
         </span>
       )}
       {s.state?.calendar_unverified && <span className="chip chip-warn" style={{ alignSelf: "flex-start" }}>تقویم جلسات تأییدنشده</span>}
+      {s.state?.class_map_unverified && (
+        <span className="chip chip-warn" style={{ alignSelf: "flex-start" }} title="کلاس هر نماد از نام و ISIN فروشنده حدس زده شده است، نه از فهرست رسمی">
+          نگاشت کلاس نمادها تأییدنشده
+        </span>
+      )}
       {s.summary && !s.summary.carryover_check.ok && (
         <span
           className="chip chip-warn"
