@@ -52,7 +52,7 @@ type BrsApiConfig struct {
 const BrsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 // ErrBudget: the day's request budget (plan quota) is used up; nothing was sent.
-var ErrBudget = errors.New("brsapi: daily request budget reached")
+var ErrBudget = errors.New("daily request budget reached")
 
 // NewBrsApi builds the adapter. Redirects are not followed: they would carry the key-bearing
 // query to another URL (and into error messages).
@@ -109,7 +109,7 @@ func (b *BrsApi) take(n int) error {
 		b.day, b.used = d, 0
 	}
 	if b.used+n > b.cfg.DailyLimit {
-		return fmt.Errorf("%w (%d requests on %s, %d more needed; BRSAPI_DAILY_LIMIT=%d)", ErrBudget, b.used, b.day, n, b.cfg.DailyLimit)
+		return fmt.Errorf("brsapi: %w (%d requests on %s, %d more needed; BRSAPI_DAILY_LIMIT=%d)", ErrBudget, b.used, b.day, n, b.cfg.DailyLimit)
 	}
 	b.used += n
 	return nil

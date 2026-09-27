@@ -96,3 +96,20 @@ func TestBrsApiConfigTypes(t *testing.T) {
 		t.Fatal("unverified type accepted")
 	}
 }
+
+func TestDailyBudget(t *testing.T) {
+	span := 9*time.Hour + 35*time.Minute // 34,500 s
+	if err := dailyBudget("X", 90*time.Second, span, 500); err != nil {
+		t.Fatalf("90 s = 384/day fits 500: %v", err)
+	}
+	err := dailyBudget("X", 60*time.Second, span, 500) // 576/day
+	if err == nil || !strings.Contains(err.Error(), "POLL_INTERVAL>=70s") {
+		t.Fatalf("want refusal naming 70s, got %v", err)
+	}
+	if err := dailyBudget("X", 70*time.Second, span, 500); err != nil {
+		t.Fatalf("the named interval must fit: %v", err)
+	}
+	if err := dailyBudget("X", time.Second, span, 0); err != nil {
+		t.Fatalf("no limit set: %v", err)
+	}
+}
