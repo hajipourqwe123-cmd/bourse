@@ -850,3 +850,36 @@ func TestReferenceEdgeCases(t *testing.T) {
 		t.Errorf("legacy entry Seen = %q, want the record's day", fresh.prev["S9"].Seen)
 	}
 }
+
+func TestQueuesFromLevelOne(t *testing.T) {
+	st := testState()
+	withBook := func(s model.Snapshot, lo, hi int64, l1 model.Level) model.Snapshot {
+		s.PriceLimitMin, s.PriceLimitMax, s.Book = lo, hi, []model.Level{l1}
+		return s
+	}
+	// Buy queue: best bid at the ceiling (the ask side is irrelevant: no ask may exceed hi).
+	st.ApplySnapshot(withBook(snap("S1", "09:10:00", 1030, 1000, 1, 1), 970, 1030,
+		model.Level{BidPrice: 1030, BidVol: 2_000, BidCount: 50}))
+	// Sell queue: best ask at the floor, even with a stray bid below it.
+	st.ApplySnapshot(withBook(snap("S2", "09:10:00", 970, 1000, 1, 1), 970, 1030,
+		model.Level{BidPrice: 500, BidVol: 10, AskPrice: 970, AskVol: 3_000, AskCount: 80}))
+	// Neither: bid and ask inside the range.
+	st.ApplySnapshot(withBook(snap("S3", "09:10:00", 1000, 1000, 1, 1), 970, 1030,
+		model.Level{BidPrice: 999, BidVol: 5, AskPrice: 1001, AskVol: 5}))
+	// No book / no range / fixed-price board: missing, never counted as "no queue".
+	noBook := snap("S4", "09:10:00", 1000, 1000, 1, 1)
+	noBook.PriceLimitMin, noBook.PriceLimitMax, noBook.Missing = 970, 1030, []string{model.FBook}
+	st.ApplySnapshot(noBook)
+	st.ApplySnapshot(withBook(snap("S5", "09:10:00", 1000, 1000, 1, 1), 1000, 1000, model.Level{BidPrice: 1000, BidVol: 1}))
+	// Other classes are not in the stock queues.
+	st.ApplySnapshot(withBook(snap("E1", "09:10:00", 1100, 1000, 1, 1), 900, 1100, model.Level{BidPrice: 1100, BidVol: 9}))
+	q := st.Summary().Queues
+	want := Queues{Available: true, Class: Stock, Instruments: 5, Missing: 2, BuyCount: 1, SellCount: 1,
+		BuyValue: 1030 * 2_000, SellValue: 970 * 3_000, AsOf: at("09:10:00")}
+	if q != want {
+		t.Errorf("queues\n got %+v\nwant %+v", q, want)
+	}
+	if q := testState().Summary().Queues; q.Available || q.Reason == "" {
+		t.Errorf("no data must be unavailable with a reason: %+v", q)
+	}
+}

@@ -294,7 +294,11 @@ func Parse(body []byte, ingest time.Time) ([]model.Snapshot, error) {
 		} else {
 			sn.Missing = append(sn.Missing, model.FPriceLimits)
 		}
-		sn.Missing = append(sn.Missing, model.FBook) // in the payload, not mapped yet
+		if book, ok := saBook(row); ok {
+			sn.Book = book
+		} else {
+			sn.Missing = append(sn.Missing, model.FBook)
+		}
 		out = append(out, sn)
 	}
 	return out, nil
@@ -357,4 +361,28 @@ func wholeDecimal(row map[string]json.RawMessage, k string) (int64, bool) {
 func dailyQuota(msg string) bool {
 	m := strings.ToLower(msg)
 	return strings.Contains(m, "limit") && (strings.Contains(m, "daily") || strings.Contains(m, "day"))
+}
+
+// saBook maps the 5-level book ({1..5}_buy|sell_price|volume|count, numeric strings). 0 means no
+// order at that level (a real value); any absent, empty or negative key makes the whole book
+// missing (a partial book would misstate the queues).
+func saBook(row map[string]json.RawMessage) ([]model.Level, bool) {
+	book := make([]model.Level, 5)
+	for i := range book {
+		n := strconv.Itoa(i + 1)
+		for _, f := range []struct {
+			key string
+			dst *int64
+		}{
+			{n + "_buy_count", &book[i].BidCount}, {n + "_buy_volume", &book[i].BidVol}, {n + "_buy_price", &book[i].BidPrice},
+			{n + "_sell_count", &book[i].AskCount}, {n + "_sell_volume", &book[i].AskVol}, {n + "_sell_price", &book[i].AskPrice},
+		} {
+			v, ok := num(row, f.key)
+			if !ok || v < 0 {
+				return nil, false
+			}
+			*f.dst = v
+		}
+	}
+	return book, true
 }

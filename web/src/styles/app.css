@@ -621,6 +621,24 @@ a:hover {
   direction: rtl;
 }
 
+.queues {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+}
+
+.queues > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.queues > span {
+  grid-column: 1 / -1;
+}
+
 /* ---------- radar ---------- */
 .radar-list {
   display: flex;

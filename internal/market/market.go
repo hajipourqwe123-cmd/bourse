@@ -201,7 +201,49 @@ type Summary struct {
 	Flows          []ClassFlow    `json:"flows"`
 	KPIs           []KPI          `json:"kpis"`
 	Breadth        Breadth        `json:"breadth"`
-	Queues         Unavailable    `json:"queues"`
+	Queues         Queues         `json:"queues"`
+}
+
+// Queues is «ارزش صف‌ها» for the stock class, from level 1 of each instrument's order book and
+// its permitted range of the day (docs/market-metrics.md):
+//
+//	buy queue:  best bid price = upper limit (hi)  → value = bid price × bid volume at level 1
+//	sell queue: best ask price = lower limit (lo)  → value = ask price × ask volume at level 1
+//
+// A bid at hi cannot meet an ask (none may be above hi), so it is a queue whatever the ask side
+// shows; likewise an ask at lo. Instruments without a book or a usable range are Missing.
+type Queues struct {
+	Available   bool      `json:"available"`
+	Reason      string    `json:"reason,omitempty"`
+	Class       string    `json:"class,omitempty"`
+	Instruments int       `json:"instruments"` // stock instruments seen today
+	Missing     int       `json:"missing"`     // no book or no usable permitted range
+	BuyCount    int       `json:"buy_count"`
+	SellCount   int       `json:"sell_count"`
+	BuyValue    int64     `json:"buy_value"`  // rial
+	SellValue   int64     `json:"sell_value"` // rial
+	AsOf        time.Time `json:"as_of"`
+	Est         bool      `json:"est,omitempty"`
+}
+
+// add counts one stock instrument.
+func (q *Queues) add(sn *model.Snapshot) {
+	q.Instruments++
+	if !sn.Has(model.FBook) || len(sn.Book) == 0 || !sn.HasPriceLimits() || sn.PriceLimitMax <= sn.PriceLimitMin {
+		q.Missing++
+		return
+	}
+	l1 := sn.Book[0]
+	switch {
+	case l1.BidPrice == sn.PriceLimitMax && l1.BidVol > 0:
+		q.BuyCount++
+		q.BuyValue += l1.BidPrice * l1.BidVol
+	case l1.AskPrice == sn.PriceLimitMin && l1.AskVol > 0:
+		q.SellCount++
+		q.SellValue += l1.AskPrice * l1.AskVol
+	}
+	q.AsOf = later(q.AsOf, sn.SourceTime)
+	q.Est = q.Est || sn.SourceTimeEstimated
 }
 
 // CarryoverCheck describes the post-open carryover reference.
@@ -226,7 +268,7 @@ type Signal struct {
 // Unavailable metrics of the current data contract (docs/phase1-plan.md D-03).
 var (
 	IndicesUnavailable = Unavailable{Reason: "شاخص‌ها در قرارداد داده فعلی و پاسخ فروشنده نیستند (D-03)"}
-	QueuesUnavailable  = Unavailable{Reason: "سطح یک دفتر سفارش در قرارداد داده فعلی و پاسخ فروشنده نیست (D-03)"}
+	queuesNoData       = "هیچ نماد سهامی دفتر سفارش و دامنه مجاز ندارد"
 )
 
 // NoteBlockTrades labels the stock value KPI: trade type is not in the data yet (D-03).
@@ -778,7 +820,7 @@ func (b *Breadth) bucket(last, y, lo, hi int64) {
 
 // Summary computes every aggregate above the symbols table.
 func (s *State) Summary() Summary {
-	sum := Summary{Day: s.day, Issues: s.issueCount(), Queues: QueuesUnavailable, Carryover: len(s.carried)}
+	sum := Summary{Day: s.day, Issues: s.issueCount(), Carryover: len(s.carried)}
 	exp := s.prevTradingDay(s.day)
 	sum.CarryoverCheck = CarryoverCheck{Day: s.prevDay, Expected: exp, OK: s.prevDay != "" && s.prevDay == exp}
 	flows := map[string]*ClassFlow{}
@@ -793,6 +835,7 @@ func (s *State) Summary() Summary {
 		values[c] = &acc{}
 	}
 	br := Breadth{Class: Stock}
+	q := Queues{Class: Stock}
 	for _, in := range s.sorted() {
 		sn := &in.snap
 		sum.Instruments++
@@ -868,6 +911,7 @@ func (s *State) Summary() Summary {
 		// Breadth: stock class only; only instruments that traded today; each placed by its OWN
 		// permitted range of the day (base market and rights have other limits than ±3 %).
 		if in.class == Stock {
+			q.add(sn)
 			br.Instruments++
 			switch {
 			case !sn.Has(model.FPriceLast) || sn.PriceLast <= 0 || sn.PriceYesterday <= 0:
@@ -900,6 +944,11 @@ func (s *State) Summary() Summary {
 		sum.Flows = append(sum.Flows, *f)
 	}
 	sum.Breadth = br
+	q.Available = q.Instruments > q.Missing
+	if !q.Available {
+		q.Reason = queuesNoData
+	}
+	sum.Queues = q
 
 	kpi := func(id string, classes ...string) KPI {
 		k := KPI{ID: id, Available: true, Classes: classes, Series: s.bars(id, classes)}
