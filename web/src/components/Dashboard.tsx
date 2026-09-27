@@ -5,7 +5,7 @@ import { startLive } from "../lib/live";
 import { LatencyWindow } from "../lib/latency";
 import { MarketStore } from "../lib/store";
 import { FlowCard, KpiRow, QueueBreadthCard, RadarCard, SessionStrip } from "./Cards";
-import { StoreContext, useMarket, useNow } from "./hooks";
+import { NOT_MOUNTED, StoreContext, useMarket, useNow } from "./hooks";
 import { MarketMap } from "./MarketMap";
 import { DemoChip, Header, MobileTabBar, Sidebar } from "./Shell";
 import { SymbolsTable } from "./SymbolsTable";
@@ -105,7 +105,8 @@ function MobileDate() {
   return (
     <div className="mobile-only" style={{ justifyContent: "space-between", alignItems: "center" }}>
       <span className="t-label">
-        {jalaliDate(new Date(now)).split(" ").slice(0, 3).join(" ")} · <span className="num">{clock(new Date(now), false)}</span>
+        {now === 0 ? NOT_MOUNTED : jalaliDate(new Date(now)).split(" ").slice(0, 3).join(" ")} ·{" "}
+        <span className="num">{now === 0 ? NOT_MOUNTED : clock(new Date(now), false)}</span>
       </span>
       <DemoChip long={false} />
     </div>
