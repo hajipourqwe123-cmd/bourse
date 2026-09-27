@@ -218,14 +218,14 @@ export function QueueBreadthCard() {
   const s = useMarket();
   const b = s.summary?.breadth;
   const q = s.summary?.queues;
-  const covered = b ? b.instruments - b.missing - b.untraded - b.awaiting : 0;
+  const covered = b ? b.instruments - b.missing - b.untraded - b.awaiting - (b.no_limits ?? 0) : 0;
   const segs = b
     ? [
-        { n: b.floor, color: "var(--breadth-1)", label: "در کف دامنه (≤ −۳٪)" },
-        { n: b.down, color: "var(--breadth-2)", label: "−۳٪ تا ۰" },
+        { n: b.floor, color: "var(--breadth-1)", label: "در کف دامنه" },
+        { n: b.down, color: "var(--breadth-2)", label: "زیر قیمت دیروز" },
         { n: b.flat, color: "var(--map-3)", label: "بدون تغییر" },
-        { n: b.up, color: "var(--breadth-3)", label: "۰ تا +۳٪" },
-        { n: b.ceil, color: "var(--breadth-4)", label: "در سقف دامنه (≥ +۳٪)" },
+        { n: b.up, color: "var(--breadth-3)", label: "بالای قیمت دیروز" },
+        { n: b.ceil, color: "var(--breadth-4)", label: "در سقف دامنه" },
       ]
     : [];
   const id = useId();
