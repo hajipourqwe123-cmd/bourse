@@ -46,12 +46,36 @@ type runSummary struct {
 var staticFields = map[string]bool{"symbol": true, "isin": true, "sector_code": true,
 	"price_yesterday": true, "price_limit_min": true, "price_limit_max": true}
 
+// budgetFile keeps the day's BrsApi request count across restarts (next to the summary log).
+func (c watchConfig) budgetFile() string {
+	return filepath.Join(filepath.Dir(c.sum), "brsapi-used.json")
+}
+
+func (c watchConfig) loadUsed(day string) int {
+	var st struct {
+		Day  string `json:"day"`
+		Used int    `json:"used"`
+	}
+	if b, err := os.ReadFile(c.budgetFile()); err == nil && json.Unmarshal(b, &st) == nil && st.Day == day {
+		return st.Used
+	}
+	return 0
+}
+
+func (c watchConfig) saveUsed(day string, used int) {
+	b, _ := json.Marshal(map[string]any{"day": day, "used": used})
+	if err := os.WriteFile(c.budgetFile(), b, 0o644); err != nil {
+		log.Printf("vendorcmp: watch: save BrsApi count: %v", err)
+	}
+}
+
 func watch(c watchConfig) {
 	day, used := "", 0
 	for {
 		now := time.Now()
 		if d := tehran.TradingDay(now); d != day {
-			day, used = d, 0
+			day, used = d, c.loadUsed(d)
+			log.Printf("vendorcmp: watch: %s: %d BrsApi requests already used today", day, used)
 		}
 		st, err := os.Stat(c.saFile)
 		switch {
@@ -62,7 +86,8 @@ func watch(c watchConfig) {
 		case used >= c.maxBrs:
 			log.Printf("vendorcmp: watch: BrsApi budget of %d requests for %s used; skipped until tomorrow", c.maxBrs, day)
 		default:
-			used++ // an attempt costs quota whether or not it succeeds
+			used++ // an attempt costs quota whether or not it succeeds: counted before sending
+			c.saveUsed(day, used)
 			if err := once(c, used); err != nil {
 				log.Printf("vendorcmp: watch: %v", err)
 			}
