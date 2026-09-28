@@ -64,6 +64,18 @@ func (j *JetStream) StatePut(ctx context.Context, key string, val []byte) error 
 	return nil
 }
 
+// StateDelete removes key from StateBucket (no error if absent).
+func (j *JetStream) StateDelete(ctx context.Context, key string) error {
+	kv, err := j.stateBucket(ctx)
+	if err != nil {
+		return err
+	}
+	if err := kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("state: delete %s: %w", key, err)
+	}
+	return nil
+}
+
 // LoadCheckpoint returns the checkpoint stored under name; ok is false if there is none.
 func (j *JetStream) LoadCheckpoint(ctx context.Context, name string) (cp Checkpoint, ok bool, err error) {
 	b, ok, err := j.StateGet(ctx, name)

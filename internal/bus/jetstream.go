@@ -580,6 +580,116 @@ func (j *JetStream) Consume(ctx context.Context, spec ConsumerSpec, fn func(Msg)
 	}
 }
 
+// BatchSpec configures ConsumeBatch: a durable pull consumer delivering up to MaxBatch messages
+// per call (for bulk sinks such as the ClickHouse writer, whose inserts are idempotent).
+type BatchSpec struct {
+	Stream, Durable, Filter string
+	MaxBatch                int           // default 1000
+	MaxWait                 time.Duration // longest wait to fill a batch; default 1s
+	AckWait                 time.Duration // default 60s; must exceed the handler's worst case
+	// Settled, if set, is called after each fetch cycle (an empty fetch, or a batch handled and
+	// acked) but ONLY when the server reports no delivered message left unacked (NumAckPending 0;
+	// e.g. a batch of a crashed run awaiting redelivery keeps it silent). Then every message up to
+	// lastStored (the stored time of this batch's newest message; zero after an empty fetch) has
+	// been handled; drained additionally reports that none was pending at local time at, so every
+	// message stored before at has been handled.
+	Settled func(at time.Time, drained bool, lastStored time.Time)
+}
+
+// ConsumeBatch runs a durable pull consumer (created or updated from spec) and calls fn with each
+// fetched batch, in stream order. Every message of a batch is acked after fn returns nil; when fn
+// fails, ConsumeBatch returns its error with the whole batch unacked, so it is redelivered (after
+// AckWait) to the next process. There is no per-message retry, Term or MaxDeliver: the handler
+// must be idempotent and must itself drop (and record) messages it cannot decode. It returns
+// ctx.Err() on cancellation.
+func (j *JetStream) ConsumeBatch(ctx context.Context, spec BatchSpec, fn func([]Msg) error) error {
+	if spec.MaxBatch <= 0 {
+		spec.MaxBatch = 1000
+	}
+	if spec.MaxWait <= 0 {
+		spec.MaxWait = time.Second
+	}
+	if spec.AckWait <= 0 {
+		spec.AckWait = time.Minute
+	}
+	c, err := j.js.CreateOrUpdateConsumer(ctx, spec.Stream, jetstream.ConsumerConfig{
+		Durable:       spec.Durable,
+		FilterSubject: spec.Filter,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckWait:       spec.AckWait,
+		MaxDeliver:    -1,
+		MaxAckPending: spec.MaxBatch,
+	})
+	if err != nil {
+		return fmt.Errorf("jetstream: consumer %s/%s: %w", spec.Stream, spec.Durable, err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batch, err := c.Fetch(spec.MaxBatch, jetstream.FetchMaxWait(spec.MaxWait))
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("jetstream: consumer %s/%s: fetch: %w", spec.Stream, spec.Durable, err)
+		}
+		var raw []jetstream.Msg
+		var msgs []Msg
+		for m := range batch.Messages() {
+			meta, err := m.Metadata()
+			if err != nil {
+				log.Printf("jetstream: %s: no metadata (%v); terminating message", m.Subject(), err)
+				_ = m.Term()
+				continue
+			}
+			raw = append(raw, m)
+			msgs = append(msgs, Msg{Subject: m.Subject(), Data: m.Data(), StreamSeq: meta.Sequence.Stream,
+				NumDelivered: meta.NumDelivered, Stored: meta.Timestamp, inProgress: m.InProgress})
+		}
+		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && ctx.Err() == nil {
+			log.Printf("jetstream: consumer %s/%s: fetch: %v", spec.Stream, spec.Durable, err)
+		}
+		var lastStored time.Time
+		if len(msgs) > 0 {
+			if err := fn(msgs); err != nil {
+				return err // unacked: redelivered after AckWait
+			}
+			for _, m := range msgs { // the newest (a redelivery may come after newer messages)
+				if m.Stored.After(lastStored) {
+					lastStored = m.Stored
+				}
+			}
+		}
+		// The last ack is synchronous, so a returned batch is known to be acked on the server.
+		for i, m := range raw {
+			if i == len(raw)-1 {
+				err = m.DoubleAck(ctx)
+			} else {
+				err = m.Ack()
+			}
+			if err != nil {
+				log.Printf("jetstream: ack %s: %v", m.Subject(), err)
+			}
+		}
+		if spec.Settled != nil {
+			at := time.Now()
+			info, err := c.Info(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				log.Printf("jetstream: consumer %s/%s info: %v", spec.Stream, spec.Durable, err)
+				continue
+			}
+			if info.NumAckPending == 0 {
+				spec.Settled(at, info.NumPending == 0, lastStored)
+			}
+		}
+	}
+}
+
 // Tail follows a stream without any durable state (an ordered, ephemeral consumer): it calls fn
 // for every message matching filter stored at or after start (zero = the whole stream), in
 // stream order, then keeps following new messages until ctx ends. caughtUp (may be nil) is

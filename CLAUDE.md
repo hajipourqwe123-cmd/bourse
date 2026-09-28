@@ -38,6 +38,6 @@ requirements: the PRD (Claude Doc, Persian). Human docs are Persian in docs/; co
 
 ## Current state
 Sprint 1: I-01, P-01, P-02, DL-01 done (merged). Sprint 2: G-01 gateway, UI-01 shell, M-dash, Gate 2 done
-(PR open). Next: W-01 ClickHouse writer (idempotent: dedup key / ReplacingMergeTree for flow_events;
-store `partial`), R-01 daily recording, Q-01 Grafana. D-03 waits for the live token (indices, order book
+(merged, #3). W-01 ClickHouse writer: cmd/writer (PR open; ReplacingMergeTree + bus_seq, read with FINAL).
+Next: R-01 daily recording, Q-01 Grafana. D-03 waits for the live token (indices, order book
 L1, trade type, tmin/tmax added). Light theme waits for owner values.

@@ -1,4 +1,4 @@
-.PHONY: test vet build synth demo demo-nats env up down ps ddl web gate2
+.PHONY: test vet build synth demo demo-nats env up down ps ddl ddl-reset writer web gate2
 COMPOSE := docker compose --env-file .env -f infra/docker-compose.yml
 
 test: ; go test ./...
@@ -23,3 +23,7 @@ ddl:
 	@for f in infra/clickhouse/*.sql; do echo "apply $$f"; \
 	  $(COMPOSE) exec -T clickhouse sh -c 'clickhouse-client --user dev --password "$$CLICKHOUSE_PASSWORD" --multiquery' < $$f || exit 1; done
 	@$(COMPOSE) exec -T clickhouse sh -c 'clickhouse-client --user dev --password "$$CLICKHOUSE_PASSWORD" -q "SHOW TABLES FROM market"'
+# Recreate the tables with the current schema; refuses unless every market table is empty.
+ddl-reset: ; infra/ddl-reset.sh
+# W-01: archive the bus (make up) into ClickHouse. Reads CLICKHOUSE_PASSWORD from .env.
+writer: build ; set -a && . ./.env && set +a && bin/writer
