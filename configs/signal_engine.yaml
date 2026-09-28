@@ -1,5 +1,5 @@
 # Radar Jahesh v1 (Sprint 3 task SM-02) — default configuration.
-# Spec: docs/signal-engine-spec.md (v1.1) · Decision: docs/adr/0007-signal-engine.md · Plan: docs/sprint3-plan.md
+# Spec: docs/signal-engine-spec.md (v1.2) · Decision: docs/adr/0007-signal-engine.md · Plan: docs/sprint3-plan.md
 #
 # Every threshold below is an INITIAL CALIBRATION VALUE, not a validated result.
 # Rule codes (U1, G1, X3, ...) refer to the spec. In Go they are carried as struct tags (rule:"G1") and a test
@@ -11,11 +11,12 @@
 # config_hash (sha256 of this file's bytes) is stamped on every feature row, signal, outcome and trial.
 # "DL-02 variant:" marks a parameter whose other values are tested in DL-02 (each value = new config_hash).
 # "in_backtest: false" = the rule runs in production but not in the backtest (its input has no history);
-# every report says so, and DL-02 runs one disclosed sensitivity run with it on.
+# every report says so, and DL-02 runs one disclosed sensitivity run with it on. Such a rule is a veto only:
+# it never enters the normalization universe or any cross-sectional aggregate (percentiles, R1, R3, P5).
 
 meta:
-  config_version: "1.1.0"
-  spec_version: "1.1"
+  config_version: "1.2.0"
+  spec_version: "1.2"
   trading_days_per_year: 240
 
 strategies:
@@ -35,13 +36,14 @@ data:
   adjustment_method: py_ratio             # D4: backward factor f = py(t) / pc(t-1); the only method in v1
   adjustment_review_min_factor: 0.05      # D4: a factor below min or above max goes to a review queue,
   adjustment_review_max_factor: 1.0       #     never applied automatically
-  price_limit_source: proxy_pmin_eq_pmax  # D5: feed | rules_table | proxy_pmin_eq_pmax (until DL-03 ships the table)
+  price_limit_source: proxy_pmin_eq_pmax  # D5: feed | rules_table | proxy_pmin_eq_pmax (until DL-03d ships the table);
+                                          #     proxy lock direction from pc vs py: up (pc > py), down (pc < py), flat (pc == py)
 
 universe:
   lookback_days: 60                       # U1
   min_trading_days: 45                    # U1
   min_value_pctile: 40                    # U2: MDV20 percentile among symbols traded in the last 20 days
-  U3: {enabled: true, in_backtest: false, min_free_float_pct: 15}   # free float is current-only (no history)
+  U3: {enabled: true, in_backtest: false, min_free_float_pct: 15}   # current-only (no history); post-normalization eligibility veto like U4
   halt_min_days: 10                       # U4: a halt at least this long triggers the cooldown
   post_halt_cooldown_days: 3              # U4
   U5: {enabled: false, in_backtest: false, event_blackout_days_s1: 5}  # needs Codal events with announced_at (Q-SG4)
@@ -78,6 +80,8 @@ industry:                                 # I1..I5 feed G2 and G3 only; both wai
 features:
   mdv_window_days: 20                     # MDV20: median daily value of the 20 trading days before t (t excluded)
   flow:
+    basis: volume                         # F1-F3, F5, R2, I1, M3, X3: volume | value (spec section 2; Q-SG12 option c).
+                                          #   Chosen once by DL-03b (gates.DL03); NOT a DL-02 variant.
     window_days: 5                        # F1, F3 — DL-02 variant: 10
     min_valid_days: 4                     # F1: fewer valid days in the window => missing
     persistence_mode: count               # F3: count | run — DL-02 variant: run (consecutive days ending at t)
@@ -167,7 +171,7 @@ patterns:                                 # setup: data through t-1 · trigger: 
 anti_manipulation:
   M1: {enabled: true, in_backtest: false, free_float_max_pct: 25, rvol_day_min: 5, ret_3d_min_pct: 10}
   M2: {enabled: true}                     # veto when mic_class = absorption (thresholds: features.reaction.mic_class)
-  M3: {enabled: true, seller_count_growth_min: 1.2, seller_baseline_days: 5, buyer_power_min: 1.5, weak_days: 2}
+  M3: {enabled: true, seller_count_growth_min: 1.2, seller_baseline_days: 5, buyer_power_min: 1.5, weak_days: 2}  # window ends at t-1
   M4: {enabled: false, block_share_max_pct: 30}       # needs block/negotiated-trade data (Q-SG7)
   M5: {enabled: true, veto_no_real_flow_with_market_maker: true}  # no market-maker list yet: "not evaluated"
 
@@ -209,34 +213,44 @@ backtest:
   holdout_months: 6                       # B5
   horizons_days: [3, 5, 10]               # B12: net forward returns for every signal; the label L uses H
   fdr_q: 0.10                             # B13: Benjamini–Hochberg over all signal × horizon × parameter combinations
+                                          #   and ablation runs; H0: mean net EXCESS return over the equal-weight index <= 0;
+                                          #   Newey-West SE (lag h-1) on one aggregated observation per signal day
   min_events_per_test: 30                 # B13
-  baseline: rs_rvol                       # B7
+  baseline: rs_rvol                       # B7: same number of orders per day as the pattern under test
+  ablation_min_drop_r: 0.05               # B8: a family stays only if dropping it lowers OOS net expectancy by >= this (R)
   benchmark: fixed_income_funds           # B10: excess return is measured against this
   report_hypothetical_risk_off: true      # B9
   fill_variants: [base, conservative]     # B2: both are reported; conservative = no fill at the open when open == pmax
   gate_fill_variant: conservative         # B2: G-3a is judged on this variant
-  grid:                                   # B15: pre-registered parameter grid; combinations = product of the axes
+  grid:                                   # B15: pre-registered grid; per pattern: axes (combinations = product) + B8 ablations
     frozen: false                         # set true in a reviewed commit BEFORE the first run on real data;
                                           # a real-data run refuses frozen: false, and a changed grid is a new
                                           # pre-registration whose trials all count in the B13 FDR family
-    G1:                                   # 2 × 3 × 2 × 2 = 24 combinations
-      features.flow.window_days: [5, 10]
-      features.flow.persistence:          # persistence_mode + persistence_buyer_power, paired
-        - {persistence_mode: count, persistence_buyer_power: 1.2}
-        - {persistence_mode: count, persistence_buyer_power: 1.0}
-        - {persistence_mode: run,   persistence_buyer_power: 1.0}
-      features.reaction.rvol_stat: [median, mean]
-      patterns.G1.order.skip_if_open_below_level: [false, true]
+    G1:
+      axes:                               # 2 × 3 × 2 × 2 = 24 combinations
+        features.flow.window_days: [5, 10]
+        features.flow.persistence:        # persistence_mode + persistence_buyer_power, paired
+          - {persistence_mode: count, persistence_buyer_power: 1.2}
+          - {persistence_mode: count, persistence_buyer_power: 1.0}
+          - {persistence_mode: run,   persistence_buyer_power: 1.0}
+        features.reaction.rvol_stat: [median, mean]
+        patterns.G1.order.skip_if_open_below_level: [false, true]
+      ablations: [flow, reaction, trend]  # B8: one full walk-forward run per dropped required family, not crossed
+                                          #     with the axes; all their tests count in the B13 FDR family
     G2:                                   # same axes; registered now, run only when G2 is enabled
-      features.flow.window_days: [5, 10]
-      features.flow.persistence:
-        - {persistence_mode: count, persistence_buyer_power: 1.2}
-        - {persistence_mode: count, persistence_buyer_power: 1.0}
-        - {persistence_mode: run,   persistence_buyer_power: 1.0}
-      features.reaction.rvol_stat: [median, mean]
-      patterns.G2.order.skip_if_open_below_level: [false, true]
+      axes:
+        features.flow.window_days: [5, 10]
+        features.flow.persistence:
+          - {persistence_mode: count, persistence_buyer_power: 1.2}
+          - {persistence_mode: count, persistence_buyer_power: 1.0}
+          - {persistence_mode: run,   persistence_buyer_power: 1.0}
+        features.reaction.rvol_stat: [median, mean]
+        patterns.G2.order.skip_if_open_below_level: [false, true]
+      ablations: [flow, reaction, trend]
 
 gates:
+  DL03:                                   # data gate (DL-03b)
+    flow_basis_min_spearman: 0.98         # Q-SG12: mean daily Spearman, value- vs volume-basis percentiles (F1 and F2)
   G3a:                                    # backtest gate, evaluated per pattern
     min_events_per_regime: 30
     top_decile_min_fold_share_pct: 60
