@@ -249,8 +249,11 @@ backtest:
       ablations: [flow, reaction, trend]
 
 gates:
-  DL03:                                   # data gate (DL-03b)
-    flow_basis_min_spearman: 0.98         # Q-SG12: mean daily Spearman, value- vs volume-basis percentiles (F1 and F2)
+  DL03:                                   # data gate (DL-03b); Q-SG12 volume basis is adopted only if all three hold
+    flow_basis_min_spearman: 0.98         # mean of the daily Spearman (value vs volume percentiles), F1 and F2 each
+    flow_basis_min_spearman_p5: 0.95      # 5th percentile of those daily Spearman values, F1 and F2 each
+    flow_basis_max_flip_pct: 2            # % of symbol-days whose flow-family score (C2) is on opposite sides of
+                                          #   combine.family_min_pctile under the two bases
   G3a:                                    # backtest gate, evaluated per pattern
     min_events_per_regime: 30
     top_decile_min_fold_share_pct: 60
