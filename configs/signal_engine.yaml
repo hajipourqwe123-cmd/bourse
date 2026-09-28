@@ -1,0 +1,272 @@
+# Radar Jahesh v1 (Sprint 3 task SM-02) — default configuration.
+# Spec: docs/signal-engine-spec.md (v1.2) · Decision: docs/adr/0007-signal-engine.md · Plan: docs/sprint3-plan.md
+#
+# Every threshold below is an INITIAL CALIBRATION VALUE, not a validated result.
+# Rule codes (U1, G1, X3, ...) refer to the spec. In Go they are carried as struct tags (rule:"G1") and a test
+# checks the tags against the rule registry. These comments are for humans only: no code or test parses them.
+# Money is rial (int64). Percents are plain numbers (5 = 5%). Percentiles are 0..100.
+# Day counts are trading days from internal/calendar.
+# v1 is END-OF-DAY ONLY: production and backtest run the same rules on the same daily data.
+# The loader is fail-closed: unknown key, missing key or out-of-range value => engine refuses to start.
+# config_hash (sha256 of this file's bytes) is stamped on every feature row, signal, outcome and trial.
+# "DL-02 variant:" marks a parameter whose other values are tested in DL-02 (each value = new config_hash).
+# "in_backtest: false" = the rule runs in production but not in the backtest (its input has no history);
+# every report says so, and DL-02 runs one disclosed sensitivity run with it on. Such a rule is a veto only:
+# it never enters the normalization universe or any cross-sectional aggregate (percentiles, R1, R3, P5).
+
+meta:
+  config_version: "1.2.0"
+  spec_version: "1.2"
+  trading_days_per_year: 240
+
+strategies:
+  S1: {enabled: true, horizon_days: 10}   # swing; primary horizon H (owner, 2026-09-28)
+  S2: {enabled: false, horizon_days: 40}  # wave; needs its own DL-02 horizon; enable only after S1 passes G-3a
+
+costs:                                    # L5 — verify against the broker's current schedule (Q-SG8)
+  buy_pct: 0.3712                         # TODO(verify)
+  sell_pct: 0.8812                        # TODO(verify) includes sell tax
+  slippage_pct: 0.10                      # per side; charged once, in L5 (never also in the fill price)
+
+data:
+  history_source: brsapi_history          # D1: BrsApi Tsetmc/History.php type=0 + type=1 (ADR-0006 field ownership)
+  history_min_days: 1100                  # G-3a: 240 warm-up + 480 train + >=4 test folds (240) + 120 holdout
+  second_source_enabled: false            # D2 is reported as "suspended" until true
+  reconcile_tolerance_pct: 0.5            # D2
+  adjustment_method: py_ratio             # D4: backward factor f = py(t) / pc(t-1); the only method in v1
+  adjustment_review_min_factor: 0.05      # D4: a factor below min or above max goes to a review queue,
+  adjustment_review_max_factor: 1.0       #     never applied automatically
+  price_limit_source: proxy_pmin_eq_pmax  # D5: feed | rules_table | proxy_pmin_eq_pmax (until DL-03d ships the table);
+                                          #     proxy lock direction from pc vs py: up (pc > py), down (pc < py), flat (pc == py)
+
+universe:
+  lookback_days: 60                       # U1
+  min_trading_days: 45                    # U1
+  min_value_pctile: 40                    # U2: MDV20 percentile among symbols traded in the last 20 days
+  U3: {enabled: true, in_backtest: false, min_free_float_pct: 15}   # current-only (no history); post-normalization eligibility veto like U4
+  halt_min_days: 10                       # U4: a halt at least this long triggers the cooldown
+  post_halt_cooldown_days: 3              # U4
+  U5: {enabled: false, in_backtest: false, event_blackout_days_s1: 5}  # needs Codal events with announced_at (Q-SG4)
+
+regime:
+  inputs:
+    R1: {enabled: true, ma_days: 50, up_pct: 55, down_pct: 40}
+    R2: {enabled: true, windows: [5, 20]}
+    R3: {enabled: true, ma_days: 50, slope_days: 10}
+    R4: {enabled: false, window_days: 10, deadband_pct: 0.1}          # needs fund module (Sprint 4)
+    R5: {enabled: false, window_days: 20, direction_verified: false}  # needs FX + bond-yield feed
+  risk_on_min_score: 0.6                  # score = sum(enabled inputs) / count(enabled inputs)
+  risk_off_max_score: -0.6
+  upgrade_confirm_days: 2                 # R6: upgrades need N consecutive days; downgrades are immediate
+  states:                                 # "unknown" (an enabled input is missing) => no new entries
+    risk_on:  {max_positions: 8, risk_per_trade_pct: 0.5,  size_mult: 1.0, patterns: [G1, G2, G3, G5]}
+    neutral:  {max_positions: 4, risk_per_trade_pct: 0.35, size_mult: 1.0, patterns: [G1, G2, G5]}
+    risk_off: {max_positions: 2, risk_per_trade_pct: 0.35, size_mult: 0.5, patterns: [], requires_improving_days: 2}
+    # risk_off trades nothing in v1 (its only pattern, G4, is deferred); DL-02 still reports hypothetical
+    # risk_off results (backtest.report_hypothetical_risk_off) to test whether the regime filter adds value.
+
+industry:                                 # I1..I5 feed G2 and G3 only; both wait for industry data
+  enabled: false                          # true only with a point-in-time group mapping (D7)
+  grouping: driver_group                  # D7: official | driver_group
+  min_active_members: 3                   # I3
+  rs_windows: [20, 60]                    # I1
+  flow_window_days: 5                     # I1
+  allowed_min_igr: 70                     # I2
+  rotation_delta: 25                      # I2
+  rotation_window_days: 10                # I2
+  leaders_per_group: 2                    # I4
+  leader_rank_window_days: 10             # I4
+
+features:
+  mdv_window_days: 20                     # MDV20: median daily value of the 20 trading days before t (t excluded)
+  flow:
+    basis: volume                         # F1-F3, F5, R2, I1, M3, X3: volume | value (spec section 2; Q-SG12 option c).
+                                          #   Chosen once by DL-03b (gates.DL03); NOT a DL-02 variant.
+    window_days: 5                        # F1, F3 — DL-02 variant: 10
+    min_valid_days: 4                     # F1: fewer valid days in the window => missing
+    persistence_mode: count               # F3: count | run — DL-02 variant: run (consecutive days ending at t)
+    persistence_buyer_power: 1.2          # F3 — DL-02 variant: 1.0
+    f4_enabled: false                     # F4: only after task Q-02 measures hot-money accuracy on real data
+  reaction:
+    rvol_baseline_days: 20                # P1
+    rvol_min_valid_days: 15               # P1: fewer traded days in the baseline => missing
+    rvol_stat: median                     # P1: median | mean — DL-02 variant: mean
+    ad_window_days: 65                    # P4
+    ad_min_valid_days: 50                 # P4
+    er_window_days: 5                     # P5
+    er_reference: market                  # P5: market | group — group only after industry data exists
+    mic_class:                            # P5 classes (moved here from the spec text and M2: rule E-4)
+      absorption_nrf_min_pctile: 70
+      absorption_er_max_pct: 0
+      thin_supply_nrf_pctile: [40, 70]
+      thin_supply_er_min_pctile: 70
+      no_real_flow_er_min_pctile: 80
+    quiet_volume: {rvol_min: 3, abs_ret_max_pct: 1}   # P6 display flag (SM-01 "suspicious volume")
+  trend:
+    rs_weights:                           # T1: horizon (days) -> weight; weights sum to 1
+      S1: {"20": 0.5, "60": 0.3, "120": 0.2}
+      S2: {"60": 0.4, "120": 0.2, "180": 0.2, "240": 0.2}
+    gate_S1: {fast_ma: 20, slow_ma: 50, slope_days: 10}
+    gate_S2: {ma_short: 50, ma_mid: 150, ma_long: 200, long_slope_days: 20,
+              min_above_low_pct: 30, max_below_high_pct: 25, min_rs_pctile: 70, range_days: 240}
+    atr_short: 10                         # T3
+    atr_long: 50                          # T3
+    vol_short: 10                         # T3
+    vol_long: 50                          # T3
+    high_windows: [60, 240]               # T4
+    atr_risk: 14                          # K1, order cap, Z1, X1..X5
+  risk:
+    lock_window_days: 60                  # K1: down_lock_days counted over this window
+  event:
+    surprise_base_months: 3               # E1
+    e3_enabled: false                     # E3 needs a fundamentals source
+
+normalization:
+  min_cross_section: 80                   # C1: fewer symbols with a value => no percentile that day
+  winsor_pct: [1, 99]                     # C1: raw aggregates and model export only (ranks are unaffected)
+
+combine:
+  families:                               # C2: a family is missing if ANY configured member is missing
+    flow:     [F1_nrf_5d, F2_buyer_power, F3_flow_persistence]   # add F4_large_flow_rel after Q-02
+    reaction: [P1_rvol_day, P2_clv, P4_ad_rating]                # P3 is a display flag only (no base volume in history)
+    trend:    [T1_rs_rating, T3_contraction, T4_dist_high]
+    event:    [E1_sales_surprise]
+  required_families: [flow, reaction, trend]   # C3
+  family_min_pctile: 60                        # C3
+  ranking: geometric_mean                      # C4
+  ev_rule: {enabled: false, min_net_pct: {S1: 1.0, S2: 2.5}}  # C5: only after AI-04 (ADR-0005 tier 2)
+  max_per_driver_group: 2                      # C7: inactive while industry.enabled is false
+
+patterns:                                 # setup: data through t-1 · trigger: day t finals · order: t+1
+  G1:                                     # accumulation breakout, close-confirmed
+    enabled: true
+    strategy: S1
+    size_mult: 1.0
+    setup: {ad_min_pctile: 70, persistence_min: 3, atr_ratio_max: 0.75, vol_dryup_max: 0.9, ret_5d_max_pct: 8}
+    trigger: {level_days: 20, rvol_day_min: 1.5, require_last_above_final: true}
+    order: {cap_atr: 0.5, skip_if_open_below_level: false}   # limit buy for t+1 at final(t) + cap_atr × ATR14
+  G2:                                     # breakout with the industry, close-confirmed
+    enabled: false                        # joins G-3a when industry data exists (industry.enabled)
+    strategy: S1
+    size_mult: 1.0
+    setup: {igr_min: 70, rs_min_pctile: 80}
+    trigger: {level_days: 60, rvol_day_min: 2.0, clv_min: 0.6}
+    order: {cap_atr: 1.0, skip_if_open_below_level: false}
+  G3:                                     # laggard of a leading group
+    enabled: false                        # needs driver groups (D7) and leader tags (I4)
+    strategy: S1
+    size_mult: 0.75
+    setup: {igr_min: 80, leaders_ret_10d_min_pct: 10, laggard_max_rs_pctile_in_group: 50,
+            above_ma: 50, flow_min_pctile: 60, flow_rising_days: 3}
+    trigger: {require_last_above_final: true, require_above_prev_high: true}
+    order: {cap_atr: 0.5}
+  # G4 (sell-queue reversal) is deferred to the high-frequency data plan: its trigger needs intraday queues.
+  G5:                                     # reaction to a monthly-report surprise
+    enabled: false                        # needs Codal reports with publish time (Q-SG5) and S2
+    strategy: S2
+    size_mult: 0.75
+    setup: {surprise_min_pctile: 85, max_days_since_publish: 2, flow_nrf_min_pctile: 70}
+    order: {cap_atr: 1.0}                 # no separate trigger: the first close after publication is day t
+
+anti_manipulation:
+  M1: {enabled: true, in_backtest: false, free_float_max_pct: 25, rvol_day_min: 5, ret_3d_min_pct: 10}
+  M2: {enabled: true}                     # veto when mic_class = absorption (thresholds: features.reaction.mic_class)
+  M3: {enabled: true, seller_count_growth_min: 1.2, seller_baseline_days: 5, buyer_power_min: 1.5, weak_days: 2}  # window ends at t-1
+  M4: {enabled: false, block_share_max_pct: 30}       # needs block/negotiated-trade data (Q-SG7)
+  M5: {enabled: true, veto_no_real_flow_with_market_maker: true}  # no market-maker list yet: "not evaluated"
+
+execution:
+  tranche_split: [0.6, 0.4]               # J3: second tranche = order for t+2, only if final(t+1) > L
+  order_valid_days: {S1: 1, S2: 3}        # J4: sessions an unfilled limit order stays valid
+
+sizing:
+  risk_tail_pct: 1.5                      # Z1
+  gap_days: 3                             # Z1: g = gap_days × daily lower-limit percent (needs D5 limits)
+  liquidity_cap_mdv_pct: 5                # Z1: percent of MDV20
+  stop_overshoot_mult: 1.0                # Z1: d_eff = d × mult; DL-02 sets it from B14 (p75 of realized loss ÷ planned R)
+  max_open_risk_pct: 3.0                  # Z2
+  max_group_capital_pct: 30               # Z2
+  min_order_value_rial: 0                 # Z3: 0 = off; TODO set with the product owner
+
+exits:                                    # every X rule is evaluated on day t finals; the exit executes at t+1 open
+  stop_lookback_days: 5                   # X1
+  max_stop_atr: 2.5                       # X1
+  time_stop_days: {S1: 5, S2: 15}         # X2
+  time_stop_min_r: 1.0                    # X2
+  flow_reversal: {days: 2, buyer_power_max: 0.8}   # X3
+  partial_at_r: 2.0                       # X5
+  partial_fraction: 0.333                 # X5
+  trail_ma: {S1: 10, S2: 20}              # X5
+  trail_atr: 2.5                          # X5
+  regime_off_min_r: 1.0                   # X7
+
+labeling:
+  target_r: 2.0                           # L2
+  stop_r: 1.0                             # L2
+  both_hit_same_day: stop_first           # L3
+
+backtest:
+  mode: eod                               # B1: the only mode in v1 (replay is deferred to the high-frequency data plan)
+  train_months: 24                        # B4
+  test_months: 3                          # B4
+  embargo: horizon                        # B4: embargo = strategy horizon H
+  holdout_months: 6                       # B5
+  horizons_days: [3, 5, 10]               # B12: net forward returns for every signal; the label L uses H
+  fdr_q: 0.10                             # B13: Benjamini–Hochberg over all signal × horizon × parameter combinations
+                                          #   and ablation runs; H0: mean net EXCESS return over the equal-weight index <= 0;
+                                          #   Newey-West SE (lag h-1) on one aggregated observation per signal day
+  min_events_per_test: 30                 # B13
+  baseline: rs_rvol                       # B7: same number of orders per day as the pattern under test
+  ablation_min_drop_r: 0.05               # B8: a family stays only if dropping it lowers OOS net expectancy by >= this (R)
+  benchmark: fixed_income_funds           # B10: excess return is measured against this
+  report_hypothetical_risk_off: true      # B9
+  fill_variants: [base, conservative]     # B2: both are reported; conservative = no fill at the open when open == pmax
+  gate_fill_variant: conservative         # B2: G-3a is judged on this variant
+  grid:                                   # B15: pre-registered grid; per pattern: axes (combinations = product) + B8 ablations
+    frozen: false                         # set true in a reviewed commit BEFORE the first run on real data;
+                                          # a real-data run refuses frozen: false, and a changed grid is a new
+                                          # pre-registration whose trials all count in the B13 FDR family
+    G1:
+      axes:                               # 2 × 3 × 2 × 2 = 24 combinations
+        features.flow.window_days: [5, 10]
+        features.flow.persistence:        # persistence_mode + persistence_buyer_power, paired
+          - {persistence_mode: count, persistence_buyer_power: 1.2}
+          - {persistence_mode: count, persistence_buyer_power: 1.0}
+          - {persistence_mode: run,   persistence_buyer_power: 1.0}
+        features.reaction.rvol_stat: [median, mean]
+        patterns.G1.order.skip_if_open_below_level: [false, true]
+      ablations: [flow, reaction, trend]  # B8: one full walk-forward run per dropped required family, not crossed
+                                          #     with the axes; all their tests count in the B13 FDR family
+    G2:                                   # same axes; registered now, run only when G2 is enabled
+      axes:
+        features.flow.window_days: [5, 10]
+        features.flow.persistence:
+          - {persistence_mode: count, persistence_buyer_power: 1.2}
+          - {persistence_mode: count, persistence_buyer_power: 1.0}
+          - {persistence_mode: run,   persistence_buyer_power: 1.0}
+        features.reaction.rvol_stat: [median, mean]
+        patterns.G2.order.skip_if_open_below_level: [false, true]
+      ablations: [flow, reaction, trend]
+
+gates:
+  DL03:                                   # data gate (DL-03b); Q-SG12 volume basis is adopted only if all three hold
+    flow_basis_min_spearman: 0.98         # mean of the daily Spearman (value vs volume percentiles), F1 and F2 each
+    flow_basis_min_spearman_p5: 0.95      # 5th percentile of those daily Spearman values, F1 and F2 each
+    flow_basis_max_flip_pct: 2            # % of symbol-days whose flow-family score (C2) is on opposite sides of
+                                          #   combine.family_min_pctile under the two bases
+  G3a:                                    # backtest gate, evaluated per pattern
+    min_events_per_regime: 30
+    top_decile_min_fold_share_pct: 60
+  G3b:                                    # display gate
+    paper_min_trading_days: 40
+
+scoreboard:
+  window_signals: 30                      # S1
+  suspend_expectancy_r_below: 0.0         # S3
+  suspend_z_below: -2.0                   # S3
+  reactivate_paper_signals: 20            # S4
+
+output:
+  show_probability: false                 # O2: true only after AI-04 passes the ADR-0005 shadow period
+  near_miss_min_family_pctile: 50         # O4
+  publish_to_users: false                 # O5: requires gate G-3b and legal clearance (O-4)
