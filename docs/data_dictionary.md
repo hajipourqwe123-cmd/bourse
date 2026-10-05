@@ -30,7 +30,7 @@
 | `BA` | BrsApi `AllSymbols` (زنده) | ندارد | پلن رایگان ۱۰۰ در روز؛ ارزش حقیقی/حقوقی ندارد |
 | `BA-H0`، `BA-H1` | BrsApi `History.php` نوع ۰ و ۱ | **روزانه از ۱۳۸۵ و ۱۳۸۷** | منبع اصلی تاریخچه (DL-03b)؛ سقف درخواست نامعلوم (Q-SG1) |
 | `REC` | ضبط عکس‌های لحظه‌ای پروژه (`recordings/`، R-01) | فقط از روز شروع ضبط | تنها منبع **تاریخچه درون‌روزی** ما |
-| `TK-P`، `TK-A` | تابلوخوانی عمومی و اشتراکی | بایگانی‌ها (عمق نامعلوم) | مشتق از سورس‌آرنا؛ مستقل نیست |
+| `TK-P`، `TK-A` | تابلوخوانی عمومی و اشتراکی | فقط ماتریس ۱۰ دقیقه‌ای (از 2026-01-31)، امتیاز نماد (از 2026-01-04)، سرانه ۳۰۰ روزه، سهامداران ۲۰ روزه؛ بقیه فقط امروز (`archive_feasibility`) | مشتق از سورس‌آرنا؛ مستقل نیست |
 | `CODAL` | کدال (از BrsApi `Codal/Announcement.php`) | دارد | زمان انتشار با رقم فارسی |
 | `DER` | محاسبه در کد ما | — | فقط از ورودی‌های یک فروشنده (ADR-0006) |
 | `LBL` | برچسب آینده‌نگر | — | **هرگز ورودی مدل نیست** |
@@ -45,7 +45,7 @@
 
 | feature_name | source | definition | unit | frequency | raw/calculated | formula_if_known | expected_range | missing_value_behavior | possible_bias | research_priority |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `open` | BA-H0 `pf`؛ SA `first_price` | اولین قیمت روز | ریال | روزانه | raw | — | > 0 | روز بی‌معامله ردیف ندارد | — | P0 |
+| `open` | BA-H0 `pf`؛ SA `first_price` | اولین قیمت روز | ریال | روزانه | raw | — | > 0 | روز بی‌معامله **ردیف دارد** با `tvol = 0` و `pf = pmin = pmax = 0` ← ناموجود (`archive_feasibility` بخش ۳) | — | P0 |
 | `high`، `low` | BA-H0 `pmax`، `pmin` | بیشینه و کمینه قیمت معامله‌شده | ریال | روزانه | raw | — | low ≤ high | قیمت ≤ ۱ ریال جانشین است ← ناموجود | — | P0 |
 | `last` | BA-H0 `pl`؛ SA `close_price` | آخرین معامله | ریال | روزانه | raw | — | [low, high] | — | نام `close_price` سورس‌آرنا گمراه‌کننده است | P0 |
 | `final` | BA-H0 `pc`؛ SA `final_price` | قیمت پایانی (میانگین وزنی رسمی) | ریال | روزانه | raw | — | > 0 | — | — | P0 |
@@ -58,7 +58,8 @@
 | `adj_factor` | DER از D4 | ضریب رویداد شرکتی | نسبت | رویداد | calculated | `f(t) = py(t) ÷ pc(t−1)` | (0.05, 1] | بیرون از بازه ← صف بازبینی | ضریب > ۱ مشکوک | P0 |
 | `adj_*` | DER | قیمت تعدیل‌شده با **لنگر t** | ریال | روزانه | calculated | مشخصات D4 | > 0 | پس از بازبینی ضریب | استفاده از سری تعدیل امروز = نگاه به آینده | P0 |
 | `is_lock_up/down/flat` | DER از D5 | روز قفل و جهت آن | پرچم | روزانه | calculated | `pmin = pmax` و `pc` در برابر `py` | — | — | با جانشین، قفل غیر روی حد را نمی‌شناسد | P0 |
-| `halted_days` | DER (روز بی‌ردیف در برابر تقویم) | طول توقف | روز | روزانه | calculated | — | ≥ 0 | تقویم تأییدنشده (D9) | — | P0 |
+| `halted_days` | DER (ردیف با `tvol = 0`، و روز بی‌ردیف در برابر تقویم) | طول توقف | روز | روزانه | calculated | — | ≥ 0 | تقویم تأییدنشده (D9) | ردیف `tvol = 0` نباید قفل جانشین D5 شمرده شود | P0 |
+| `final_outside_range` | DER | `pc` بیرون از [`pmin`، `pmax`] (قاعده حجم مبنا) | پرچم | روزانه | calculated | `pc < pmin` یا `pc > pmax` با `tvol > 0` | — | — | پایانی آن روز قابل معامله نبوده؛ برچسب‌های مبتنی بر `final` حساسیت می‌خواهند | P0 |
 
 ### ۲-ب. حقیقی و حقوقی
 
@@ -119,7 +120,7 @@
 | `ret_vs_flow_divergence` | DER | همان `mic_class` مشخصات | طبقه | روزانه | calculated | مشخصات P5 | absorption، thin_supply، no_real_flow، neutral | — | — | P0 |
 | `sell_count_growth_i` | DER (M3) | تعداد فروشنده حقیقی ÷ میانگین پایه | نسبت | روزانه | calculated | مشخصات M3 | > 0 | — | — | P1 |
 | `inst_net_share` | DER | (`buy_vol_n − sell_vol_n`) ÷ `volume` | نسبت | روزانه | calculated | — | [−1, 1] | — | کد به کد حقوقی/حقیقی؛ صندوق‌های بازارگردان | P1 |
-| `hot_net`، `hot_plus_net`، `retail_net`، `unattributed` | REC + DER (`internal/flow`) | خالص پول هر باند اندازه | ریال | بازه و جمع روز | calculated | ADR-0004 | — | روز ناقص ← `partial` | رقیق‌شدن در بازه؛ وابسته به طول بازه | P2 (فقط رو به جلو) |
+| `hot_net`، `hot_plus_net`، `retail_net`، `unattributed` (خانواده **HotMoneyMetric**) | REC + DER (`internal/flow`) | خالص پول هر باند اندازه، با باند بر اساس **میانگین** ارزش بازه بر افزایش تعداد؛ «پول هوشمند» یا «خریدار بزرگ» نیست (`source_independence_matrix` بخش ۵) | ریال | بازه و جمع روز | calculated | ADR-0004 | — | روز ناقص ← `partial` | رقیق‌شدن در بازه؛ وابسته به طول بازه | P2 (فقط رو به جلو) |
 | `flow_10m_matrix` | REC + DER | خالص هر باند در پنجره ۱۰ دقیقه + تغییر قیمت | ریال، ٪ | ۱۰ دقیقه | calculated | `internal/flow` | — | پنجره ناقص ← `partial` | همان | P2 |
 
 ### ۳-ب. واکنش قیمت و حجم (خوشه‌های K-VOL و K-LOC)
@@ -192,13 +193,14 @@
 
 | feature_name | source | definition | unit | frequency | raw/calculated | formula_if_known | expected_range | missing_value_behavior | possible_bias | research_priority |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `tk_hot_alert` (رویداد) | TK-A `hot-money/hot?archived_date=` | هشدار پول داغ با `delta_count`، `alert_per_capita`، `first_time` | رویداد | درون‌روزی | calculated (نزد سایت) | میانگین ارزش بازه ÷ افزایش تعداد (inventory C-02) | — | — | رقیق‌شدن؛ هشدارهای پس از جلسه (C-03) | P1 |
+| `tk_hot_alert` (رویداد، HotMoneyMetric) | TK-A `hot-money/hot` (فقط امروز؛ بایگانی ندارد) | هشدار پول داغ با `delta_count`، `alert_per_capita`، `first_time` | رویداد | درون‌روزی | calculated (نزد سایت) | میانگین ارزش بازه ÷ افزایش تعداد (inventory C-02) | — | — | رقیق‌شدن؛ هشدارهای پس از جلسه (C-03) | P1 |
 | `tk_alert_count_buy/sell`، `tk_avg_hot_buys/sells`، `tk_proceeds` | TK-A | تجمیع روزانه هشدارها | عدد، میلیون تومان | روزانه | calculated | — | ≥ 0 | — | همان | P2 |
 | `tk_symbol_score` و چهار جزء | TK-A `symbol-scores` | امتیاز ۰ تا ۱۰۰ | امتیاز | روزانه (تاریخچه) | calculated | inventory C-01 و T09 | [0, 100] | — | ساعت مرورگر؛ حجم خطی | P1 |
 | `tk_technical_score` | TK-A `indicators` | ۰ تا ۱۰ از EMA، RSI، CCI، WR، ADX | امتیاز | لحظه‌ای | calculated | inventory T09 | [0, 10] | — | — | P2 |
 | `tk_golden_number`، `tk_plusD`، `tk_plusM`، `tk_mToD`، `tk_cross_time/type`، `tk_buy_slope`، `tk_sell_slope`، `tk_ratio_to_avg` | TK-A `tablocastic-history` | ستون‌های تابلوکستیک | نامعلوم | ۶۰ ثانیه | calculated (نزد سایت) | **نامعلوم** | نامعلوم | — | همه از سرانه درون‌روزی (K-SIZE) | P2 |
 | `tk_multidim_hits` | TK-A `multidimensional-analysis` | شمار حضور در ۸ فیلتر | عدد | ۶۰ ثانیه | calculated | — | [0, 8] | — | شمارش تکراری | P1 |
-| `tk_special_alert` (۲۱ نوع) | TK-A `stock-alerts/<key>/events` | رویداد هشدار ویژه با دسته اثر | رویداد | درون‌روزی | calculated | آستانه‌ها نامعلوم | — | — | — | **P1** (بایگانی رویداد) |
+| `tk_special_alert` (۲۱ نوع) | TK-A `stock-alerts` (تعریف) | رویداد هشدار ویژه با دسته اثر | رویداد | درون‌روزی | calculated | منتشرشده (`authenticated_audit` بخش ۴) | — | — | بایگانی ندارد؛ فقط با بازسازی خودمان | **P1** (۹ هشدار پایان روز) |
+| `large_holder_change` (خانواده **TrueLargeBuyerEvidence**) | TSETMC / TK-A `shareholders` | تغییر روزانه تعداد سهم دارندگان ≥ ۱٪ | سهم، ٪ | روزانه | raw | — | — | تاریخچه فقط ۲۰ روز؛ پیش از آن ناموجود | فقط بالای ۱٪؛ بیشتر نهادها؛ با تأخیر | P1 (ضبط رو به جلو) |
 | `tk_smart_money_score` | TK-A صفحه اصلی | ترکیب خطی سه نسبت | امتیاز | لحظه‌ای | calculated | inventory T04 | ≥ 0 | — | تعریف ورود و خروج یکسان (C-04) | P3 |
 | `tk_price_movement_ratio` | TK-P `smart-money-averages` | میانگین پایانی ۳ روز ÷ ۱۴ روز | نسبت | روزانه | calculated | inventory T04 | حدود [0.7, 1.4] | — | با ROC هم‌خوشه | P3 |
 | `tk_avg_per_capita_*_10d` | TK-P `smart-money-averages` | میانگین ۱۰ روزه سرانه و تعداد | میلیون تومان، نفر | روزانه | calculated | — | > 0 | — | نمودار سرانه سایت مقدار پرشده دارد (C-05) | P3 |
