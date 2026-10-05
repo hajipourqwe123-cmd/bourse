@@ -37,7 +37,7 @@ data:
   adjustment_review_min_factor: 0.05      # D4: a factor below min or above max goes to a review queue,
   adjustment_review_max_factor: 1.0       #     never applied automatically
   price_limit_source: proxy_pmin_eq_pmax  # D5: feed | rules_table | proxy_pmin_eq_pmax (until DL-03d ships the table);
-                                          #     proxy lock direction from pc vs py: up (pc > py), down (pc < py), flat (pc == py)
+                                          #     proxy applies only when tvol > 0 and pmin == pmax > 0; direction from traded price pmin vs py (not pc): up, down, else UNKNOWN; tvol == 0 rows are HALTED/SUSPENDED, never locks
 
 universe:
   lookback_days: 60                       # U1
