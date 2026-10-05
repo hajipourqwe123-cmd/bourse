@@ -10,3 +10,9 @@ out.ndjson
 /gateway
 /recordings/
 /.local/
+
+# MI-01b: raw tablokhani archive must never enter git
+/tablokhani_archive/
+**/tablokhani_archive/
+tk__*.json
+/quarantine/
