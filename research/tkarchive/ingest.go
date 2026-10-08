@@ -12,9 +12,10 @@ import (
 	"time"
 )
 
-// Downloaded files are named tk__<dataset>__<YYYY-MM-DD>.json.
+// Downloaded files are named tk__<dataset>__<YYYY-MM-DD>.json; a later capture of a
+// day already archived adds __recapture and is archived under key <date>@recapture.
 var (
-	dlNameRe  = regexp.MustCompile(`^tk__(hot_money_matrix|symbol_score_history)__(\d{4}-\d{2}-\d{2})\.json$`)
+	dlNameRe  = regexp.MustCompile(`^tk__(hot_money_matrix|symbol_score_history)__(\d{4}-\d{2}-\d{2})(__recapture)?\.json$`)
 	jwtShape  = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}`)
 	authLabel = regexp.MustCompile(`(?i)"?(access_token|refresh_token|authorization)"?\s*[:=]\s*"?Bearer`)
 )
@@ -80,6 +81,9 @@ func Ingest(s *Store, dir string) (*IngestReport, error) {
 		}
 		rep.UniqueItems++
 		ds, key := m[1], m[2]
+		if m[3] != "" {
+			key += "@recapture" // its completeness is assessed like any capture, not assumed
+		}
 		man, err := s.Manifest(ds)
 		if err != nil {
 			return rep, err
@@ -106,13 +110,16 @@ func Ingest(s *Store, dir string) (*IngestReport, error) {
 			}
 			rep.FalsePositives = append(rep.FalsePositives, name)
 		}
-		params := map[string]string{"date": key}
+		day := strings.SplitN(key, "@", 2)[0]
+		params := map[string]string{"date": day}
 		if ds == DatasetScores {
-			params = map[string]string{"score_date": key, "end_date": key}
+			params = map[string]string{"score_date": day, "end_date": day}
 		}
 		st, _ := os.Stat(p)
-		if _, err := s.Pending(ds, key, key); err != nil { // moves a corrupt raw file aside
-			return rep, err
+		if !strings.Contains(key, "@") { // Pending is date-keyed; moves a corrupt raw file aside
+			if _, err := s.Pending(ds, key, key); err != nil {
+				return rep, err
+			}
 		}
 		if _, err = s.Put(PutRequest{Dataset: ds, Key: key, Endpoint: endpoints[ds], Params: params,
 			HTTPStatus: 200, RetrievedAt: st.ModTime().UTC().Format(time.RFC3339), Body: string(b)}); err != nil {

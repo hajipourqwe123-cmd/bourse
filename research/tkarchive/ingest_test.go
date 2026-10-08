@@ -61,3 +61,28 @@ func TestIngestQuarantinesRealSecretAndKeepsFalsePositive(t *testing.T) {
 		t.Fatalf("false positive must be ingested and recorded: %+v", r)
 	}
 }
+
+func TestAnnotateCaptureAndRecaptureKeyAreDistinct(t *testing.T) {
+	root, dl := t.TempDir(), t.TempDir()
+	s, _ := NewStore(root)
+	writeDL(t, dl, "tk__hot_money_matrix__2026-03-01.json", matrixBody)
+	if _, err := Ingest(s, dl); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Annotate(DatasetMatrix, "2026-03-01", "same_day_capture", SessionUnknown); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := s.Manifest(DatasetMatrix)
+	if m["2026-03-01"].ObservationKind != "same_day_capture" || m["2026-03-01"].Completeness != SessionUnknown || s.Verify(m["2026-03-01"]) != nil {
+		t.Fatal("annotation must label the entry and keep the raw checksum valid")
+	}
+	writeDL(t, dl, "tk__hot_money_matrix__2026-03-01__recapture.json", matrixBody+" ")
+	r, err := Ingest(s, dl)
+	if err != nil || r.NewlyArchived != 1 {
+		t.Fatalf("recapture must be a separate immutable item: %+v %v", r, err)
+	}
+	m, _ = s.Manifest(DatasetMatrix)
+	if m["2026-03-01@recapture"] == nil || m["2026-03-01@recapture"].SHA256 == m["2026-03-01"].SHA256 {
+		t.Fatal("recapture and original capture must not be conflated")
+	}
+}

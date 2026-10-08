@@ -26,10 +26,10 @@ const (
 var (
 	ErrExists     = errors.New("raw response already exists (immutable)")
 	ErrBadDataset = errors.New("unknown dataset")
-	ErrBadKey     = errors.New("key must be YYYY-MM-DD")
+	ErrBadKey     = errors.New("key must be YYYY-MM-DD or YYYY-MM-DD@suffix")
 	ErrSecret     = errors.New("request parameters look like they contain a secret")
 	ErrNotJSON    = errors.New("body is not valid JSON")
-	keyRe         = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	keyRe         = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(@[a-z0-9-]+)?$`)
 	secretKeyRe   = regexp.MustCompile(`(?i)token|auth|cookie|secret|passw|bearer|session|api[_-]?key`)
 	secretValueRe = regexp.MustCompile(`(?i)^\s*(bearer\s|eyJ[A-Za-z0-9_-]{10,})`)
 	validDatasets = map[string]bool{DatasetMatrix: true, DatasetScores: true}
@@ -61,6 +61,12 @@ type Entry struct {
 	SchemaVersion string            `json:"schema_version"`
 	File          string            `json:"file"`
 	PayloadDate   string            `json:"payload_date,omitempty"`
+	// ObservationKind is empty for ordinary observations; "same_day_capture" marks a
+	// capture taken on the market day itself (an earlier label was "intraday_snapshot").
+	ObservationKind string `json:"observation_kind,omitempty"`
+	// Completeness is an explicit session-completeness state (session.go); empty
+	// means it is derived from retrieved_at with the session calendar.
+	Completeness string `json:"completeness,omitempty"`
 }
 
 type Store struct {
@@ -205,6 +211,29 @@ func (s *Store) appendManifest(e *Entry) error {
 		return err
 	}
 	return f.Sync()
+}
+
+// Annotate appends a manifest line labelling an existing item's observation kind
+// and session completeness. The raw file and its checksum are untouched; earlier
+// manifest lines stay as history.
+func (s *Store) Annotate(dataset, key, kind, completeness string) error {
+	m, err := s.Manifest(dataset)
+	if err != nil {
+		return err
+	}
+	e := m[key]
+	if e == nil {
+		return ErrBadKey
+	}
+	if err := s.Verify(e); err != nil {
+		return err
+	}
+	c := *e
+	c.ObservationKind = kind
+	c.Completeness = completeness
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendManifest(&c)
 }
 
 // Manifest returns the latest entry per key.

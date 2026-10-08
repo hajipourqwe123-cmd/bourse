@@ -1,5 +1,6 @@
-// Command tkarchive runs the localhost archive receiver (serve) or validates
-// an existing archive (validate). The archive root must be outside the repo.
+// Command tkarchive runs the localhost archive receiver (serve), ingests browser
+// downloads (ingest), labels an item (annotate) or validates the archive
+// (validate). The archive root must be outside the repo.
 package main
 
 import (
@@ -15,7 +16,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: tkarchive serve|validate [-root DIR] [-port N]")
+		fmt.Fprintln(os.Stderr, "usage: tkarchive serve|ingest|annotate|validate [-root DIR] ...")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -24,6 +25,10 @@ func main() {
 	from := fs.String("from", "2026-01-04", "validation range start")
 	to := fs.String("to", "2026-10-04", "validation range end")
 	dir := fs.String("dir", `C:\Users\Mr.Hajipour\Downloads`, "download landing folder (ingest)")
+	ds := fs.String("dataset", "", "dataset (annotate)")
+	key := fs.String("key", "", "archive key (annotate)")
+	kind := fs.String("kind", "same_day_capture", "observation kind (annotate)")
+	compl := fs.String("completeness", tkarchive.SessionUnknown, "session-completeness state (annotate)")
 	fs.Parse(os.Args[2:])
 	st, err := tkarchive.NewStore(*root)
 	if err != nil {
@@ -47,6 +52,11 @@ func main() {
 			os.WriteFile(filepath.Join(*root, "manifests", "ingest_report.json"), j, 0o644)
 		}
 		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "annotate": // annotate -dataset D -key K -kind KIND -completeness STATE
+		if err := st.Annotate(*ds, *key, *kind, *compl); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

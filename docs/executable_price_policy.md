@@ -25,3 +25,4 @@ Implementation: `internal/history/execprice.go`.
 8. Daily bars cannot give exact fills: **no fill is ever labelled exact**. Reports must show the share of fills per `Assumption` and a sensitivity run (open vs. worst-of-range).
 9. Raw (unadjusted) prices only; adjusted series are a different Go type and cannot reach the fill functions.
 10. Labels (`final(e+h)`, X1) that were evaluated on `final` must be re-run on `last` as a sensitivity (archive_feasibility finding 2).
+11. Percent fields from third-party archives (tablokhani `priceChangeValues`, `priceLevelValues`) are not prices: they never feed fills, MFE/MAE or state classification.
