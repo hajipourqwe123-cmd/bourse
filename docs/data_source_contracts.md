@@ -18,7 +18,7 @@ A contract states what a source guarantees, so downstream code can rely on it. F
 | Key | `ins_code`, `date` |
 | Fields | `py`, `pf`, `pl`, `pc`, `pmin`, `pmax`, `tvol`, `tval`, `tcnt`; `type=1` adds real/legal volume, value, count |
 | Guarantees | one row per calendar trading day incl. halted days (`tvol = 0`, `pmin = pmax = 0`) |
-| Not guaranteed | `pc` inside [`pmin`,`pmax`]; consistent int/float types; real+legal = total (12 exceptions); delisted symbols; allowed-range limits |
+| Not guaranteed | `pc` inside [`pmin`,`pmax`] (285 of 4230 traded days in the Foolad sample); consistent int/float types; real+legal = total (12 exceptions); delisted symbols; allowed-range limits |
 | Limit | Q-SG1 OPEN |
 | Consumers | `internal/history` (state, fills, adjustment) |
 

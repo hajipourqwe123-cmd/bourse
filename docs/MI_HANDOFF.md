@@ -40,12 +40,38 @@ Rebuild the binary after changing `research/tkarchive`: `go build -o D:/Bourse/d
 4. A halted row is never a lock; `closing_price` is never a fill price; fills, MFE and MAE use traded prices; UNKNOWN when evidence is insufficient.
 5. Credentials never enter files, logs, manifests or Git. The secret scan quarantines real credentials and records false positives without printing values.
 
+## Phase 5B (Canonical Market Dataset) — state 2026-10-10
+
+Design-only by owner decision: BrsApi is reachable over unencrypted HTTP only, so no live provider request was made. Everything below was produced from raw responses already on disk.
+
+| Item | Location |
+| --- | --- |
+| Canonical layer (identity, calendar, industry, daily, gates, benchmark) | `internal/canonical/` |
+| Architecture proof run (offline, no network) | `cmd/canonical` → `D:\Bourse\data\canonical_proof_report.json` |
+| Docs | `security_master.md`, `trading_calendar.md`, `historical_industry_membership.md`, `canonical_daily_dataset.md`, `provider_truth_benchmark.md`, `historical_download_plan.md`, `canonical_quality_gates.md` |
+
+Reproduce: `go run ./cmd/canonical build` (reads the recordings under `D:/Bourse/bourse/recordings` and the tablokhani archive; writes the report outside Git).
+
+### Pattern Discovery gate
+
+| Requirement | State |
+| --- | --- |
+| Stable instrument identity | model done; **dated history absent** (identity starts at the snapshot date, so 4643 of 4644 instrument-days have no point-in-time identity) |
+| Verified trading calendar | evidence-based model done; 4230 trading days proven from one instrument; **no whole-market load, no verified holiday list** |
+| Canonical whole-market OHLCV | schema + normalizer done and proven on one instrument (19.54 years); **whole-market load not run** |
+| Corporate-action handling | layers and detection done (32 discontinuities found); **event kinds need Codal** |
+| Historical universe treatment | survivorship measured by ticker label: 206 of 1306 archive symbols absent from the current universe (66 expired rights issues, 140 other); **identity-based measurement blocked** |
+| Industry membership | dated table done; **coverage 1.0 at the snapshot date, 0.0 before it** |
+| Executable price policy | done (Phase 5A), enforced in the canonical layer |
+| Temporal leakage checks | `requested_date`/`served_date` split, declared field absence, Symbol Score History still `TEMPORALLY_AMBIGUOUS` |
+| Coverage > 98% on verified trading dates | **not measurable** until the whole-market load exists |
+
 ## Blockers before Pattern Discovery
 
-1. No canonical daily price/volume series for the universe: BrsApi unreachable from this network; only one sample symbol on disk; History limit Q-SG1 open.
+1. No canonical whole-market daily series yet: the loader is designed but unrun. BrsApi is reachable over **unencrypted HTTP only** (HTTPS and TSETMC/SourceArena time out), the transport decision is open, and the History limit Q-SG1 has never appeared in a response.
 2. Length: matrix 105 and scores 184 genuine days against about 1100 needed for G-3a.
 3. Scores temporal alignment unresolved; most score inputs (sell per capita, real volumes, trade volume) are null.
-4. Survivorship: no delisted-name source before 2026; tablokhani archives key by Persian ticker, not `ins_code`.
+4. Survivorship: no listing/delisting dates in any reachable feed, so a point-in-time universe cannot be built; 2026 exposure is measurable only by ticker label (10.7% excluding expired rights issues).
 5. Session calendar and holiday list unverified; instrument-class map provisional.
 6. Provider limits and intraday provider choice open (provider_benchmark_plan.md); TSETMC unassessed.
 

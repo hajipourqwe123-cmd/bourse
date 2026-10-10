@@ -7,7 +7,7 @@ Implementation: `internal/history/execprice.go`.
 | Name | Definition | May be a fill price? |
 | --- | --- | --- |
 | `last_price` (`pl`) | last trade print | yes, if inside [`trade_low`, `trade_high`] |
-| `closing_price` (`pc`) | exchange-defined close (volume-weighted rule). **May not be a price at which any trade occurred.** In the Foolad sample `pc` is outside [`pmin`, `pmax`] on 286 of 4230 traded days | **never** |
+| `closing_price` (`pc`) | exchange-defined close (volume-weighted rule). **May not be a price at which any trade occurred.** In the Foolad sample `pc` is outside [`pmin`, `pmax`] on **285** of 4230 traded days (recounted in Phase 5B; an earlier figure of 286 was off by one) | **never** |
 | `trade_high` / `trade_low` (`pmax` / `pmin`) | extremes of actual prints | bounds for fill feasibility, MFE, MAE |
 | `open` (`pf`) | first print | yes |
 | `adjusted_price` | analytical series, `adj_*` | **never** |
